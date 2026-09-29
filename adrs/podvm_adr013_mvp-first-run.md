@@ -62,8 +62,11 @@ The MVP does not require:
 - Port forwarding - not needed
 - Volume mounts - not needed
 - `podvm exec` - not needed
-- `podvm build` - not needed
+- `podvm build` - not needed (only build needs layer commits)
 - Multiple containers - not needed
+- Memory ballooning - not needed for single echo command
+- vsock IPC - only needed for build/exec
+- Guest kernel module - only needed for build
 
 The MVP can run without a daemon. The CLI starts the VM, waits for exit, and cleans up. This simplifies initial development. The daemon can be added later for state management.
 

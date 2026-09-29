@@ -80,6 +80,8 @@ Two final insights:
 
 ### Technical
 
+- **Key insight: only build creates layers**: `docker run` only needs ONE writable upper layer. Lower layers are read-only and never change. This means `podvm run` needs no IPC, no guest module, no layer commits. Just mount and go. vsock and guest module are only needed for `podvm build`.
+
 - **Docker Desktop pattern works on Linux**: The VM-per-container model is proven on macOS. On Linux, it eliminates the redundant container runtime layer.
 
 - **virtiofs vs 9p**: virtiofs provides ~80% native performance vs ~50% for 9p. The virtiofsd daemon is required but is a single binary from the QEMU package.
