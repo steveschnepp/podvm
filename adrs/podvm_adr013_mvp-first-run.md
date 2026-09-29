@@ -123,12 +123,25 @@ podvm/
 ## Build
 
 ```bash
+# One-time: build static deps with musl
+# (curl + openssl)
+CC=musl-gcc ./configure --disable-shared --with-openssl && make && make install
+
 # Host tools
-musl-gcc -static -Os -o podvm src/*.c -lcurl -ljansson
+musl-gcc -static -Os -o podvm src/*.c -lcurl -lssl -lcrypto -lpthread -lz
 
 # Guest init
 cd guest && make
 ```
+
+## Dependencies
+
+All statically linked with musl:
+- libcurl — HTTPS registry pulls, redirects, TLS
+- OpenSSL — TLS for curl
+- musl — C standard library
+
+Zero runtime dependencies. Single binary.
 
 ## Alternatives Considered
 
