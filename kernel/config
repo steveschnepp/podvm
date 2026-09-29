@@ -1,0 +1,72 @@
+# podvm synthetic kernel config
+# Minimal Linux kernel for podvm guests
+# Build: make -C linux-x86_64 defconfig && cp config linux-x86_64/.config && make -C linux-x86_64 olddefconfig && make -C linux-x86_64 -j$(nproc) bzImage
+
+# ──── Processor ────
+CONFIG_SMP=y
+CONFIG_NR_CPUS=8
+CONFIG_X86_64=y
+
+# ──── Paravirtualization ────
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+
+# ──── Virtio Drivers (built-in) ────
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_FS=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_RNG=y
+CONFIG_VIRTIO_BALLOON=y
+
+# ──── Vsock ────
+CONFIG_VSOCK=y
+CONFIG_VIRTIO_VSOCKETS_COMMON=y
+
+# ──── Filesystems ────
+CONFIG_TMPFS=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# ──── Essential ────
+CONFIG_TTY=y
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_PRINTK=y
+CONFIG_BUG=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+CONFIG_AIO=y
+
+# ──── Compression (for initramfs) ────
+CONFIG_CRYPTO_LZ4=y
+CONFIG_CRYPTO_ZSTD=y
+CONFIG_CRYPTO_GZIP=y
+
+# ──── NOT needed ────
+# CONFIG_OVERLAY_FS is not set
+# CONFIG_EXT4_FS is not set
+# CONFIG_BTRFS_FS is not set
+# CONFIG_XFS_FS is not set
+# CONFIG_NFS_FS is not set
+# CONFIG_CIFS is not set
+# CONFIG_ATA is not set
+# CONFIG_SCSI is not set
+# CONFIG_USB is not set
+# CONFIG_SOUND is not set
+# CONFIG_DRM is not set
+# CONFIG_WLAN is not set
+# CONFIG_BLUETOOTH is not set
+# CONFIG_INFINIBAND is not set
