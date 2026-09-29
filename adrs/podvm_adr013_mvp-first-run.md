@@ -87,34 +87,48 @@ Timing targets:
 
 ```
 podvm/
-├── Cargo.toml                    # Rust project root
 ├── src/
-│   ├── main.rs                   # CLI entry point
-│   ├── cli.rs                    # argument parsing
-│   ├── image.rs                  # registry client + layer download
-│   ├── storage.rs                # container storage (read Podman format)
-│   ├── overlay.rs                # overlay assembly
-│   └── vm.rs                     # Cloud Hypervisor launcher
+│   ├── main.c                   # CLI entry point + argument parsing
+│   ├── image.c                  # registry client + layer download
+│   ├── image.h
+│   ├── storage.c                # container storage (read Podman format)
+│   ├── storage.h
+│   ├── overlay.c                # overlay assembly
+│   ├── overlay.h
+│   ├── vm.c                     # Cloud Hypervisor launcher
+│   ├── vm.h
+│   ├── json.c                   # minimal JSON parser
+│   └── json.h
 ├── guest/
-│   ├── init.c                    # guest init (musl static)
+│   ├── init.c                   # guest init (musl static)
 │   └── Makefile
 ├── kernel/
-│   └── config                    # synthetic kernel config
-├── adrs/                         # architecture decisions
-├── SPEC.md                       # full specification
-└── Makefile                      # top-level build
+│   └── config                   # synthetic kernel config
+├── adrs/                        # architecture decisions
+├── SPEC.md                      # full specification
+└── Makefile                     # top-level build (C99, musl-gcc)
 ```
 
 ## MVP Implementation Order
 
-1. Build guest init (guest/init.c)
+1. Build guest init (guest/init.c) - musl static
 2. Build synthetic kernel (kernel/config)
-3. Implement image pull (src/image.rs) - download debian layers
-4. Implement storage reader (src/storage.rs) - read layer paths
-5. Implement overlay assembly (src/overlay.rs) - mount overlay
-6. Implement VM launcher (src/vm.rs) - start Cloud Hypervisor
-7. Implement CLI (src/main.rs) - wire everything together
+3. Implement image pull (src/image.c) - download debian layers
+4. Implement storage reader (src/storage.c) - read layer paths
+5. Implement overlay assembly (src/overlay.c) - mount overlay
+6. Implement VM launcher (src/vm.c) - start Cloud Hypervisor
+7. Implement CLI (src/main.c) - wire everything together
 8. Test: podvm run -it debian echo hello world
+
+## Build
+
+```bash
+# Host tools
+musl-gcc -static -Os -o podvm src/*.c -lcurl -ljansson
+
+# Guest init
+cd guest && make
+```
 
 ## Alternatives Considered
 
