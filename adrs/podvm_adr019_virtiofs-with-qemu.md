@@ -34,7 +34,7 @@ virtiofsd runs per-container, not per-host. Each container gets its own virtiofs
 ## QEMU Configuration
 
 ```bash
-# Full QEMU command with virtiofs
+# Full QEMU command with virtiofs + balloon + QMP
 qemu-system-x86_64 \
   -machine q35,accel=kvm \
   -cpu host \
@@ -48,6 +48,12 @@ qemu-system-x86_64 \
   # virtiofs device
   -chardev socket,id=char0,path=/run/podvm/<id>/virtiofs-rootfs.sock \
   -device vhost-user-fs-pci,chardev=char0,tag=rootfs \
+  \
+  # Memory balloon
+  -device virtio-balloon-pci \
+  \
+  # QMP control socket
+  -qmp unix:/run/podvm/<id>/qmp.sock,server,nowait \
   \
   # Kernel and init
   -kernel /var/lib/podvm/kernel/bzImage \
