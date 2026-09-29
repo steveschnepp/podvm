@@ -123,12 +123,17 @@ podvm/
 ## Build
 
 ```bash
-# Host tools (dynamic, uses host libc + curl)
-gcc -O2 -o podvm src/*.c -lcurl
+# Host tools
+mkdir build && cd build
+cmake ..
+make
 
-# Guest init (static, musl for initramfs)
-musl-gcc -static -Os -o init guest/init.c
+# Guest init
+cd guest
+make
 ```
+
+CMakeLists.txt handles dependency detection (libcurl, etc.) automatically.
 
 ## Dependencies
 
