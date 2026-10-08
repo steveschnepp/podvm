@@ -31,6 +31,7 @@
 
 #include "store.h"
 #include "json.h"
+#include "image.h"
 
 #define MAX_CHAIN 64
 
@@ -78,7 +79,13 @@ static char *read_file(const char *path) {
  * (Candidate list is built inline in store_find.)
  */
 
-int store_find(const char *image, char *top_layer, size_t n) {
+/*
+ * Look up an image by name in images.json, returning its id (the config
+ * blob digest) and top layer id. Either output may be NULL.
+ * Returns 0 on success.
+ */
+static int store_lookup(const char *image, char *image_id, size_t idn,
+                        char *top_layer, size_t n) {
     char root[STORE_PATH_MAX];
     if (storage_root(root, sizeof(root)) < 0)
         return -1;
@@ -119,7 +126,12 @@ int store_find(const char *image, char *top_layer, size_t n) {
                 if (nm && !strcmp(nm, cand[c])) {
                     const char *layer = json_str(json_get(im, "layer"));
                     if (layer) {
-                        snprintf(top_layer, n, "%s", layer);
+                        if (top_layer)
+                            snprintf(top_layer, n, "%s", layer);
+                        if (image_id) {
+                            const char *id = json_str(json_get(im, "id"));
+                            if (id) snprintf(image_id, idn, "%s", id);
+                        }
                         found = 1;
                     }
                     break;
@@ -129,6 +141,10 @@ int store_find(const char *image, char *top_layer, size_t n) {
     }
     json_free(j);
     return found ? 0 : -1;
+}
+
+int store_find(const char *image, char *top_layer, size_t n) {
+    return store_lookup(image, NULL, 0, top_layer, n);
 }
 
 /*
@@ -183,6 +199,90 @@ int store_chain(const char *top_layer, StoreLayer *layers, int max) {
 int store_podman_available(void) {
     return access("/usr/bin/podman", X_OK) == 0 ||
            access("/bin/podman", X_OK) == 0;
+}
+
+/*
+ * Base64-encode a string (standard alphabet, with padding).
+ * Used to build podman's big-data filenames: containers/storage stores
+ * an image's config blob as overlay-images/<id>/=<base64("sha256:<id>")>.
+ * out must hold 4*ceil(len/3)+1 bytes; we bound the copy to outn.
+ */
+static void b64_encode(const char *in, char *out, size_t outn) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t len = strlen(in);
+    size_t o = 0;
+    /* Bound by len, not by in[i]: with len%3 != 0 the final stride would
+     * step past the NUL and read whatever follows the string. */
+    for (size_t i = 0; i < len && o + 4 < outn; i += 3) {
+        unsigned v = (unsigned char)in[i] << 16;
+        if (i + 1 < len) v |= (unsigned char)in[i + 1] << 8;
+        if (i + 2 < len) v |= (unsigned char)in[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? tbl[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < len) ? tbl[v & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+/*
+ * Read an image's config blob out of podman storage and parse it into cfg.
+ *
+ * containers/storage keeps the OCI config blob as "big data" under the
+ * image dir, named =<base64(name)>. For images podman pulled, the image id
+ * *is* the config digest, so the blob is at
+ *   overlay-images/<id>/=base64("sha256:<id>")
+ * which we try first. As a fallback we read the "manifest" big-data entry
+ * and follow its config.digest -- covers images whose id is not the config
+ * digest (e.g. some locally-built/converted images).
+ *
+ * Returns 0 on success (cfg filled, possibly partially), -1 if no config
+ * blob could be read or parsed. Caller must image_config_init() first and
+ * image_config_free() after.
+ */
+int store_image_config(const char *image, ImageConfig *cfg) {
+    char root[STORE_PATH_MAX];
+    char id[128];
+    char name[256];
+    char b64[512];
+    char path[STORE_PATH_MAX * 2];
+    char *data = NULL;
+
+    if (storage_root(root, sizeof(root)) < 0)
+        return -1;
+    if (store_lookup(image, id, sizeof(id), NULL, 0) < 0)
+        return -1;
+
+    /* Primary: the config blob stored under the image id's digest. */
+    snprintf(name, sizeof(name), "sha256:%s", id);
+    b64_encode(name, b64, sizeof(b64));
+    snprintf(path, sizeof(path), "%s/overlay-images/%s/=%s", root, id, b64);
+    data = read_file(path);
+
+    /* Fallback: follow the manifest's config.digest. */
+    if (!data) {
+        b64_encode("manifest", b64, sizeof(b64));
+        snprintf(path, sizeof(path), "%s/overlay-images/%s/=%s", root, id, b64);
+        char *mani = read_file(path);
+        if (mani) {
+            JNode *j = json_parse(mani);
+            free(mani);
+            const char *cdigest = json_str(json_get(json_get(j, "config"), "digest"));
+            if (cdigest) {
+                b64_encode(cdigest, b64, sizeof(b64));
+                snprintf(path, sizeof(path), "%s/overlay-images/%s/=%s", root, id, b64);
+                data = read_file(path);
+            }
+            json_free(j);
+        }
+    }
+
+    if (!data)
+        return -1;
+    int rc = image_config_parse(data, cfg);
+    free(data);
+    return rc;
 }
 
 /*
