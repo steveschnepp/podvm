@@ -199,6 +199,60 @@ static void test_is_path(void) {
     CHECK(image_is_path("myuser/app") == 0);
 }
 
+/* ── image config blob parsing ─────────────────────── */
+static void test_config_parse(void) {
+    /* Real Debian bookworm config blob (as stored by podman). */
+    const char *debian =
+        "{\"config\":{\"Env\":[\"PATH=/usr/local/sbin:/usr/local/bin\"],"
+        "\"Entrypoint\":[],\"Cmd\":[\"bash\"]},"
+        "\"created\":\"2026-08-24T00:00:00Z\","
+        "\"rootfs\":{\"type\":\"layers\"},\"os\":\"linux\","
+        "\"architecture\":\"amd64\"}";
+    ImageConfig c;
+    image_config_init(&c);
+    CHECK(image_config_parse(debian, &c) == 0);
+    CHECK(c.nenv == 1 && strcmp(c.env[0], "PATH=/usr/local/sbin:/usr/local/bin") == 0);
+    CHECK(c.nentry == 0);              /* explicit empty Entrypoint */
+    CHECK(c.ncmd == 1 && strcmp(c.cmd[0], "bash") == 0);
+    CHECK(c.cwd[0] == '\0');            /* WorkingDir absent */
+    CHECK(c.user[0] == '\0');
+    image_config_free(&c);
+
+    /* Full config: entrypoint + cmd + workingdir + user. */
+    const char *full =
+        "{\"config\":{\"Env\":[\"A=1\",\"B=2\"],"
+        "\"Entrypoint\":[\"/entry.sh\"],\"Cmd\":[\"serve\",\"--port\",\"80\"],"
+        "\"WorkingDir\":\"/app\",\"User\":\"1000:1000\"}}";
+    image_config_init(&c);
+    CHECK(image_config_parse(full, &c) == 0);
+    CHECK(c.nenv == 2 && strcmp(c.env[1], "B=2") == 0);
+    CHECK(c.nentry == 1 && strcmp(c.entrypoint[0], "/entry.sh") == 0);
+    CHECK(c.ncmd == 3 && strcmp(c.cmd[2], "80") == 0);
+    CHECK(strcmp(c.cwd, "/app") == 0);
+    CHECK(strcmp(c.user, "1000:1000") == 0);
+    image_config_free(&c);
+
+    /* A manifest (no "config" object) is rejected, not crashed on. */
+    const char *manifest =
+        "{\"schemaVersion\":2,\"layers\":[{\"digest\":\"sha256:x\"}]}";
+    image_config_init(&c);
+    CHECK(image_config_parse(manifest, &c) == -1);
+    image_config_free(&c);
+
+    /* Garbage / empty input rejected. */
+    image_config_init(&c);
+    CHECK(image_config_parse("not json", &c) == -1);
+    CHECK(image_config_parse("", &c) == -1);
+    CHECK(image_config_parse(NULL, &c) == -1);
+    image_config_free(&c);
+
+    /* Double free is safe (free zeroes the struct). */
+    image_config_init(&c);
+    image_config_parse(full, &c);
+    image_config_free(&c);
+    image_config_free(&c);
+}
+
 int main(void) {
     test_json();
     test_gzip();
@@ -206,6 +260,7 @@ int main(void) {
     test_image_parse();
     test_reg_parse();
     test_is_path();
+    test_config_parse();
 
     if (failures == 0) {
         printf("image tests: all passed\n");

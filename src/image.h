@@ -20,6 +20,42 @@ typedef struct {
     char rootfs[MAX_PATH];          /* Path to assembled rootfs */
 } ImageRef;
 
+/* Limits on an image config's command/env arrays. */
+#define MAX_ENV_VARS  64
+#define MAX_CMD_PARTS 64
+
+/*
+ * OCI image config (the "config" object of an image's config blob).
+ * This is what lets `podvm <image>` run an image's default command
+ * without the user typing one (ADR-005: an image carries its own
+ * default command).
+ *
+ * Owned strings; init before parse, free after use.
+ */
+typedef struct {
+    char *env[MAX_ENV_VARS];        /* "K=V" strings */
+    int   nenv;
+    char *entrypoint[MAX_CMD_PARTS];
+    int   nentry;
+    char *cmd[MAX_CMD_PARTS];
+    int   ncmd;
+    char  cwd[MAX_PATH];            /* WorkingDir ("" if unset) */
+    char  user[128];                /* User, e.g. "1000:1000" ("" if unset) */
+} ImageConfig;
+
+/* Zero an ImageConfig (call before image_config_parse). */
+void image_config_init(ImageConfig *c);
+
+/* Free strings held by an ImageConfig (safe to call twice). */
+void image_config_free(ImageConfig *c);
+
+/*
+ * Parse an OCI config blob (the JSON whose top level has a "config"
+ * object) into an ImageConfig. Missing fields are left empty.
+ * Returns 0 on success, -1 if the text is not a usable config blob.
+ */
+int image_config_parse(const char *json_text, ImageConfig *c);
+
 /*
  * Parse image name (e.g., "debian:latest" -> name="debian", tag="latest")
  * Returns 0 on success.

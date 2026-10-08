@@ -497,6 +497,60 @@ static int select_platform_manifest(JNode *mani, char *digest, size_t n) {
     return 1;
 }
 
+/* ───────────────────────── image config blob ───────────────────────── */
+
+void image_config_init(ImageConfig *c) {
+    if (c) memset(c, 0, sizeof(*c));
+}
+
+void image_config_free(ImageConfig *c) {
+    if (!c) return;
+    for (int i = 0; i < c->nenv; i++)   free(c->env[i]);
+    for (int i = 0; i < c->nentry; i++) free(c->entrypoint[i]);
+    for (int i = 0; i < c->ncmd; i++)   free(c->cmd[i]);
+    memset(c, 0, sizeof(*c));
+}
+
+/* Copy a JSON string array into a slot array of malloc'd strings. */
+static void cfg_copy_strarr(JNode *arr, char **dst, int *n, int max) {
+    if (!arr || arr->type != JARR) return;
+    for (size_t i = 0; i < arr->n && *n < max; i++) {
+        const char *s = json_str(json_at(arr, i));
+        if (!s) continue;
+        dst[*n] = strdup(s);
+        if (dst[*n]) (*n)++;
+    }
+}
+
+int image_config_parse(const char *json_text, ImageConfig *c) {
+    if (!json_text || !c) return -1;
+
+    JNode *j = json_parse(json_text);
+    if (!j || j->type != JOBJ) { json_free(j); return -1; }
+
+    JNode *cfg = json_get(j, "config");
+    if (!cfg || cfg->type != JOBJ) {
+        /* Not a config blob (may be a manifest): not usable, but not
+         * an error worth failing the caller over -- they treat empty
+         * config as "image carries no defaults". */
+        json_free(j);
+        return -1;
+    }
+
+    cfg_copy_strarr(json_get(cfg, "Env"),   c->env,   &c->nenv,   MAX_ENV_VARS);
+    cfg_copy_strarr(json_get(cfg, "Entrypoint"), c->entrypoint, &c->nentry, MAX_CMD_PARTS);
+    cfg_copy_strarr(json_get(cfg, "Cmd"),   c->cmd,   &c->ncmd,   MAX_CMD_PARTS);
+
+    const char *wd = json_str(json_get(cfg, "WorkingDir"));
+    if (wd) snprintf(c->cwd, sizeof(c->cwd), "%s", wd);
+
+    const char *user = json_str(json_get(cfg, "User"));
+    if (user) snprintf(c->user, sizeof(c->user), "%s", user);
+
+    json_free(j);
+    return 0;
+}
+
 /* ───────────────────────── public API ───────────────────────── */
 
 int image_parse(const char *image_str, ImageRef *ref) {
