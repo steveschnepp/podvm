@@ -333,6 +333,12 @@ static int start_qemu(void) {
     /* 9p filesystem share (in-process; no daemon needed) */
     qargs[qi++] = "-fsdev";   qargs[qi++] = fsdev_str;
     qargs[qi++] = "-device";  qargs[qi++] = "virtio-9p-pci,fsdev=fsdev0,mount_tag=rootfs";
+    /* User-mode networking (slirp): in-process, no daemon, no root,
+     * no host state (ADR-023). Guest gets DHCP 10.0.2.15, DNS at
+     * 10.0.2.3, gateway 10.0.2.2. Bridge/tap returns in the
+     * performance phase. */
+    qargs[qi++] = "-netdev";  qargs[qi++] = "user,id=net0";
+    qargs[qi++] = "-device";  qargs[qi++] = "virtio-net-pci,netdev=net0";
     /* vsock (only when the host supports it) */
     if (vsock_available) {
         qargs[qi++] = "-device";
@@ -407,7 +413,10 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0}
     };
     
-    while ((opt = getopt_long(argc, argv, ":im:c:k:r:h", long_options, &option_index)) != -1) {
+    /* '+' stops getopt at the first non-option (the image/rootfs), so
+     * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
+     * are not stolen as podvm options. */
+    while ((opt = getopt_long(argc, argv, "+:im:c:k:r:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
