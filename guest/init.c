@@ -26,7 +26,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <linux/vm_sockets.h>
 
 #include "strparse.h"
@@ -240,6 +245,73 @@ static void load_guest_modules(void) {
     }
 }
 
+/*
+ * Configure eth0 with a static config matching QEMU slirp's well-known
+ * constants (ADR-023): guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3.
+ *
+ * Slirp serves DHCP, but there is no DHCP client in the initramfs and the
+ * host->guest config channel is one-way, so we set the address statically.
+ * Best-effort: if eth0 is absent (no virtio-net device, or a synthetic
+ * kernel without netdev) we return quietly and the guest runs without
+ * network -- isolation and boot are unaffected.
+ */
+#define SLIRP_IP      "10.0.2.15"
+#define SLIRP_NETMASK "255.255.255.0"
+#define SLIRP_GATEWAY "10.0.2.2"
+#define SLIRP_DNS     "10.0.2.3"
+
+static int setup_network(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "eth0");
+
+    /* Address */
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    sin->sin_family = AF_INET;
+    inet_pton(AF_INET, SLIRP_IP, &sin->sin_addr);
+    if (ioctl(fd, SIOCSIFADDR, &ifr) < 0) {
+        fprintf(stderr, "podvm-init: eth0 absent or unconfigurable: %s\n",
+                strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    /* Netmask */
+    inet_pton(AF_INET, SLIRP_NETMASK, &sin->sin_addr);
+    if (ioctl(fd, SIOCSIFNETMASK, &ifr) < 0)
+        fprintf(stderr, "podvm-init: eth0 netmask: %s\n", strerror(errno));
+
+    /* Bring the interface up */
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+        if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0)
+            fprintf(stderr, "podvm-init: eth0 up: %s\n", strerror(errno));
+    }
+
+    /* Default route via slirp gateway */
+    struct rtentry rt;
+    memset(&rt, 0, sizeof(rt));
+    sin = (struct sockaddr_in *)&rt.rt_dst;
+    sin->sin_family = AF_INET;          /* 0.0.0.0 = default */
+    sin = (struct sockaddr_in *)&rt.rt_genmask;
+    sin->sin_family = AF_INET;          /* 0.0.0.0 mask */
+    sin = (struct sockaddr_in *)&rt.rt_gateway;
+    sin->sin_family = AF_INET;
+    inet_pton(AF_INET, SLIRP_GATEWAY, &sin->sin_addr);
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    rt.rt_dev = (char *)ifr.ifr_name;
+    if (ioctl(fd, SIOCADDRT, &rt) < 0 && errno != EEXIST)
+        fprintf(stderr, "podvm-init: default route: %s\n", strerror(errno));
+
+    close(fd);
+    fprintf(stderr, "podvm-init: eth0 up %s via %s\n", SLIRP_IP, SLIRP_GATEWAY);
+    return 0;
+}
+
 /* Mount container rootfs via 9p */
 static int mount_rootfs(const Config *cfg) {
     mkdir_p(cfg->root, 0755);
@@ -292,6 +364,9 @@ int main(void) {
     if (cfg.hostname[0])
         sethostname(cfg.hostname, strlen(cfg.hostname));
 
+    /* Step 3b: Bring up eth0 for slirp networking (best-effort). */
+    setup_network();
+
     /* Step 4: Mount container rootfs */
     if (mount_rootfs(&cfg) < 0)
         return 1;
@@ -305,6 +380,16 @@ int main(void) {
     /* Step 6: Re-mount pseudofs inside the container rootfs. chroot hid
      * the initramfs mounts; /proc /sys /dev must exist in the new root. */
     mount_pseudofs_at("");
+
+    /* Step 6b: Point DNS at slirp's resolver (best-effort; the container
+     * rootfs may be read-only or lack /etc). */
+    {
+        int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)!write(fd, "nameserver " SLIRP_DNS "\n", 22);
+            close(fd);
+        }
+    }
 
     /* Step 7: Set working directory */
     if (cfg.cwd[0])
