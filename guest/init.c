@@ -7,8 +7,9 @@
  *   1. kernel cmdline  (podvm.*=... tokens, always present via -append)
  *   2. host vsock      (overrides cmdline when the host connects and sends)
  *
- * Flow: mount pseudofs -> parse cmdline -> try vsock override -> mount
- * rootfs (virtiofs/9p) -> chroot -> set cwd/user -> exec entrypoint.
+ * Flow: mount pseudofs -> load 9p modules (if bundled) -> parse cmdline
+ * -> try vsock override -> mount rootfs (9p) -> chroot -> set cwd/user
+ * -> exec entrypoint.
  *
  * Build: musl-gcc -static -Os (see guest/Makefile)
  */
@@ -24,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <linux/vm_sockets.h>
 
@@ -176,13 +178,38 @@ static void mount_pseudofs(void) {
     mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
 }
 
-/* Mount container rootfs via virtiofs (fallback: 9p) */
+/*
+ * Load 9p kernel modules from /modules in the initramfs, if present.
+ *
+ * Needed when booting the host kernel: KVM guests are a separate kernel
+ * instance, so the host's loaded 9p modules don't count, and module
+ * autoload can't work (no modprobe in the initramfs). The initramfs
+ * build script bundles decompressed copies of 9pnet/9pnet_virtio/9p.
+ *
+ * The synthetic kernel builds 9p in and ships no /modules dir; this is
+ * a no-op there.
+ */
+static void load_9p_modules(void) {
+    static const char *order[] = {
+        "9pnet.ko", "9pnet_virtio.ko", "9p.ko", NULL
+    };
+    char path[PATH_SIZE];
+
+    for (int i = 0; order[i]; i++) {
+        snprintf(path, sizeof(path), "/modules/%s", order[i]);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;   /* not bundled: built-in or absent */
+        if (syscall(__NR_finit_module, fd, "", 0) < 0 && errno != EEXIST)
+            fprintf(stderr, "podvm-init: finit_module %s: %s\n",
+                    order[i], strerror(errno));
+        close(fd);
+    }
+}
+
+/* Mount container rootfs via 9p */
 static int mount_rootfs(const Config *cfg) {
     mkdir_p(cfg->root, 0755);
-
-    /* virtiofs: tag is the source argument, not a mount option */
-    if (mount("rootfs", cfg->root, "virtiofs", 0, NULL) == 0)
-        return 0;
 
     /* 9p: tag is a mount option */
     if (mount(NULL, cfg->root, "9p", 0,
@@ -200,6 +227,9 @@ int main(void) {
 
     /* Step 1: Mount pseudo-filesystems */
     mount_pseudofs();
+
+    /* Step 1b: Load bundled 9p modules (no-op on the synthetic kernel) */
+    load_9p_modules();
 
     /* Step 2: Baseline config from kernel cmdline */
     memset(&cfg, 0, sizeof(cfg));
