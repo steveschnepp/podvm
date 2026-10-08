@@ -33,8 +33,8 @@ test_integration: test_integration.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # Image pipeline tests (includes src/image.c; needs curl + zlib)
-test_image: test_image.c ../src/image.c ../src/image.h
-	$(CC) $(CFLAGS) -o $@ $< -I../src -lcurl -lz
+test_image: test_image.c ../src/image.c ../src/image.h ../src/json.c ../src/json.h
+	$(CC) $(CFLAGS) -o $@ test_image.c ../src/json.c -I../src -lcurl -lz
 
 # Run all tests
 test: $(TESTS)
