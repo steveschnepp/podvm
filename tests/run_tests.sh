@@ -81,7 +81,7 @@ echo ""
 # Dependency checks
 run_test "QEMU available" "which qemu-system-x86_64"
 run_test "KVM available" "test -e /dev/kvm"
-run_test "virtiofsd available" "which virtiofsd || echo WARN: virtiofsd not installed"
+run_test "9p modules available" "find /lib/modules/$(uname -r) -name '9p*.ko*' | grep -q . || echo WARN: no 9p modules for host kernel"
 run_test "musl-gcc available" "which musl-gcc || echo WARN: musl-gcc not installed"
 
 echo ""
@@ -90,7 +90,7 @@ echo ""
 
 # Kernel config checks
 run_test "Vsock enabled" "grep -q 'CONFIG_VSOCK=y' kernel/config"
-run_test "Virtio FS enabled" "grep -q 'CONFIG_VIRTIO_FS=y' kernel/config"
+run_test "9p enabled" "grep -q 'CONFIG_NET_9P_VIRTIO=y' kernel/config && grep -q 'CONFIG_9P_FS=y' kernel/config"
 run_test "Balloon enabled" "grep -q 'CONFIG_VIRTIO_BALLOON=y' kernel/config"
 run_test "Uncompressed kernel" "grep -q 'CONFIG_KERNEL_UNCOMPRESSED=y' kernel/config"
 run_test "No BPF" "grep -q 'CONFIG_BPF=y' kernel/config && exit 1 || true"

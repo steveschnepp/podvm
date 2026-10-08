@@ -16,8 +16,16 @@ CONFIG_KVM_GUEST=y
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_PCI=y
 CONFIG_VIRTIO_CONSOLE=y
-CONFIG_VIRTIO_FS=y
 CONFIG_VIRTIO_BALLOON=y
+
+# ──── 9p (container rootfs share) ────
+# 9p is the rootfs transport until the performance phase (ADR-022), when
+# virtiofs returns. CONFIG_NET_9P depends on CONFIG_NET, so a minimal net
+# stack is unavoidable -- see ADR-022 for the attack-surface tradeoff.
+CONFIG_NET=y
+CONFIG_NET_9P=y
+CONFIG_NET_9P_VIRTIO=y
+CONFIG_9P_FS=y
 
 # ──── Vsock (host↔guest IPC) ────
 CONFIG_VSOCK=y
@@ -95,6 +103,7 @@ CONFIG_KERNEL_UNCOMPRESSED=y
 # OVERLAY_FS     - host handles this
 # EXT4/BTRFS/XFS - no local disks
 # NFS/CIFS       - no network filesystems
+# VIRTIO_FS      - deferred to performance phase (ADR-022); 9p is primary now
 # ATA/SCSI/USB   - no hardware
 # SOUND/DRM      - no GUI
 # WLAN/BLUETOOTH - no wireless
