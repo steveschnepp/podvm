@@ -32,6 +32,7 @@
 #include "image.h"
 #include "store.h"
 #include "strparse.h"
+#include "imgcfg.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -252,83 +253,29 @@ static void build_cmdline(char *buf, size_t len) {
 
 /*
  * Fold an image's config (Env/Entrypoint/Cmd/WorkingDir/User) into the
- * run config, honoring the OCI promise that an image carries its own
- * default command (ADR-005).
- *
- * Command resolution follows docker semantics:
- *   podvm img            -> Entrypoint + Cmd from the image
- *   podvm img foo [args] -> Entrypoint + foo args  (the user's command
- *                            replaces Cmd, but an image Entrypoint still
- *                            leads, exactly as `docker run` does)
- *
- * The wire format is a single entrypoint plus comma-joined args (the
- * guest splits args on commas via csv_parse), so we build those two
- * strings directly rather than joining and re-splitting.
- *
- * Env is appended to config.env (image vars; HOME is ensured afterward).
- * cwd and user are taken from the image when the user gave no override.
+ * run config. The resolution logic is imgcfg_fold() in imgcfg.c (pure,
+ * table-tested); this is just the glue between the global config and that
+ * function. An image that carries a default command can now run with no
+ * command typed on the CLI (ADR-005).
  */
 static void apply_image_config(const ImageConfig *ic) {
-    char entry[MAX_PATH];
-    char argbuf[sizeof(config.args)];
-    size_t eoff = 0;
-    int have_entry = 0;
+    /* The user's CLI command + args are the base; env/cwd/user start
+     * unset so the image can supply them. */
+    RunSpec base;
+    RunSpec out;
+    memset(&base, 0, sizeof(base));
+    snprintf(base.entrypoint, sizeof(base.entrypoint), "%s", config.entrypoint);
+    snprintf(base.args, sizeof(base.args), "%s", config.args);
+    snprintf(base.cwd, sizeof(base.cwd), "%s", config.cwd);
+    snprintf(base.user, sizeof(base.user), "%s", config.user);
 
-    entry[0] = '\0';
-    argbuf[0] = '\0';
+    imgcfg_fold(ic, &base, &out);
 
-    /* Append one word as either the entrypoint or a comma-joined arg. */
-#define PUSH_WORD(w) do { \
-    if (!have_entry) { \
-        int _w = snprintf(entry + eoff, sizeof(entry) - eoff, "%s", (w)); \
-        if (_w >= 0 && (size_t)_w < sizeof(entry) - eoff) { eoff += (size_t)_w; have_entry = 1; } \
-    } else { \
-        size_t _have = strlen(argbuf); \
-        int _w = snprintf(argbuf + _have, sizeof(argbuf) - _have, "%s%s", _have ? "," : "", (w)); \
-        (void)_w; \
-    } \
-} while (0)
-
-    /* Image Entrypoint always leads. */
-    for (int i = 0; i < ic->nentry; i++)
-        PUSH_WORD(ic->entrypoint[i]);
-
-    if (config.entrypoint[0]) {
-        /* User named a command: it replaces Cmd, after any Entrypoint. */
-        PUSH_WORD(config.entrypoint);
-        /* config.args is already comma-joined from the CLI. */
-        for (char *tok = strtok(config.args, ","); tok; tok = strtok(NULL, ","))
-            PUSH_WORD(tok);
-    } else {
-        for (int i = 0; i < ic->ncmd; i++)
-            PUSH_WORD(ic->cmd[i]);
-    }
-#undef PUSH_WORD
-
-    if (have_entry) {
-        snprintf(config.entrypoint, sizeof(config.entrypoint), "%s", entry);
-        snprintf(config.args, sizeof(config.args), "%s", argbuf);
-    }
-
-    /* Env: append the image's vars to whatever is already set. */
-    for (int i = 0; i < ic->nenv; i++) {
-        size_t have = strlen(config.env);
-        int w = snprintf(config.env + have, sizeof(config.env) - have,
-                         "%s%s", have ? "," : "", ic->env[i]);
-        if (w < 0 || (size_t)w >= sizeof(config.env) - have) break;
-    }
-    /* Ensure HOME is set (docker always provides one; the image may not). */
-    if (!strstr(config.env, "HOME=")) {
-        size_t have = strlen(config.env);
-        snprintf(config.env + have, sizeof(config.env) - have,
-                 "%sHOME=/root", have ? "," : "");
-    }
-
-    /* cwd / user: image supplies them when the user gave no override. */
-    if (!config.cwd[0] && ic->cwd[0])
-        snprintf(config.cwd, sizeof(config.cwd), "%s", ic->cwd);
-    if (!config.user[0] && ic->user[0])
-        snprintf(config.user, sizeof(config.user), "%s", ic->user);
+    snprintf(config.entrypoint, sizeof(config.entrypoint), "%s", out.entrypoint);
+    snprintf(config.args, sizeof(config.args), "%s", out.args);
+    snprintf(config.env, sizeof(config.env), "%s", out.env);
+    snprintf(config.cwd, sizeof(config.cwd), "%s", out.cwd);
+    snprintf(config.user, sizeof(config.user), "%s", out.user);
 }
 
 

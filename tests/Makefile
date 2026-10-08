@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256
+TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg
 
 .PHONY: all test clean
 
@@ -40,6 +40,10 @@ test_image: test_image.c ../src/image.c ../src/image.h ../src/json.c ../src/json
 test_sha256: test_sha256.c ../src/sha256.c ../src/sha256.h
 	$(CC) $(CFLAGS) -o $@ test_sha256.c ../src/sha256.c -I../src
 
+# Image-config fold tests (pure logic, no deps)
+test_imgcfg: test_imgcfg.c ../src/imgcfg.c ../src/imgcfg.h ../src/image.h
+	$(CC) $(CFLAGS) -o $@ test_imgcfg.c ../src/imgcfg.c -I../src
+
 # Run all tests
 test: $(TESTS)
 	@echo "Running tests..."
@@ -61,6 +65,9 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== SHA-256 Tests ==="
 	./test_sha256 || true
+	@echo ""
+	@echo "=== Image Config Fold Tests ==="
+	./test_imgcfg || true
 	@echo ""
 	@echo "All tests complete!"
 
