@@ -14,6 +14,8 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 - **Vsock IPC** - Host↔guest communication via virtio-vsock
 - **Uncompressed initrd** - Faster boot, less kernel code
 - **No guest runtime** - Container runs directly in VM
+- **9p rootfs share** - No host daemon required (virtiofs returns in the
+  performance phase; see [ADR-022](adrs/podvm_adr022_9p-rootfs-transport.md))
 
 ## Architecture
 
@@ -24,14 +26,11 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 │  │  podvm CLI                                              │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │  virtiofsd                                              │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────┐ │
 │  │  QEMU                                                   │ │
 │  └─────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
                              │
-                    virtiofs │ vsock
+                    9p │ vsock
                              │
 ┌─────────────────────────────┼───────────────────────────────┐
 │  VM                         │                               │
@@ -42,7 +41,7 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 │  │  /init (static)                                          │ │
 │  └──────────────────────────┬─────────────────────────────┘ │
 │  ┌──────────────────────────▼─────────────────────────────┐ │
-│  │  Container Rootfs (via virtiofs)                       │ │
+│  │  Container Rootfs (via virtio 9p)                       │ │
 │  └─────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -51,10 +50,11 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 
 - Linux with KVM support
 - QEMU (`qemu-system-x86_64`)
-- virtiofsd (shares the container rootfs with the guest)
 - libcurl + zlib (host build; registry pull + gzip layers)
 - CMake 3.10+
 - musl-gcc (optional) for the guest init; falls back to gcc when absent
+- 9p + vsock kernel modules for the running host kernel (host-kernel boots
+  only; bundled automatically into the initramfs by guest/build-initramfs.sh)
 
 Optional, for the full VM path:
 - `/dev/vhost-vsock` on the host (enables the vsock config channel;
@@ -231,7 +231,8 @@ See [adrs/](adrs/) for detailed architecture decisions:
 - **ADR003**: Musl static guest init
 - **ADR007**: Synthetic kernel
 - **ADR016**: Vsock IPC
-- **ADR019**: Virtiofs with QEMU
+- **ADR019**: Virtiofs with QEMU (deferred; see ADR-022)
+- **ADR022**: 9p rootfs transport (current)
 
 ## Security
 
@@ -240,7 +241,7 @@ See [adrs/](adrs/) for detailed architecture decisions:
 The kernel config minimizes attack surface:
 
 **Included:**
-- Virtio PCI, Console, FS, Balloon
+- Virtio PCI, Console, Balloon, 9p
 - Vsock
 - Namespaces (UTS/IPC/USER/PID/NET)
 - Seccomp
@@ -260,7 +261,8 @@ The kernel config minimizes attack surface:
 - **Trust boundary**: Host is trusted, container is untrusted
 - **Isolation**: Hardware VM boundary (KVM)
 - **IPC**: Vsock (not shared memory)
-- **Filesystem**: Virtiofs (host-controlled)
+- **Filesystem**: virtio 9p (host-controlled; virtiofs returns in the
+  performance phase per ADR-022)
 
 ## Documentation
 

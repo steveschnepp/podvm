@@ -2,7 +2,9 @@
 
 **Date:** 2024-09-29
 
-**Status:** Accepted
+**Status:** Superseded for now by ADR-022 (9p rootfs transport). virtiofs
+returns as the default in the performance phase; this ADR remains the
+design of record for that restoration (see ADR-022 follow-up list).
 
 ## Context
 
