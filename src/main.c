@@ -10,20 +10,27 @@
  * Build: gcc -O2 -o podvm src/main.c
  */
 
+#define _GNU_SOURCE   /* unshare, CLONE_NEWUSER */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <signal.h>
+#include <sched.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <sys/socket.h>
 #include <linux/vm_sockets.h>
 
 #include "image.h"
+#include "store.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -90,6 +97,12 @@ static void handle_signal(int sig) {
 
 /* vsock availability on the host (auto-detected) */
 static int vsock_available = 0;
+
+/* Podman-storage mode: rootfs is an overlay over podman layer diffs,
+ * mounted inside the QEMU child's user namespace (see run_qemu_child). */
+#define MAX_CHAIN 64
+static StoreLayer store_layers[MAX_CHAIN];
+static int store_nlayers = 0;
 
 /* Detect host vsock support via /dev/vhost-vsock */
 static void detect_vsock(void) {
@@ -182,6 +195,104 @@ static void build_cmdline(char *buf, size_t len) {
         config.env[0] ? config.env : "HOME=/root");
 }
 
+/*
+ * Enter a user+mount namespace and mount the podman layer chain as an
+ * overlay at config.rootfs_dir. Runs in the QEMU child after fork().
+ *
+ * Rootless podman storage is only a valid rootfs inside a userns: the
+ * diff dirs are plain dirs, and the union needs CAP_SYS_ADMIN in a
+ * namespace to mount overlay. The VM's isolation boundary is the VM
+ * (ADR-001); staging the files through a userns changes nothing about
+ * that (ADR-024).
+ *
+ * uid_map: map our uid to 0 inside the ns so the overlay mount is
+ * permitted; 9p then serves the files as the invoking user outside.
+ */
+static int setup_userns_overlay(void) {
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    char buf[64];
+
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) {
+        fprintf(stderr, "podvm: unshare user+mnt failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Deny setgroups, then map uid/gid. Must be done in this order. */
+    int fd = open("/proc/self/setgroups", O_WRONLY);
+    if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
+
+    snprintf(buf, sizeof(buf), "0 %u 1", uid);
+    fd = open("/proc/self/uid_map", O_WRONLY);
+    if (fd < 0 || write(fd, buf, strlen(buf)) < 0) {
+        fprintf(stderr, "podvm: uid_map failed: %s\n", strerror(errno));
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    close(fd);
+
+    snprintf(buf, sizeof(buf), "0 %u 1", gid);
+    fd = open("/proc/self/gid_map", O_WRONLY);
+    if (fd < 0 || write(fd, buf, strlen(buf)) < 0) {
+        fprintf(stderr, "podvm: gid_map failed: %s\n", strerror(errno));
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    close(fd);
+
+    /* Stop mount propagation so our tmpfs/overlay stay private. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        fprintf(stderr, "podvm: make-rprivate failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* upper + work on a private tmpfs; merged is the 9p-served rootfs */
+    char basedir[STORE_PATH_MAX], updir[STORE_PATH_MAX], wkdir[STORE_PATH_MAX];
+    snprintf(basedir, sizeof(basedir), "/tmp/podvm-ovl.%d", getpid());
+    snprintf(updir, sizeof(updir), "%s/u", basedir);
+    snprintf(wkdir, sizeof(wkdir), "%s/w", basedir);
+
+    if (mkdir(basedir, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "podvm: mkdir %s failed: %s\n", basedir, strerror(errno));
+        return -1;
+    }
+    if (mount("tmpfs", basedir, "tmpfs", 0, "mode=0755") < 0) {
+        fprintf(stderr, "podvm: tmpfs for upper failed: %s\n", strerror(errno));
+        return -1;
+    }
+    mkdir(updir, 0755);
+    mkdir(wkdir, 0755);
+    if (mkdir(config.rootfs_dir, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "podvm: mkdir %s failed: %s\n",
+                config.rootfs_dir, strerror(errno));
+        return -1;
+    }
+
+    /* Build lowerdir chain: top-first, colon-separated */
+    char lowers[STORE_PATH_MAX * 8];
+    size_t off = 0;
+    for (int i = 0; i < store_nlayers; i++) {
+        int w = snprintf(lowers + off, sizeof(lowers) - off, "%s%s",
+                         i ? ":" : "", store_layers[i].diff);
+        if (w < 0 || (size_t)w >= sizeof(lowers) - off) {
+            fprintf(stderr, "podvm: lowerdir chain too long\n");
+            return -1;
+        }
+        off += (size_t)w;
+    }
+
+    char opts[STORE_PATH_MAX * 9];
+    snprintf(opts, sizeof(opts),
+             "lowerdir=%s,upperdir=%s,workdir=%s,userxattr",
+             lowers, updir, wkdir);
+
+    if (mount("overlay", config.rootfs_dir, "overlay", 0, opts) < 0) {
+        fprintf(stderr, "podvm: overlay mount failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* Start QEMU (non-blocking) */
 static int start_qemu(void) {
     char cmdline[MAX_CMDLINE];
@@ -239,7 +350,10 @@ static int start_qemu(void) {
 
     qemu_pid = fork();
     if (qemu_pid == 0) {
-        /* Child: exec QEMU */
+        /* Child: stage the rootfs (podman layers via userns overlay),
+         * then exec QEMU inside that namespace. */
+        if (store_nlayers > 0 && setup_userns_overlay() < 0)
+            _exit(1);
         execvp("qemu-system-x86_64", (char *const *)qargs);
         fprintf(stderr, "podvm: exec qemu failed: %s\n", strerror(errno));
         _exit(1);
@@ -362,9 +476,38 @@ int main(int argc, char **argv) {
     
     /* Resolve rootfs/image */
     char resolved_rootfs[MAX_PATH];
-    if (image_resolve(config.rootfs_dir, resolved_rootfs, sizeof(resolved_rootfs)) < 0) {
-        fprintf(stderr, "podvm: failed to resolve image/path: %s\n", config.rootfs_dir);
-        return 1;
+
+    /*
+     * Resolution order:
+     *   1. directory path -> use as-is
+     *   2. podman storage -> layers in place (pull via podman if missing)
+     *   3. podvm's own registry pull -> cache
+     */
+    if (image_is_path(config.rootfs_dir)) {
+        if (image_resolve(config.rootfs_dir, resolved_rootfs,
+                          sizeof(resolved_rootfs)) < 0) {
+            fprintf(stderr, "podvm: directory not found: %s\n", config.rootfs_dir);
+            return 1;
+        }
+    } else {
+        char top[STORE_PATH_MAX];
+        if (store_resolve(config.rootfs_dir, top, sizeof(top), 1) == 0) {
+            store_nlayers = store_chain(top, store_layers, MAX_CHAIN);
+            if (store_nlayers <= 0) {
+                fprintf(stderr, "podvm: no layer chain for %s\n", config.rootfs_dir);
+                return 1;
+            }
+            printf("podvm: using podman storage: %s (%d layers)\n",
+                   config.rootfs_dir, store_nlayers);
+            /* Served dir is created by the QEMU child's overlay mount */
+            snprintf(resolved_rootfs, sizeof(resolved_rootfs),
+                     "/tmp/podvm-rootfs.%d", getpid());
+        } else if (image_resolve(config.rootfs_dir, resolved_rootfs,
+                                 sizeof(resolved_rootfs)) < 0) {
+            fprintf(stderr, "podvm: failed to resolve image/path: %s\n",
+                    config.rootfs_dir);
+            return 1;
+        }
     }
     
     /* Copy resolved path back */
