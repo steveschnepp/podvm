@@ -116,6 +116,12 @@ if [ -e /dev/kvm ]; then
     else
         echo "E2E net (DNS+HTTPS)           SKIPPED (no alpine image)"
     fi
+    # Image-config e2e (image's own Cmd/Env with no CLI command): needs podman.
+    if which podman > /dev/null 2>&1; then
+        run_test "E2E image config (default cmd)" "sh tests/e2e_imgcfg.sh"
+    else
+        echo "E2E image config (default cmd) SKIPPED (no podman)"
+    fi
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi
