@@ -43,6 +43,8 @@ static struct {
     char entrypoint[MAX_PATH];
     char args[256];
     char env[1024];
+    char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
+    char user[128];           /* from image User ("uid:gid") */
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -it flag */
@@ -189,11 +191,97 @@ static void build_cmdline(char *buf, size_t len) {
         "podvm.root=/rootfs "
         "podvm.entrypoint=%s "
         "podvm.args=%s "
-        "podvm.env=%s",
+        "podvm.env=%s "
+        "podvm.cwd=%s "
+        "podvm.user=%s",
         config.entrypoint,
         config.args[0] ? config.args : "-",
-        config.env[0] ? config.env : "HOME=/root");
+        config.env[0] ? config.env : "HOME=/root",
+        config.cwd[0] ? config.cwd : "/",
+        config.user[0] ? config.user : "-");
 }
+
+/*
+ * Fold an image's config (Env/Entrypoint/Cmd/WorkingDir/User) into the
+ * run config, honoring the OCI promise that an image carries its own
+ * default command (ADR-005).
+ *
+ * Command resolution follows docker semantics:
+ *   podvm img            -> Entrypoint + Cmd from the image
+ *   podvm img foo [args] -> Entrypoint + foo args  (the user's command
+ *                            replaces Cmd, but an image Entrypoint still
+ *                            leads, exactly as `docker run` does)
+ *
+ * The wire format is a single entrypoint plus comma-joined args (the
+ * guest splits args on commas via csv_parse), so we build those two
+ * strings directly rather than joining and re-splitting.
+ *
+ * Env is appended to config.env (image vars; HOME is ensured afterward).
+ * cwd and user are taken from the image when the user gave no override.
+ */
+static void apply_image_config(const ImageConfig *ic) {
+    char entry[MAX_PATH];
+    char argbuf[sizeof(config.args)];
+    size_t eoff = 0;
+    int have_entry = 0;
+
+    entry[0] = '\0';
+    argbuf[0] = '\0';
+
+    /* Append one word as either the entrypoint or a comma-joined arg. */
+#define PUSH_WORD(w) do { \
+    if (!have_entry) { \
+        int _w = snprintf(entry + eoff, sizeof(entry) - eoff, "%s", (w)); \
+        if (_w >= 0 && (size_t)_w < sizeof(entry) - eoff) { eoff += (size_t)_w; have_entry = 1; } \
+    } else { \
+        size_t _have = strlen(argbuf); \
+        int _w = snprintf(argbuf + _have, sizeof(argbuf) - _have, "%s%s", _have ? "," : "", (w)); \
+        (void)_w; \
+    } \
+} while (0)
+
+    /* Image Entrypoint always leads. */
+    for (int i = 0; i < ic->nentry; i++)
+        PUSH_WORD(ic->entrypoint[i]);
+
+    if (config.entrypoint[0]) {
+        /* User named a command: it replaces Cmd, after any Entrypoint. */
+        PUSH_WORD(config.entrypoint);
+        /* config.args is already comma-joined from the CLI. */
+        for (char *tok = strtok(config.args, ","); tok; tok = strtok(NULL, ","))
+            PUSH_WORD(tok);
+    } else {
+        for (int i = 0; i < ic->ncmd; i++)
+            PUSH_WORD(ic->cmd[i]);
+    }
+#undef PUSH_WORD
+
+    if (have_entry) {
+        snprintf(config.entrypoint, sizeof(config.entrypoint), "%s", entry);
+        snprintf(config.args, sizeof(config.args), "%s", argbuf);
+    }
+
+    /* Env: append the image's vars to whatever is already set. */
+    for (int i = 0; i < ic->nenv; i++) {
+        size_t have = strlen(config.env);
+        int w = snprintf(config.env + have, sizeof(config.env) - have,
+                         "%s%s", have ? "," : "", ic->env[i]);
+        if (w < 0 || (size_t)w >= sizeof(config.env) - have) break;
+    }
+    /* Ensure HOME is set (docker always provides one; the image may not). */
+    if (!strstr(config.env, "HOME=")) {
+        size_t have = strlen(config.env);
+        snprintf(config.env + have, sizeof(config.env) - have,
+                 "%sHOME=/root", have ? "," : "");
+    }
+
+    /* cwd / user: image supplies them when the user gave no override. */
+    if (!config.cwd[0] && ic->cwd[0])
+        snprintf(config.cwd, sizeof(config.cwd), "%s", ic->cwd);
+    if (!config.user[0] && ic->user[0])
+        snprintf(config.user, sizeof(config.user), "%s", ic->user);
+}
+
 
 /*
  * Enter a user+mount namespace and mount the podman layer chain as an
@@ -402,6 +490,7 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     int opt;
     int option_index = 0;
+    const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {
         {"interactive", no_argument,       0, 'i'},
@@ -456,6 +545,14 @@ int main(int argc, char **argv) {
 
     /* Get image or rootfs directory */
     strncpy(config.rootfs_dir, argv[optind], MAX_PATH - 1);
+    config.rootfs_dir[MAX_PATH - 1] = '\0';
+    {
+        /* Keep the user's original ref for image-config lookup (the
+         * rootfs_dir field is overwritten with the resolved path below). */
+        static char image_ref_buf[MAX_PATH];
+        snprintf(image_ref_buf, sizeof(image_ref_buf), "%s", config.rootfs_dir);
+        image_ref = image_ref_buf;
+    }
     optind++;
 
     /* Get entrypoint (if provided) */
@@ -485,6 +582,7 @@ int main(int argc, char **argv) {
     
     /* Resolve rootfs/image */
     char resolved_rootfs[MAX_PATH];
+    int used_podman = 0;
 
     /*
      * Resolution order:
@@ -508,6 +606,7 @@ int main(int argc, char **argv) {
             }
             printf("podvm: using podman storage: %s (%d layers)\n",
                    config.rootfs_dir, store_nlayers);
+            used_podman = 1;
             /* Served dir is created by the QEMU child's overlay mount */
             snprintf(resolved_rootfs, sizeof(resolved_rootfs),
                      "/tmp/podvm-rootfs.%d", getpid());
@@ -522,6 +621,32 @@ int main(int argc, char **argv) {
     /* Copy resolved path back */
     strncpy(config.rootfs_dir, resolved_rootfs, MAX_PATH - 1);
     config.rootfs_dir[MAX_PATH - 1] = '\0';
+
+    /*
+     * Fold the image's own config (Env/Entrypoint/Cmd/WorkingDir/User)
+     * into the run config. An image that carries a default command can
+     * now run with no command typed on the CLI (ADR-005). Only applies
+     * when we resolved an image -- a bare rootfs dir has no config.
+     */
+    if (!image_is_path(image_ref)) {
+        ImageConfig ic;
+        image_config_init(&ic);
+        int got = used_podman
+                ? store_image_config(image_ref, &ic)
+                : image_config_load(image_ref, &ic);
+        if (got == 0)
+            apply_image_config(&ic);
+        image_config_free(&ic);
+    }
+
+    /* The entrypoint is the one thing the guest cannot invent: if neither
+     * the user nor the image supplied a command, there is nothing to exec. */
+    if (!config.entrypoint[0]) {
+        fprintf(stderr, "podvm: no command given and image '%s' declares none\n",
+                image_ref);
+        fprintf(stderr, "podvm: usage: podvm [options] <image|rootfs> [command]\n");
+        return 1;
+    }
 
     /* Setup signal handlers */
     signal(SIGINT, handle_signal);
@@ -544,11 +669,15 @@ int main(int argc, char **argv) {
                  "podvm.root=%s "
                  "podvm.entrypoint=%s "
                  "podvm.args=%s "
-                 "podvm.env=%s",
+                 "podvm.env=%s "
+                 "podvm.cwd=%s "
+                 "podvm.user=%s",
                  "/rootfs",
                  config.entrypoint,
                  config.args[0] ? config.args : "-",
-                 config.env[0] ? config.env : "HOME=/root");
+                 config.env[0] ? config.env : "HOME=/root",
+                 config.cwd[0] ? config.cwd : "/",
+                 config.user[0] ? config.user : "-");
 
         printf("podvm: sending config to guest over vsock\n");
         if (send_config_vsock(vsock_config) < 0) {
