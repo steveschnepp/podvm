@@ -603,7 +603,22 @@ int main(int argc, char **argv) {
      *   1. directory path -> use as-is
      *   2. podman storage -> layers in place (pull via podman if missing)
      *   3. podvm's own registry pull -> cache
+     *
+     * PODVM_RESOLVE overrides the storage choice for an image ref:
+     *   podvm   -> podman storage only (fail if absent)
+     *   native  -> podvm's own registry pull only
+     *   auto    -> the default order above
+     * Mostly a testing knob (the native pull path is otherwise only
+     * reached when podman storage misses), but also lets a user prefer
+     * podvm's own pull over podman's storage.
      */
+    const char *resolve_pref = getenv("PODVM_RESOLVE");
+    int want_native = resolve_pref && !strcmp(resolve_pref, "native");
+    int want_podman = resolve_pref && !strcmp(resolve_pref, "podman");
+    if (resolve_pref && !want_native && !want_podman) {
+        fprintf(stderr, "podvm: PODVM_RESOLVE must be 'auto', 'podman' or 'native'\n");
+        return 1;
+    }
     if (image_is_path(config.rootfs_dir)) {
         if (image_resolve(config.rootfs_dir, resolved_rootfs,
                           sizeof(resolved_rootfs)) < 0) {
@@ -612,7 +627,11 @@ int main(int argc, char **argv) {
         }
     } else {
         char top[STORE_PATH_MAX];
-        if (store_resolve(config.rootfs_dir, top, sizeof(top), 1) == 0) {
+        int resolved = 0;
+
+        /* 2. podman storage (skipped when the user forced native). */
+        if (!want_native &&
+            store_resolve(config.rootfs_dir, top, sizeof(top), 1) == 0) {
             store_nlayers = store_chain(top, store_layers, MAX_CHAIN);
             if (store_nlayers <= 0) {
                 fprintf(stderr, "podvm: no layer chain for %s\n", config.rootfs_dir);
@@ -621,11 +640,21 @@ int main(int argc, char **argv) {
             printf("podvm: using podman storage: %s (%d layers)\n",
                    config.rootfs_dir, store_nlayers);
             used_podman = 1;
+            resolved = 1;
             /* Served dir is created by the QEMU child's overlay mount */
             snprintf(resolved_rootfs, sizeof(resolved_rootfs),
                      "/tmp/podvm-rootfs.%d", getpid());
-        } else if (image_resolve(config.rootfs_dir, resolved_rootfs,
-                                 sizeof(resolved_rootfs)) < 0) {
+        } else if (want_podman) {
+            fprintf(stderr, "podvm: image '%s' not in podman storage "
+                            "(PODVM_RESOLVE=podman)\n", config.rootfs_dir);
+            return 1;
+        }
+
+        /* 3. podvm's own registry pull (skipped when the user forced
+         * podman, which already failed above). */
+        if (!resolved && !want_podman &&
+            image_resolve(config.rootfs_dir, resolved_rootfs,
+                          sizeof(resolved_rootfs)) < 0) {
             fprintf(stderr, "podvm: failed to resolve image/path: %s\n",
                     config.rootfs_dir);
             return 1;

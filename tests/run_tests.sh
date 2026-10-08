@@ -64,6 +64,7 @@ run_test "Config parsing" "./tests/test_config"
 run_test "Host args" "./tests/test_host_args"
 run_test "Vsock basics" "./tests/test_vsock"
 run_test "Image pipeline" "./tests/test_image"
+run_test "SHA-256" "./tests/test_sha256"
 
 echo ""
 echo "Running integration tests..."
@@ -122,6 +123,8 @@ if [ -e /dev/kvm ]; then
     else
         echo "E2E image config (default cmd) SKIPPED (no podman)"
     fi
+    # Native-pull e2e: forces podvm's own registry client (PODVM_RESOLVE=native).
+    run_test "E2E native pull" "timeout 250 sh tests/e2e_native.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi
