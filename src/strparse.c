@@ -45,7 +45,7 @@ int csv_parse(const char *input, char **output, int max) {
     const char *p = input;
 
     while (*p && count < max) {
-        /* Skip leading spaces */
+        /* Skip leading spaces (tolerant after a comma) */
         while (*p == ' ') p++;
         if (!*p) break;
 
@@ -64,8 +64,12 @@ int csv_parse(const char *input, char **output, int max) {
             count++;
         }
 
-        /* Skip comma */
+        /* Comma: continue. Space/end: the value is done -- in the
+         * kernel cmdline format a space starts a new podvm.*= token;
+         * the host joins args with commas only, so a space is a
+         * terminator, not a separator. */
         if (*p == ',') p++;
+        else break;
     }
 
     return count;

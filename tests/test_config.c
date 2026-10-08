@@ -217,7 +217,22 @@ static void test_parse_cmdline(void) {
     assert(cfg.entrypoint[0] == '\0');
     
     config_free(&cfg);
-    
+
+    /* Regression: args value must terminate at the token boundary.
+     * A space starts the next podvm.*= token; it is not an arg
+     * separator (the host joins args with commas). Found via the
+     * podman-storage e2e: "podvm.args=OK podvm.env=HOME=/root" used
+     * to yield args = {"OK", "podvm.env=HOME=/root"}. */
+    parse_cmdline(&cfg,
+        "podvm.root=/rootfs "
+        "podvm.entrypoint=/bin/echo "
+        "podvm.args=OK "
+        "podvm.env=HOME=/root");
+    assert(cfg.argc == 1);
+    assert(strcmp(cfg.args[0], "OK") == 0);
+
+    config_free(&cfg);
+
     printf("PASS: test_parse_cmdline\n");
 }
 
