@@ -240,15 +240,43 @@ guest with `eth0 up 10.0.2.15 via 10.0.2.2`.
 
 ## Next Steps
 
-1. **sha256 layer-digest verification + zstd layers** (still open;
-   `image.c` TODO).
-2. **Image config blob (Env/Entrypoint/Cmd)** -- now easy via podman
-   storage big-data; honors a pulled image's default command instead of
-   only the CLI entrypoint.
-3. **Args-with-spaces on the config channel** -- needs quoting/escaping so
-   entrypoints with spaced args work.
-4. **ADR-023 cleanup**: the slirp constants are hardcoded in `init.c`;
-   when bridge networking lands, route per-container config through the
-   existing `podvm.*=` cmdline/vsock channel.
-5. **End-to-end `podvm <image> <cmd>` against the native pull** (not just
-   podman storage) to cover the fallback path in the suite.
+Refined after verifying the current state (tree clean, all three e2e
+tests green: 19 PASS / 1 WARN / 0 FAIL). Ranked by value.
+
+1. **Image config blob (Env/Entrypoint/Cmd) -- the recommended next
+   step.** Verified broken today: `podvm alpine:latest` with *no* command
+   sends an empty entrypoint (`podvm.entrypoint=`) and the guest rejects
+   it ("podvm.entrypoint not set"). So podvm can only run images whose
+   command the user types, which undercuts the OCI promise (ADR-005) that
+   an image carries its own default command. Now cheap: the storage
+   backend already parses manifests, and the config blob sits in podman
+   storage big-data (`images.json` -> `big-data-names` ->
+   `manifest-sha256:*` -> JSON with Env/Entrypoint/Cmd/WorkingDir).
+   Unlocks: `podvm <image>` just runs the image's default command; env
+   and working-dir honored, not just CLI flags.
+2. **sha256 layer-digest verification** (`image.c` TODO). Real integrity
+   gap; do it before the pull path is used against untrusted registries.
+3. **zstd layer support** (`image.c` TODO). Registries increasingly
+   default to zstd; will bite eventually, not immediately.
+4. **`-i` / `--interactive` is a dead flag.** Parsed and stored
+   (`config.interactive`) but never read -- QEMU already attaches stdio
+   via `-serial mon:stdio -nographic`. Either wire it to something real
+   or drop it from the CLI.
+5. **Native-pull e2e coverage.** The native registry client works (fixed
+   this session) but is not exercised by the suite -- only podman storage
+   is. Add an e2e that pulls via the native path and boots.
+6. **Overlay write-back.** The podman-storage upper layer is a throwaway
+   tmpfs, so in-guest writes vanish with the VM. Needs ADR-020's guest
+   overlay module design to commit changes back.
+7. **Args-with-spaces on the config channel.** Left as-is per decision;
+   the space-delimited `podvm.*=` format cannot carry an argument with a
+   space (a format constraint, not a parser bug -- no library fixes it).
+   Revisit if real entrypoints need spaced args; fix is to the encoding
+   (escape or length-prefix over vsock), keeping `strparse.c` as the
+   cmdline-fallback decoder.
+8. **ADR-023 cleanup.** The slirp constants (10.0.2.15/2.3) are
+   hardcoded in `init.c`; when bridge networking lands, route
+   per-container config through the existing `podvm.*=` cmdline/vsock
+   channel.
+9. **Bigger design items (deliberate future work):** ADR-021 FreeBSD
+   platform, ADR-020 guest overlay module.
