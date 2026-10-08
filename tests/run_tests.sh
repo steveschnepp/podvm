@@ -66,6 +66,7 @@ run_test "Vsock basics" "./tests/test_vsock"
 run_test "Image pipeline" "./tests/test_image"
 run_test "SHA-256" "./tests/test_sha256"
 run_test "Image config fold" "./tests/test_imgcfg"
+run_test "User resolution" "./tests/test_userdb"
 
 echo ""
 echo "Running integration tests..."

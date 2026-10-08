@@ -18,6 +18,8 @@ tests/test_kernel_config
 tests/test_integration
 tests/test_image
 tests/test_sha256
+tests/test_imgcfg
+tests/test_userdb
 
 # Debug/build logs (output capture)
 out/

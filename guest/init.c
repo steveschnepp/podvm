@@ -35,6 +35,7 @@
 #include <linux/vm_sockets.h>
 
 #include "strparse.h"
+#include "userdb.h"
 
 #define MAX_ARGS      64
 #define PATH_SIZE     1024
@@ -56,7 +57,9 @@ typedef struct {
     int  nenv;
     char cwd[PATH_SIZE];
     char hostname[256];
-    int  uid;
+    char user[128];        /* raw podvm.user spec ("uid:gid" or "name:group") */
+    int  uid;              /* resolved after chroot from the container's
+                            * /etc/passwd + /etc/group (see userdb.c) */
     int  gid;
 } Config;
 
@@ -125,10 +128,8 @@ static void parse_config(Config *cfg, const char *text) {
 
     val = kv_find(text, "podvm.user=");
     if (val) {
-        char tok[128];
-        kv_copy_value(tok, sizeof(tok), val);
-        kv_unescape(tok);
-        parse_uid_gid(tok, &cfg->uid, &cfg->gid);
+        kv_copy_value(cfg->user, sizeof(cfg->user), val);
+        kv_unescape(cfg->user);
     }
 }
 
@@ -434,7 +435,22 @@ int main(void) {
         *eq = '=';   /* keep the string intact for any later use */
     }
 
-    /* Step 9: Switch user */
+    /* Step 9: Switch user. The podvm.user spec may name a user/group
+     * (e.g. "nobody", "app:app") rather than raw ids, so it is resolved
+     * against /etc/passwd and /etc/group *after* chroot -- those files
+     * are the container's, and docker resolves an image's User the same
+     * way. A purely numeric spec is handled by the same path. An
+     * unresolvable name falls back to root (with a warning) rather than
+     * refusing to start, matching podvm's best-effort posture elsewhere. */
+    if (cfg.user[0] && strcmp(cfg.user, "-") != 0) {
+        if (userdb_resolve("/etc/passwd", "/etc/group", cfg.user,
+                           &cfg.uid, &cfg.gid) < 0) {
+            fprintf(stderr, "podvm-init: cannot resolve user '%s' "
+                            "(no such user/group in container); "
+                            "running as root\n", cfg.user);
+            cfg.uid = cfg.gid = 0;
+        }
+    }
     if (cfg.gid > 0) setgid(cfg.gid);
     if (cfg.uid > 0) setuid(cfg.uid);
 

@@ -7,7 +7,7 @@ CFLAGS = -static -Os -fno-stack-protector -fno-asynchronous-unwind-tables \
          -ffunction-sections -fdata-sections
 LDFLAGS = -s -Wl,--gc-sections
 
-SRC = init.c ../src/strparse.c
+SRC = init.c ../src/strparse.c ../src/userdb.c
 INC = -I../src
 OUT = init
 
