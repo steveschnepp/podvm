@@ -130,6 +130,8 @@ if [ -e /dev/kvm ]; then
     # Interactive e2e: -i gives the guest stdin (Ctrl-A reaches it). Python
     # pty harness; skips without KVM/alpine.
     run_test "E2E interactive (-i)" "timeout 150 python3 tests/e2e_interactive.py"
+    # Write-back e2e: named container's writes persist across runs.
+    run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi

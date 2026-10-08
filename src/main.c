@@ -47,6 +47,7 @@ static struct {
     char env[1024];
     char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
+    char name[256];           /* container name; enables persistent state */
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -it flag */
@@ -57,6 +58,46 @@ static struct {
     .cpus = 1,
     .interactive = 0,
 };
+
+/* Create a directory and all missing parents (like mkdir -p). */
+static int mkdir_p(const char *path, mode_t mode) {
+    char tmp[MAX_PATH];
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return -1;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/*
+ * Host directory holding a named container's writable layer (the overlay
+ * upper). Returning an empty string means "no persistent state" -- the
+ * caller falls back to a throwaway tmpfs upper, so writes die with the
+ * VM (the pre--write-back behavior).
+ *
+ * Lives under $XDG_STATE_HOME (or ~/.local/state), the conventional home
+ * for mutable per-container state, mirroring podman's storage layout.
+ */
+static void container_state_dir(char *out, size_t n) {
+    out[0] = '\0';
+    if (!config.name[0]) return;
+
+    const char *xdg = getenv("XDG_STATE_HOME");
+    char base[STORE_PATH_MAX];
+    if (xdg && xdg[0]) {
+        snprintf(base, sizeof(base), "%s/podvm/containers", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) return;
+        snprintf(base, sizeof(base), "%s/.local/state/podvm/containers", home);
+    }
+    snprintf(out, n, "%s/%s", base, config.name);
+}
 
 /* Get host kernel path */
 static void get_host_kernel(char *path, size_t path_size) {
@@ -330,22 +371,49 @@ static int setup_userns_overlay(void) {
         return -1;
     }
 
-    /* upper + work on a private tmpfs; merged is the 9p-served rootfs */
+    /* Writable layer: upper + work. With --name, these live in the
+     * container's persistent state dir on the host, so writes survive the
+     * VM (write-back, ADR-026). Without a name we keep the historical
+     * throwaway behavior: upper/work on a private tmpfs that dies with
+     * the VM. Either way 'merged' is the 9p-served rootfs.
+     *
+     * The overlay is mounted inside the QEMU child's userns (uid 0 mapped
+     * to the invoking uid), so files created in the persistent upper are
+     * owned by the invoking user outside -- no root-owned state. */
     char basedir[STORE_PATH_MAX], updir[STORE_PATH_MAX], wkdir[STORE_PATH_MAX];
-    snprintf(basedir, sizeof(basedir), "/tmp/podvm-ovl.%d", getpid());
-    snprintf(updir, sizeof(updir), "%s/u", basedir);
-    snprintf(wkdir, sizeof(wkdir), "%s/w", basedir);
+    char state[STORE_PATH_MAX];
+    container_state_dir(state, sizeof(state));
 
-    if (mkdir(basedir, 0755) < 0 && errno != EEXIST) {
-        fprintf(stderr, "podvm: mkdir %s failed: %s\n", basedir, strerror(errno));
-        return -1;
+    if (state[0]) {
+        snprintf(updir, sizeof(updir), "%s/u", state);
+        snprintf(wkdir, sizeof(wkdir), "%s/w", state);
+        if (mkdir_p(state, 0755) < 0 ||
+            (mkdir(updir, 0755) < 0 && errno != EEXIST) ||
+            (mkdir(wkdir, 0755) < 0 && errno != EEXIST)) {
+            fprintf(stderr, "podvm: cannot create container state %s: %s\n",
+                    state, strerror(errno));
+            return -1;
+        }
+        /* stderr, not stdout: this runs in the QEMU child, which
+         * execvp's immediately -- buffered stdout would be discarded. */
+        fprintf(stderr, "podvm: container '%s' writable layer: %s\n",
+                config.name, state);
+    } else {
+        snprintf(basedir, sizeof(basedir), "/tmp/podvm-ovl.%d", getpid());
+        snprintf(updir, sizeof(updir), "%s/u", basedir);
+        snprintf(wkdir, sizeof(wkdir), "%s/w", basedir);
+
+        if (mkdir(basedir, 0755) < 0 && errno != EEXIST) {
+            fprintf(stderr, "podvm: mkdir %s failed: %s\n", basedir, strerror(errno));
+            return -1;
+        }
+        if (mount("tmpfs", basedir, "tmpfs", 0, "mode=0755") < 0) {
+            fprintf(stderr, "podvm: tmpfs for upper failed: %s\n", strerror(errno));
+            return -1;
+        }
+        mkdir(updir, 0755);
+        mkdir(wkdir, 0755);
     }
-    if (mount("tmpfs", basedir, "tmpfs", 0, "mode=0755") < 0) {
-        fprintf(stderr, "podvm: tmpfs for upper failed: %s\n", strerror(errno));
-        return -1;
-    }
-    mkdir(updir, 0755);
-    mkdir(wkdir, 0755);
     if (mkdir(config.rootfs_dir, 0755) < 0 && errno != EEXIST) {
         fprintf(stderr, "podvm: mkdir %s failed: %s\n",
                 config.rootfs_dir, strerror(errno));
@@ -495,6 +563,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
     fprintf(stderr, "  -r, --initramfs <path> Initramfs path\n");
+    fprintf(stderr, "  -n, --name <name>   Container name; persists the writable layer\n");
+    fprintf(stderr, "                      across runs (write-back). Without it, writes\n");
+    fprintf(stderr, "                      are discarded when the VM exits.\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
@@ -513,6 +584,7 @@ int main(int argc, char **argv) {
         {"cpus",        required_argument, 0, 'c'},
         {"kernel",      required_argument, 0, 'k'},
         {"initramfs",   required_argument, 0, 'r'},
+        {"name",        required_argument, 0, 'n'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -520,7 +592,7 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:im:c:k:r:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:im:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
@@ -536,6 +608,13 @@ int main(int argc, char **argv) {
             break;
         case 'r':
             strncpy(config.initramfs, optarg, MAX_PATH - 1);
+            break;
+        case 'n':
+            if (strchr(optarg, '/')) {
+                fprintf(stderr, "podvm: --name must not contain '/'\n");
+                return 1;
+            }
+            strncpy(config.name, optarg, sizeof(config.name) - 1);
             break;
         case 'h':
             usage(argv[0]);
