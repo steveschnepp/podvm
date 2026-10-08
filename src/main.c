@@ -436,8 +436,21 @@ static int start_qemu(void) {
     qargs[qi++] = "-kernel";  qargs[qi++] = config.kernel;
     qargs[qi++] = "-initrd";  qargs[qi++] = config.initramfs;
     qargs[qi++] = "-append";  qargs[qi++] = cmdline;
-    /* Serial / lifecycle */
-    qargs[qi++] = "-serial";  qargs[qi++] = "mon:stdio";
+    /* Serial / lifecycle.
+     *
+     * The guest console is always attached to stdio; -i chooses whether
+     * the QEMU monitor shares it:
+     *
+     *   default:  -serial mon:stdio multiplexes the monitor onto stdio,
+     *             so Ctrl-A C drops into the QEMU monitor -- useful for
+     *             debugging a wedged guest, but Ctrl-A never reaches it.
+     *   -i:       -serial stdio gives the guest stdin exclusively, so
+     *             every keystroke (incl. Ctrl-A, a readline binding) goes
+     *             to the container. Right for an interactive shell; the
+     *             monitor is unavailable and you stop the VM by killing
+     *             the process. */
+    qargs[qi++] = "-serial";
+    qargs[qi++] = config.interactive ? "stdio" : "mon:stdio";
     qargs[qi++] = "-nographic";
     qargs[qi++] = "-no-reboot";
     qargs[qi] = NULL;
@@ -475,7 +488,8 @@ static int wait_qemu(void) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -i, --interactive   Interactive (attach stdin/stdout)\n");
+    fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
+    fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
