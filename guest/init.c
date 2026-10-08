@@ -34,6 +34,7 @@
 #define MAX_ARGS      64
 #define PATH_SIZE     1024
 #define CMDLINE_SIZE  4096
+#define MAX_ARG_VAL   256   /* matches the host's args[] buffer */
 
 /* vsock config channel (must match host) */
 #define VSOCK_PORT       5000
@@ -78,8 +79,16 @@ static void parse_config(Config *cfg, const char *text) {
 
     val = kv_find(text, "podvm.args=");
     if (val) {
+        char tok[MAX_ARG_VAL];
+        kv_copy_value(tok, sizeof(tok), val);   /* trim at token boundary */
         csv_free(cfg->args, cfg->argc);   /* free any previous args */
-        cfg->argc = csv_parse(val, cfg->args, MAX_ARGS);
+        /* The host sends "-" as the empty-args sentinel; treat it as
+         * no args, not a literal "-" argument. */
+        if (strcmp(tok, "-") == 0) {
+            cfg->argc = 0;
+        } else {
+            cfg->argc = csv_parse(tok, cfg->args, MAX_ARGS);
+        }
     }
 
     val = kv_find(text, "podvm.cwd=");
@@ -169,13 +178,28 @@ static int mkdir_p(const char *path, mode_t mode) {
 }
 
 /* Mount pseudo-filesystems */
+/* Mount pseudo-filesystems under a root prefix. Used twice: once at the
+ * initramfs root (before chroot, for init's own use) and once inside the
+ * container rootfs after chroot -- chroot hides the initramfs mounts, so
+ * /proc /sys /dev must be re-mounted in the new root or tools that read
+ * /proc/net, /proc/self, etc. (ifconfig, curl, ps) fail. */
+static void mount_pseudofs_at(const char *root) {
+    char p[PATH_SIZE];
+#define PF(type, dir, opts) do { \
+    snprintf(p, sizeof(p), "%s/%s", root, dir); \
+    mount(type, p, type, 0, opts); \
+} while (0)
+    PF("proc", "proc", NULL);
+    PF("sysfs", "sys", NULL);
+    PF("devtmpfs", "dev", NULL);
+    snprintf(p, sizeof(p), "%s/dev/pts", root); mkdir(p, 0755);
+    mount("devpts", p, "devpts", 0, NULL);
+    snprintf(p, sizeof(p), "%s/tmp", root); mount("tmpfs", p, "tmpfs", 0, NULL);
+#undef PF
+}
+
 static void mount_pseudofs(void) {
-    mount("proc", "/proc", "proc", 0, NULL);
-    mount("sysfs", "/sys", "sysfs", 0, NULL);
-    mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
-    mkdir("/dev/pts", 0755);
-    mount("devpts", "/dev/pts", "devpts", 0, NULL);
-    mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
+    mount_pseudofs_at("");
 }
 
 /*
@@ -199,6 +223,7 @@ static void load_guest_modules(void) {
         "vsock.ko",
         "vmw_vsock_virtio_transport_common.ko",
         "vmw_vsock_virtio_transport.ko",
+        "failover.ko", "net_failover.ko", "virtio_net.ko",
         NULL
     };
     char path[PATH_SIZE];
@@ -277,17 +302,21 @@ int main(void) {
         return 1;
     }
 
-    /* Step 6: Set working directory */
+    /* Step 6: Re-mount pseudofs inside the container rootfs. chroot hid
+     * the initramfs mounts; /proc /sys /dev must exist in the new root. */
+    mount_pseudofs_at("");
+
+    /* Step 7: Set working directory */
     if (cfg.cwd[0])
         chdir(cfg.cwd);
     else
         chdir("/");
 
-    /* Step 7: Switch user */
+    /* Step 8: Switch user */
     if (cfg.gid > 0) setgid(cfg.gid);
     if (cfg.uid > 0) setuid(cfg.uid);
 
-    /* Step 8: Exec entrypoint */
+    /* Step 9: Exec entrypoint */
     char *exec_argv[MAX_ARGS + 1];
     exec_argv[0] = cfg.entrypoint;
     for (int j = 0; j < cfg.argc; j++)
