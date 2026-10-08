@@ -221,7 +221,7 @@ static int start_qemu(void) {
     qargs[qi++] = "-smp";     qargs[qi++] = cpu_str;
     /* 9p filesystem share (in-process; no daemon needed) */
     qargs[qi++] = "-fsdev";   qargs[qi++] = fsdev_str;
-    qargs[qi++] = "-device";  qargs[qi++] = "virtio-9p-pci,fsdev=fsdev0,tag=rootfs";
+    qargs[qi++] = "-device";  qargs[qi++] = "virtio-9p-pci,fsdev=fsdev0,mount_tag=rootfs";
     /* vsock (only when the host supports it) */
     if (vsock_available) {
         qargs[qi++] = "-device";
