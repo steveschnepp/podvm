@@ -110,6 +110,12 @@ if [ -e /dev/kvm ]; then
     else
         echo "E2E podman image              SKIPPED (no podman or no images)"
     fi
+    # Networking e2e (DNS+HTTPS out of the guest): needs an alpine image.
+    if which podman > /dev/null 2>&1 && podman images 2>/dev/null | grep -qi alpine; then
+        run_test "E2E net (DNS+HTTPS)" "sh tests/e2e_net.sh"
+    else
+        echo "E2E net (DNS+HTTPS)           SKIPPED (no alpine image)"
+    fi
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi
