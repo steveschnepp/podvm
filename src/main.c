@@ -1,7 +1,8 @@
 /*
  * podvm - VM-based container runtime
  *
- * PoC launcher: starts QEMU with virtiofs for container filesystem.
+ * PoC launcher: starts QEMU with 9p for container filesystem sharing.
+ * (virtiofs is deferred until the performance phase; see ADR-022.)
  * Uses vsock for host↔guest communication.
  *
  * Usage: podvm [options] <image|rootfs-dir> [command] [args...]
@@ -69,9 +70,6 @@ static void get_host_kernel(char *path, size_t path_size) {
     /* Fallback */
     strcpy(path, "/boot/vmlinuz");
 }
-
-/* virtiofsd process */
-static pid_t virtiofsd_pid = 0;
 
 /* QEMU process */
 static pid_t qemu_pid = 0;
@@ -174,6 +172,7 @@ static int send_config_vsock(const char *config_str) {
 static void build_cmdline(char *buf, size_t len) {
     snprintf(buf, len,
         "console=ttyS0 "
+        "panic=-1 "              /* reboot on panic; -no-reboot exits QEMU */
         "podvm.root=/rootfs "
         "podvm.entrypoint=%s "
         "podvm.args=%s "
@@ -183,64 +182,12 @@ static void build_cmdline(char *buf, size_t len) {
         config.env[0] ? config.env : "HOME=/root");
 }
 
-/* Start virtiofsd */
-static int start_virtiofsd(const char *socket_path, const char *shared_dir) {
-    /* virtiofsd location varies by distro */
-    const char *virtiofsd_paths[] = {
-        "/usr/lib/qemu/virtiofsd",
-        "/usr/libexec/virtiofsd",
-        "/usr/bin/virtiofsd",
-        "virtiofsd",
-        NULL
-    };
-    
-    virtiofsd_pid = fork();
-    if (virtiofsd_pid == 0) {
-        /* Child: exec virtiofsd */
-        for (int i = 0; virtiofsd_paths[i]; i++) {
-            execl(virtiofsd_paths[i], "virtiofsd",
-                   "--socket-path", socket_path,
-                   "--shared-dir", shared_dir,
-                   "--cache", "auto",
-                   "--sandbox", "none",
-                   NULL);
-        }
-        fprintf(stderr, "podvm: exec virtiofsd failed: %s\n", strerror(errno));
-        _exit(1);
-    }
-    if (virtiofsd_pid < 0) {
-        fprintf(stderr, "podvm: fork virtiofsd failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    /* Wait for socket to appear */
-    for (int i = 0; i < 50; i++) {
-        struct stat st;
-        if (stat(socket_path, &st) == 0)
-            return 0;
-        usleep(10000); /* 10ms */
-    }
-
-    fprintf(stderr, "podvm: virtiofsd socket did not appear\n");
-    return -1;
-}
-
-/* Stop virtiofsd */
-static void stop_virtiofsd(void) {
-    if (virtiofsd_pid > 0) {
-        kill(virtiofsd_pid, SIGTERM);
-        waitpid(virtiofsd_pid, NULL, 0);
-        virtiofsd_pid = 0;
-    }
-}
-
 /* Start QEMU (non-blocking) */
-static int start_qemu(const char *virtiofs_socket) {
+static int start_qemu(void) {
     char cmdline[MAX_CMDLINE];
     char memory_str[32];
     char cpu_str[32];
-    char memory_backend[64];
-    char chardev_str[512];
+    char fsdev_str[MAX_PATH + 64];
     char vsock_cid_str[32];
 
     /* Bounded argv so we can conditionally append the vsock device. */
@@ -250,16 +197,15 @@ static int start_qemu(const char *virtiofs_socket) {
     build_cmdline(cmdline, sizeof(cmdline));
     snprintf(memory_str, sizeof(memory_str), "%dM", config.memory);
     snprintf(cpu_str, sizeof(cpu_str), "%d", config.cpus);
-    snprintf(memory_backend, sizeof(memory_backend),
-             "memory-backend-memfd,id=mem,size=%dM,share=on", config.memory);
-    snprintf(chardev_str, sizeof(chardev_str),
-             "socket,id=char0,path=%s", virtiofs_socket);
+    snprintf(fsdev_str, sizeof(fsdev_str),
+             "local,id=fsdev0,path=%s,security_model=none",
+             config.rootfs_dir);
     snprintf(vsock_cid_str, sizeof(vsock_cid_str), "%d", GUEST_CID);
 
     printf("podvm: starting QEMU\n");
     printf("podvm:   kernel:    %s\n", config.kernel);
     printf("podvm:   initramfs: %s\n", config.initramfs);
-    printf("podvm:   rootfs:    %s\n", config.rootfs_dir);
+    printf("podvm:   rootfs:    %s (9p)\n", config.rootfs_dir);
     printf("podvm:   memory:    %s\n", memory_str);
     printf("podvm:   cpus:      %s\n", cpu_str);
     printf("podvm:   vsock:     %s (cid %s)\n",
@@ -273,12 +219,9 @@ static int start_qemu(const char *virtiofs_socket) {
     qargs[qi++] = "-cpu";     qargs[qi++] = "host";
     qargs[qi++] = "-m";       qargs[qi++] = memory_str;
     qargs[qi++] = "-smp";     qargs[qi++] = cpu_str;
-    /* Memory backend (required for virtiofs) */
-    qargs[qi++] = "-object";  qargs[qi++] = memory_backend;
-    qargs[qi++] = "-numa";    qargs[qi++] = "node,memdev=mem";
-    /* virtiofs */
-    qargs[qi++] = "-chardev"; qargs[qi++] = chardev_str;
-    qargs[qi++] = "-device";  qargs[qi++] = "vhost-user-fs-pci,chardev=char0,tag=rootfs";
+    /* 9p filesystem share (in-process; no daemon needed) */
+    qargs[qi++] = "-fsdev";   qargs[qi++] = fsdev_str;
+    qargs[qi++] = "-device";  qargs[qi++] = "virtio-9p-pci,fsdev=fsdev0,tag=rootfs";
     /* vsock (only when the host supports it) */
     if (vsock_available) {
         qargs[qi++] = "-device";
@@ -435,27 +378,9 @@ int main(int argc, char **argv) {
     /* Detect host vsock support (determines QEMU device + config channel). */
     detect_vsock();
 
-    /* Create socket directory using XDG_RUNTIME_DIR or fallback */
-    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
-    if (!runtime_dir) runtime_dir = "/tmp/podvm";
-    
-    char socket_dir[MAX_PATH];
-    snprintf(socket_dir, sizeof(socket_dir), "%s/podvm", runtime_dir);
-    mkdir(socket_dir, 0755);
-    
-    char socket_path[MAX_PATH];
-    snprintf(socket_path, sizeof(socket_path), "%s/virtiofs-rootfs.sock", socket_dir);
-    printf("podvm: starting virtiofsd\n");
-    if (start_virtiofsd(socket_path, config.rootfs_dir) < 0) {
-        fprintf(stderr, "podvm: failed to start virtiofsd\n");
-        return 1;
-    }
-
-    /* Start QEMU */
-    if (start_qemu(socket_path) < 0) {
+    /* Start QEMU (9p serves the rootfs in-process; no virtiofsd) */
+    if (start_qemu() < 0) {
         fprintf(stderr, "podvm: failed to start QEMU\n");
-        stop_virtiofsd();
-        unlink(socket_path);
         return 1;
     }
 
@@ -480,11 +405,5 @@ int main(int argc, char **argv) {
     }
 
     /* Wait for QEMU to exit */
-    int ret = wait_qemu();
-
-    /* Cleanup */
-    stop_virtiofsd();
-    unlink(socket_path);
-
-    return ret;
+    return wait_qemu();
 }
