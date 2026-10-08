@@ -104,6 +104,12 @@ echo ""
 # Not a WARN-if-missing check: skip silently on KVM-less hosts.
 if [ -e /dev/kvm ]; then
     run_test "E2E boot (9p + vsock)" "timeout 150 sh tests/e2e_boot.sh"
+    # Podman-storage e2e: needs podman + at least one local image.
+    if which podman > /dev/null 2>&1 && podman images -q 2>/dev/null | grep -q .; then
+        run_test "E2E podman image" "sh tests/e2e_podman.sh"
+    else
+        echo "E2E podman image              SKIPPED (no podman or no images)"
+    fi
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi
