@@ -1,37 +1,36 @@
 #!/bin/sh
 # Build minimal initramfs for podvm guest
-# Usage: ./build-initramfs.sh
+# Usage: ./build-initramfs.sh [output-path]
+#
+# The init binary is placed directly at /init (it is PID 1). There is no
+# shell in the initramfs, so /init must be the real binary, not a script.
 
 set -e
 
-INITRAMFS_DIR=$(mktemp -d)
-INIT=init
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# Check if init binary exists
+OUT="${1:-$SCRIPT_DIR/initramfs.cpio}"
+INIT="$SCRIPT_DIR/init"
+
+# Build init if missing
 if [ ! -f "$INIT" ]; then
     echo "Building init binary..."
-    make
+    make -C "$SCRIPT_DIR"
 fi
 
-# Create directory structure
-mkdir -p "$INITRAMFS_DIR"/{bin,proc,sys,dev,rootfs,tmp,etc}
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
-# Copy init
-cp "$INIT" "$INITRAMFS_DIR/bin/init"
+# Directory structure (POSIX-safe: no brace expansion under dash)
+for d in bin proc sys dev rootfs tmp etc; do
+    mkdir -p "$WORK/$d"
+done
 
-# Create /init wrapper
-cat > "$INITRAMFS_DIR/init" << 'EOF'
-#!/bin/sh
-exec /bin/init "$@"
-EOF
-chmod +x "$INITRAMFS_DIR/init"
+# init is PID1 — no shell wrapper, place the real binary at /init
+cp "$INIT" "$WORK/init"
 
-# Create initramfs
-cd "$INITRAMFS_DIR"
-find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz
-cd ..
+# Archive (uncompressed for faster boot)
+( cd "$WORK" && find . -print0 | cpio --null -o -H newc > "$OUT" )
 
-# Cleanup
-rm -rf "$INITRAMFS_DIR"
-
-echo "initramfs: $(ls -la initramfs.cpio.gz | awk '{print $5}') bytes"
+echo "initramfs: $(wc -c < "$OUT") bytes -> $OUT"
