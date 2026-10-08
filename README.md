@@ -16,6 +16,8 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 - **No guest runtime** - Container runs directly in VM
 - **9p rootfs share** - No host daemon required (virtiofs returns in the
   performance phase; see [ADR-022](adrs/podvm_adr022_9p-rootfs-transport.md))
+- **Podman storage backend** - Uses images podman already pulled, layers
+  in place, no export (see [ADR-024](adrs/podvm_adr024_podman-storage-backend.md))
 
 ## Architecture
 
@@ -235,6 +237,7 @@ See [adrs/](adrs/) for detailed architecture decisions:
 - **ADR022**: 9p rootfs transport (current)
 - **ADR023**: User-mode networking first (current; bridge in the
   performance phase)
+- **ADR024**: Podman storage backend (current)
 
 ## Security
 
