@@ -179,19 +179,27 @@ static void mount_pseudofs(void) {
 }
 
 /*
- * Load 9p kernel modules from /modules in the initramfs, if present.
+ * Load guest kernel modules from /modules in the initramfs, if present.
+ * 9p: netfs (dep of 9pnet on kernels >= ~6.6), 9pnet, 9pnet_virtio, 9p.
+ * vsock: vsock, virtio transport common, virtio transport.
+ * fscache is built into the host kernel here, so only netfs is bundled.
  *
  * Needed when booting the host kernel: KVM guests are a separate kernel
- * instance, so the host's loaded 9p modules don't count, and module
+ * instance, so the host's loaded modules don't count, and module
  * autoload can't work (no modprobe in the initramfs). The initramfs
- * build script bundles decompressed copies of 9pnet/9pnet_virtio/9p.
+ * build script bundles decompressed copies from the running host kernel.
  *
- * The synthetic kernel builds 9p in and ships no /modules dir; this is
- * a no-op there.
+ * The synthetic kernel builds everything in and ships no /modules dir;
+ * this is a no-op there.
  */
-static void load_9p_modules(void) {
+static void load_guest_modules(void) {
     static const char *order[] = {
-        "9pnet.ko", "9pnet_virtio.ko", "9p.ko", NULL
+        "netfs.ko",
+        "9pnet.ko", "9pnet_virtio.ko", "9p.ko",
+        "vsock.ko",
+        "vmw_vsock_virtio_transport_common.ko",
+        "vmw_vsock_virtio_transport.ko",
+        NULL
     };
     char path[PATH_SIZE];
 
@@ -211,9 +219,10 @@ static void load_9p_modules(void) {
 static int mount_rootfs(const Config *cfg) {
     mkdir_p(cfg->root, 0755);
 
-    /* 9p: tag is a mount option */
-    if (mount(NULL, cfg->root, "9p", 0,
-              "trans=virtio,version=9p2000.L,tag=rootfs") == 0)
+    /* 9p: the mount *source* is the tag (fs_context conversion, 5.14+).
+     * 'tag=' as a data option is no longer accepted (EINVAL). */
+    if (mount("rootfs", cfg->root, "9p", 0,
+              "trans=virtio,version=9p2000.L") == 0)
         return 0;
 
     fprintf(stderr, "podvm-init: mount rootfs failed: %s\n", strerror(errno));
@@ -228,8 +237,8 @@ int main(void) {
     /* Step 1: Mount pseudo-filesystems */
     mount_pseudofs();
 
-    /* Step 1b: Load bundled 9p modules (no-op on the synthetic kernel) */
-    load_9p_modules();
+    /* Step 1b: Load bundled guest modules (no-op on synthetic kernel) */
+    load_guest_modules();
 
     /* Step 2: Baseline config from kernel cmdline */
     memset(&cfg, 0, sizeof(cfg));
