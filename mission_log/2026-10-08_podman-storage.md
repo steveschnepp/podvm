@@ -220,3 +220,92 @@ panic=-1/-no-reboot.
 6. **ADR-021 (FreeBSD):** the storage backend is Linux/podman-specific;
    the FreeBSD platform keeps the registry client path. Note in the
    FreeBSD work when it resumes.
+
+---
+
+## Appendix: Current Architecture (as built, 2026-10-08)
+
+Snapshot taken after the podman-storage session. Facts pulled from the
+code (`src/main.c`, `src/store.c`, `guest/init.c`), not the design
+docs. The README diagram predates the storage backend and is stale --
+pending an update to match this.
+
+### Host side (single process tree, no daemons)
+
+```mermaid
+graph TD
+    A["podvm CLI<br/>src/main.c"] --> B{"image ref?"}
+    B -->|"directory path"| C["use as-is"]
+    B -->|"name:tag"| D["store.c: podman storage"]
+    B -->|"miss + podman"| E["podman pull<br/>(hijack)"]
+    E --> D
+    D --> F["images.json -&gt; top layer"]
+    F --> G["layers.json -&gt; parent chain"]
+    G --> H["overlay/&lt;id&gt;/diff dirs"]
+    B -->|"no podman"| I["image.c: registry client<br/>curl + gunzip + untar"]
+
+    H --> J["fork QEMU child"]
+    I --> J
+    C --> J
+
+    J --> K["unshare(CLONE_NEWUSER|CLONE_NEWNS)<br/>uid_map 0-&gt;uid, setgroups=deny"]
+    K --> L["mount tmpfs: upper/work<br/>mount overlay: chain -&gt; rootfs"]
+    L --> M["exec QEMU<br/>-fsdev local, virtio-9p-pci<br/>vhost-vsock-pci guest-cid=3"]
+
+    A -.->|"vsock: send podvm.*= config"| M
+```
+
+### Guest side
+
+```mermaid
+graph TD
+    N["Kernel boots<br/>host kernel today,<br/>synthetic kernel ADR-007 later"] --> O["/init (static PID1)<br/>guest/init.c"]
+    O --> P["mount pseudofs<br/>proc, sys, devtmpfs,<br/>devpts, tmpfs"]
+    P --> Q["load_guest_modules()<br/>finit_module: netfs, 9pnet,<br/>9pnet_virtio, 9p, vsock trio<br/>(host-kernel boots only)"]
+    Q --> R["parse /proc/cmdline<br/>podvm.*= baseline"]
+    R --> S["vsock listener :5000<br/>3s poll, overrides cmdline"]
+    S --> T["mount 9p tag=rootfs -&gt; /rootfs"]
+    T --> U["chroot /rootfs"]
+    U --> V["set cwd, uid/gid"]
+    V --> W["exec entrypoint<br/>(becomes PID1)"]
+```
+
+### The full path, end to end
+
+| Stage | Where | Code |
+|---|---|---|
+| Resolve ref | host | `store.c:store_resolve()` |
+| Fetch if missing | host | `store_podman_pull()` -> `podman pull` |
+| Build layer chain | host | `store.c:store_chain()` |
+| Enter staging ns | QEMU child | `main.c:setup_userns_overlay()` |
+| Mount rootfs union | QEMU child, in-ns | `mount(2)` overlay, `userxattr` |
+| Serve rootfs | QEMU, in-ns | `-fsdev local` + `virtio-9p-pci` |
+| Config channel | host -> guest | vsock CID 3:5000, cmdline fallback |
+| Guest mount + run | guest | `init.c:mount_rootfs()` -> chroot -> exec |
+| Lifecycle | host | PID1 exits -> `panic=-1` -> `-no-reboot` -> QEMU exits |
+
+### Key facts
+
+**Trust boundary: the VM.** The userns overlay is staging only
+(ADR-024); the guest still sees a 9p share of a host-controlled dir.
+Isolation of runtime, not of mounting mechanics.
+
+**Status of each component:**
+
+| Component | Status |
+|---|---|
+| 9p rootfs share | done, e2e-tested |
+| Podman storage backend | done, 5-layer chain tested |
+| Vsock config + cmdline fallback | done, handshake proven |
+| Module bundling (host-kernel boots) | done, transitive closure |
+| Slirp networking | ADR-023 decided, NOT implemented (no QEMU args yet) |
+| Synthetic kernel | ADR-007, kernel/config written, no bzImage built |
+| virtiofs | deferred to performance phase (revert set in ADR-022) |
+| Bridge networking | ADR-009, deferred (slirp first per ADR-023) |
+| Image config blob (Env/Entrypoint/Cmd) | TODO -- only CLI entrypoint honored |
+| Overlay write-back | upper is throwaway tmpfs; writes vanish with the VM |
+
+**Two transports, two directions:** 9p carries the rootfs host->guest
+(bulk); vsock carries config host->guest (small, best-effort, cmdline is
+authoritative). No guest networking data path exists yet -- vsock is not
+a substitute for one (ADR-023 rejects the vsock-IP-proxy idea).
