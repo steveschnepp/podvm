@@ -78,12 +78,15 @@ static int read_cmdline(char *buf, size_t len) {
  */
 static void parse_config(Config *cfg, const char *text) {
     const char *val;
+    /* kv_copy_value passes escape sequences through verbatim; single-valued
+     * fields are unescaped here, and list fields (args/env) are unescaped
+     * per field by csv_parse. */
 
     val = kv_find(text, "podvm.root=");
-    if (val) kv_copy_value(cfg->root, PATH_SIZE, val);
+    if (val) { kv_copy_value(cfg->root, PATH_SIZE, val); kv_unescape(cfg->root); }
 
     val = kv_find(text, "podvm.entrypoint=");
-    if (val) kv_copy_value(cfg->entrypoint, PATH_SIZE, val);
+    if (val) { kv_copy_value(cfg->entrypoint, PATH_SIZE, val); kv_unescape(cfg->entrypoint); }
 
     val = kv_find(text, "podvm.args=");
     if (val) {
@@ -100,7 +103,7 @@ static void parse_config(Config *cfg, const char *text) {
     }
 
     val = kv_find(text, "podvm.cwd=");
-    if (val) kv_copy_value(cfg->cwd, PATH_SIZE, val);
+    if (val) { kv_copy_value(cfg->cwd, PATH_SIZE, val); kv_unescape(cfg->cwd); }
 
     /* podvm.env= is a comma-separated list of K=V pairs. The host has
      * always sent this; the guest previously ignored it, so image
@@ -118,10 +121,15 @@ static void parse_config(Config *cfg, const char *text) {
     }
 
     val = kv_find(text, "podvm.hostname=");
-    if (val) kv_copy_value(cfg->hostname, 256, val);
+    if (val) { kv_copy_value(cfg->hostname, 256, val); kv_unescape(cfg->hostname); }
 
     val = kv_find(text, "podvm.user=");
-    if (val) parse_uid_gid(val, &cfg->uid, &cfg->gid);
+    if (val) {
+        char tok[128];
+        kv_copy_value(tok, sizeof(tok), val);
+        kv_unescape(tok);
+        parse_uid_gid(tok, &cfg->uid, &cfg->gid);
+    }
 }
 
 /*

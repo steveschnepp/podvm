@@ -12,18 +12,32 @@
 /*
  * Find value after prefix in "key=value key2=value2" format.
  * Returns pointer to value, or NULL if not found.
- * Value extends to next space or end of string.
+ * Value extends to next *unescaped* space or end of string.
  */
 const char *kv_find(const char *cmdline, const char *prefix);
 
 /*
- * Copy value from src to dst, stopping at space or end.
- * Returns number of bytes copied.
+ * Copy one token's value into dst, stopping at an *unescaped* space.
+ * Escape sequences (\\, \ , \,) are copied through verbatim -- call
+ * kv_unescape() for single values, csv_parse() for comma lists.
+ * Returns bytes copied (excluding NUL).
  */
 size_t kv_copy_value(char *dst, size_t dst_size, const char *src);
 
 /*
- * Parse comma-separated values.
+ * Resolve escape sequences in place: \\ -> \, \  -> space, \, -> comma.
+ */
+void kv_unescape(char *s);
+
+/*
+ * Escape a value for the wire (backslash, space, comma -> \\, \ , \,).
+ * Returns bytes written (excluding NUL), or (size_t)-1 if it did not fit.
+ */
+size_t kv_escape(char *dst, size_t dst_size, const char *src);
+
+/*
+ * Parse a comma-separated list, splitting on *unescaped* commas and
+ * unescaping each field. An unescaped space terminates the value.
  * Returns number of values parsed.
  */
 int csv_parse(const char *input, char **output, int max);

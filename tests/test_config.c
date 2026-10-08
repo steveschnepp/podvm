@@ -236,6 +236,87 @@ static void test_parse_cmdline(void) {
     printf("PASS: test_parse_cmdline\n");
 }
 
+/* Test escaping: values with spaces and commas survive the channel. */
+static void test_escape(void) {
+    char wire[256];
+    char tok[256];
+    char *items[8];
+    int n;
+
+    /* Round-trip a single value containing spaces. The wire form still
+     * contains space bytes (an escaped space is backslash + space), but
+     * the parser treats them as escaped, not as a token boundary. */
+    assert(kv_escape(wire, sizeof(wire), "/My App Dir") > 0);
+    assert(strcmp(wire, "/My\\ App\\ Dir") == 0);
+    kv_copy_value(tok, sizeof(tok), wire);
+    kv_unescape(tok);
+    assert(strcmp(tok, "/My App Dir") == 0);
+
+    /* Round-trip a value containing a comma. */
+    assert(kv_escape(wire, sizeof(wire), "a,b") > 0);
+    kv_copy_value(tok, sizeof(tok), wire);
+    kv_unescape(tok);
+    assert(strcmp(tok, "a,b") == 0);
+
+    /* Round-trip a value containing a backslash. */
+    assert(kv_escape(wire, sizeof(wire), "a\\b") > 0);
+    kv_copy_value(tok, sizeof(tok), wire);
+    kv_unescape(tok);
+    assert(strcmp(tok, "a\\b") == 0);
+
+    /* A list: escape each element, join with real commas. */
+    char list[256]; size_t off = 0;
+    const char *parts[] = {"hello world", "a,b", "plain"};
+    for (int i = 0; i < 3; i++) {
+        char esc[128];
+        assert(kv_escape(esc, sizeof(esc), parts[i]) > 0);
+        off += (size_t)snprintf(list + off, sizeof(list) - off, "%s%s",
+                                i ? "," : "", esc);
+    }
+    n = csv_parse(list, items, 8);
+    assert(n == 3);
+    assert(strcmp(items[0], "hello world") == 0);
+    assert(strcmp(items[1], "a,b") == 0);
+    assert(strcmp(items[2], "plain") == 0);
+    csv_free(items, n);
+
+    printf("PASS: test_escape\n");
+}
+
+/* Test escape-aware token finding across embedded spaces. */
+static void test_kv_find_escaped(void) {
+    /* root's value contains an escaped space; entrypoint must still be
+     * found after it. */
+    const char *cmdline =
+        "podvm.root=/My\\ App\\ Dir podvm.entrypoint=/bin/sh podvm.args=a\\ b,c";
+
+    const char *val = kv_find(cmdline, "podvm.root=");
+    assert(val != NULL);
+    char tok[64];
+    kv_copy_value(tok, sizeof(tok), val);
+    kv_unescape(tok);
+    assert(strcmp(tok, "/My App Dir") == 0);
+
+    val = kv_find(cmdline, "podvm.entrypoint=");
+    assert(val != NULL);
+    kv_copy_value(tok, sizeof(tok), val);
+    kv_unescape(tok);
+    assert(strcmp(tok, "/bin/sh") == 0);
+
+    /* args: an escaped space inside one arg, a real comma separator. */
+    val = kv_find(cmdline, "podvm.args=");
+    assert(val != NULL);
+    kv_copy_value(tok, sizeof(tok), val);
+    char *items[8];
+    int n = csv_parse(tok, items, 8);
+    assert(n == 2);
+    assert(strcmp(items[0], "a b") == 0);
+    assert(strcmp(items[1], "c") == 0);
+    csv_free(items, n);
+
+    printf("PASS: test_kv_find_escaped\n");
+}
+
 /* Test edge cases */
 static void test_edge_cases(void) {
     Config cfg;
@@ -277,6 +358,8 @@ int main(void) {
     test_kv_copy_value();
     test_csv_parse();
     test_parse_uid_gid();
+    test_escape();
+    test_kv_find_escaped();
     test_parse_cmdline();
     test_edge_cases();
     

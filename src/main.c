@@ -31,6 +31,7 @@
 
 #include "image.h"
 #include "store.h"
+#include "strparse.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -183,22 +184,70 @@ static int send_config_vsock(const char *config_str) {
     return 0;
 }
 
-/* Build kernel cmdline */
-static void build_cmdline(char *buf, size_t len) {
+/* Escape one value for the wire. Falls back to an empty string if it
+ * somehow cannot fit (kv_escape reports that by returning (size_t)-1). */
+static void escape_value(char *dst, size_t dstsz, const char *src) {
+    if (kv_escape(dst, dstsz, src) == (size_t)-1)
+        dst[0] = '\0';
+}
+
+/*
+ * Escape a comma-joined list element-wise. The separators are real
+ * commas; each element is escaped so any comma or space *inside* an
+ * element survives. Escaping the whole string at once would also escape
+ * the separators and collapse the list into one field on the guest.
+ */
+static void escape_csv(char *dst, size_t dstsz, const char *raw) {
+    size_t off = 0;
+    dst[0] = '\0';
+    if (!raw || !raw[0]) return;
+
+    const char *p = raw;
+    while (*p) {
+        char elem[512];
+        size_t n = 0;
+        while (*p && *p != ',' && n + 1 < sizeof(elem)) elem[n++] = *p++;
+        elem[n] = '\0';
+        if (*p == ',') p++;
+
+        char esc[sizeof(elem) * 2];
+        escape_value(esc, sizeof(esc), elem);
+        int w = snprintf(dst + off, dstsz - off, "%s%s", off ? "," : "", esc);
+        if (w < 0 || (size_t)w >= dstsz - off) break;
+        off += (size_t)w;
+    }
+}
+
+/*
+ * Build the podvm.*= token string, escaping every value so spaces and
+ * commas survive the channel. Shared by the kernel cmdline and the vsock
+ * payload so the two can never diverge on encoding.
+ */
+static void build_config_tokens(char *buf, size_t len) {
+    char entry[MAX_PATH * 2], args[MAX_CMDLINE], env[MAX_CMDLINE];
+    char cwd[MAX_PATH * 2], user[sizeof(config.user) * 2];
+
+    escape_value(entry, sizeof(entry), config.entrypoint);
+    escape_csv(args, sizeof(args), config.args[0] ? config.args : "-");
+    escape_csv(env, sizeof(env), config.env[0] ? config.env : "HOME=/root");
+    escape_value(cwd, sizeof(cwd), config.cwd[0] ? config.cwd : "/");
+    escape_value(user, sizeof(user), config.user[0] ? config.user : "-");
+
     snprintf(buf, len,
-        "console=ttyS0 "
-        "panic=-1 "              /* reboot on panic; -no-reboot exits QEMU */
         "podvm.root=/rootfs "
         "podvm.entrypoint=%s "
         "podvm.args=%s "
         "podvm.env=%s "
         "podvm.cwd=%s "
         "podvm.user=%s",
-        config.entrypoint,
-        config.args[0] ? config.args : "-",
-        config.env[0] ? config.env : "HOME=/root",
-        config.cwd[0] ? config.cwd : "/",
-        config.user[0] ? config.user : "-");
+        entry, args, env, cwd, user);
+}
+
+/* Build kernel cmdline */
+static void build_cmdline(char *buf, size_t len) {
+    char tokens[MAX_CMDLINE];
+    build_config_tokens(tokens, sizeof(tokens));
+    snprintf(buf, len, "console=ttyS0 panic=-1 %s", tokens);
 }
 
 /*
@@ -708,19 +757,7 @@ int main(int argc, char **argv) {
      * authoritative fallback and is always passed via -append above). */
     if (vsock_available) {
         char vsock_config[MAX_CMDLINE];
-        snprintf(vsock_config, sizeof(vsock_config),
-                 "podvm.root=%s "
-                 "podvm.entrypoint=%s "
-                 "podvm.args=%s "
-                 "podvm.env=%s "
-                 "podvm.cwd=%s "
-                 "podvm.user=%s",
-                 "/rootfs",
-                 config.entrypoint,
-                 config.args[0] ? config.args : "-",
-                 config.env[0] ? config.env : "HOME=/root",
-                 config.cwd[0] ? config.cwd : "/",
-                 config.user[0] ? config.user : "-");
+        build_config_tokens(vsock_config, sizeof(vsock_config));
 
         printf("podvm: sending config to guest over vsock\n");
         if (send_config_vsock(vsock_config) < 0) {
