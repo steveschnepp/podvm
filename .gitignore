@@ -16,3 +16,4 @@ tests/test_host_args
 tests/test_vsock
 tests/test_kernel_config
 tests/test_integration
+tests/test_image
