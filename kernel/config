@@ -4,7 +4,7 @@
 
 # ──── Processor ────
 CONFIG_SMP=y
-CONFIG_NR_CPUS=8
+CONFIG_NR_CPUS=4
 CONFIG_X86_64=y
 
 # ──── Paravirtualization ────
@@ -15,58 +15,87 @@ CONFIG_KVM_GUEST=y
 # ──── Virtio Drivers (built-in) ────
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_PCI=y
-CONFIG_VIRTIO_MMIO=y
-CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_FS=y
-CONFIG_VIRTIO_NET=y
-CONFIG_VIRTIO_RNG=y
 CONFIG_VIRTIO_BALLOON=y
 
-# ──── Vsock ────
+# ──── Vsock (host↔guest IPC) ────
 CONFIG_VSOCK=y
 CONFIG_VIRTIO_VSOCKETS_COMMON=y
 
 # ──── Filesystems ────
 CONFIG_TMPFS=y
-CONFIG_TMPFS_XATTR=y
 CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 
+# ──── Namespaces (container isolation) ────
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_USER_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+
+# ──── Seccomp (syscall filtering) ────
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+
+# ──── Capabilities ────
+CONFIG_SECURITY=y
+CONFIG_SECURITY_CAPABILITIES=y
+
 # ──── Essential ────
 CONFIG_TTY=y
-CONFIG_VT=y
-CONFIG_VT_CONSOLE=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_PRINTK=y
-CONFIG_BUG=y
 CONFIG_FUTEX=y
 CONFIG_EPOLL=y
 CONFIG_SIGNALFD=y
-CONFIG_TIMERFD=y
 CONFIG_EVENTFD=y
-CONFIG_AIO=y
 
-# ──── Compression (for initramfs) ────
-CONFIG_CRYPTO_LZ4=y
-CONFIG_CRYPTO_ZSTD=y
-CONFIG_CRYPTO_GZIP=y
+# ──── Kernel hardening ────
+CONFIG_CC_STACKPROTECTOR_STRONG=y
+CONFIG_RANDOMIZE_BASE=y
+CONFIG_HARDENED_USERCOPY=y
+CONFIG_FORTIFY_SOURCE=y
 
-# ──── NOT needed ────
-# CONFIG_OVERLAY_FS is not set
-# CONFIG_EXT4_FS is not set
-# CONFIG_BTRFS_FS is not set
-# CONFIG_XFS_FS is not set
-# CONFIG_NFS_FS is not set
-# CONFIG_CIFS is not set
-# CONFIG_ATA is not set
-# CONFIG_SCSI is not set
-# CONFIG_USB is not set
-# CONFIG_SOUND is not set
-# CONFIG_DRM is not set
-# CONFIG_WLAN is not set
-# CONFIG_BLUETOOTH is not set
-# CONFIG_INFINIBAND is not set
+# ──── Kernel ────
+CONFIG_KERNEL_UNCOMPRESSED=y
+
+# ──── Explicitly removed (attack surface) ────
+# BPF            - VM inside kernel, massive CVE history
+# VIRTIO_MMIO    - not needed with PCI
+# VIRTIO_BLK     - no block devices
+# VIRTIO_NET     - no guest networking
+# VIRTIO_RNG     - not critical
+# VT/VT_CONSOLE  - use serial only
+# BUG            - debug assertions
+# TIMERFD        - extra syscall surface
+# AIO            - not needed
+# TMPFS_XATTR    - xattr parsing bugs
+# CRYPTO_*       - uncompressed initrd
+# MODULES        - everything built-in
+# FTRACE         - tracing subsystem
+# KPROBES        - dynamic tracing
+# PERF_EVENTS    - perf counters
+# DEBUG_FS       - debug filesystem
+# KGDB           - kernel debugger
+# MAGIC_SYSRQ    - magic sysrq key
+# AUDIT          - audit subsystem
+# APPARMOR       - security module
+# SELINUX        - security module
+# YAMA           - security module
+# ACPI           - power management
+# PM             - power management
+# SUSPEND        - suspend/resume
+# HIBERNATION    - hibernation
+# OVERLAY_FS     - host handles this
+# EXT4/BTRFS/XFS - no local disks
+# NFS/CIFS       - no network filesystems
+# ATA/SCSI/USB   - no hardware
+# SOUND/DRM      - no GUI
+# WLAN/BLUETOOTH - no wireless
+# INFINIBAND     - no RDMA
