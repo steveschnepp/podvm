@@ -1,31 +1,49 @@
 /*
  * image.c - OCI image handling
  *
- * Pull and resolve container images using libcurl.
+ * Resolve an image reference to a rootfs directory, pulling from an OCI
+ * registry (Docker Hub / any v2 registry) when needed.
+ *
+ * Pull pipeline:
+ *   1. Parse ref into registry / repository / tag.
+ *   2. GET manifest (Bearer token auth on 401). If the response is a
+ *      manifest list / index, select the linux/amd64 image manifest.
+ *   3. For each layer blob: download (gzipped tar), gunzip (zlib), untar
+ *      into the rootfs, applying OCI whiteout semantics.
+ *
+ * TODO: verify layer digests (sha256) and support zstd layers. Config
+ * blob (Env/Entrypoint/Cmd) is fetched but not yet surfaced to the host.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <curl/curl.h>
+#include <zlib.h>
+
 #include "image.h"
 
 /* Default cache directory */
 #define DEFAULT_CACHE_DIR "/tmp/podvm/images"
-
-/* Buffer sizes */
 #define PATH_SIZE 2048
 
 static char cache_dir[PATH_SIZE] = DEFAULT_CACHE_DIR;
 
-/* Create directory recursively */
+/* ───────────────────────── small helpers ───────────────────────── */
+
 static int mkdir_p(const char *path, int mode) {
     char tmp[PATH_SIZE];
     char *p;
-    
+
+    if (strlen(path) >= sizeof(tmp)) return -1;
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
@@ -38,50 +56,689 @@ static int mkdir_p(const char *path, int mode) {
     return 0;
 }
 
-/* Write callback for curl */
-static size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    FILE *file = (FILE *)userdata;
-    return fwrite(ptr, size, nmemb, file);
+/* Growable byte buffer */
+typedef struct { char *data; size_t len; size_t cap; } Buf;
+
+static void buf_init(Buf *b) { b->data = NULL; b->len = 0; b->cap = 0; }
+static void buf_free(Buf *b) { free(b->data); buf_init(b); }
+
+static int buf_reserve(Buf *b, size_t need) {
+    if (b->len + need + 1 <= b->cap) return 0;
+    size_t ncap = b->cap ? b->cap : 4096;
+    while (ncap < b->len + need + 1) ncap *= 2;
+    char *nd = realloc(b->data, ncap);
+    if (!nd) return -1;
+    b->data = nd;
+    b->cap = ncap;
+    return 0;
 }
+
+static size_t buf_write(void *ptr, size_t sz, size_t nmemb, void *ud) {
+    Buf *b = (Buf *)ud;
+    size_t total = sz * nmemb;
+    if (buf_reserve(b, total) < 0) return 0;
+    memcpy(b->data + b->len, ptr, total);
+    b->len += total;
+    b->data[b->len] = '\0';
+    return total;
+}
+
+/* ───────────────────────── minimal JSON DOM ───────────────────────── */
+
+typedef enum { JNULL, JBOOL, JNUM, JSTR, JARR, JOBJ } JType;
+
+typedef struct JNode JNode;
+struct JNode {
+    JType type;
+    char *str;       /* JSTR (decoded) or JNUM (raw) */
+    int bval;        /* JBOOL */
+    char **keys;     /* JOBJ */
+    JNode **items;   /* JOBJ values / JARR items */
+    size_t n;
+};
+
+static JNode *jnew(JType t) {
+    JNode *j = calloc(1, sizeof(*j));
+    if (j) j->type = t;
+    return j;
+}
+
+void json_free(JNode *j) {
+    if (!j) return;
+    free(j->str);
+    for (size_t i = 0; i < j->n; i++) {
+        free(j->keys ? j->keys[i] : NULL);
+        json_free(j->items ? j->items[i] : NULL);
+    }
+    free(j->keys);
+    free(j->items);
+    free(j);
+}
+
+typedef struct { const char *s; const char *p; } JParser;
+
+static void jskip(JParser *jp) {
+    while (*jp->p && isspace((unsigned char)*jp->p)) jp->p++;
+}
+
+static JNode *jparse_value(JParser *jp);
+
+static char *jparse_string_raw(JParser *jp) {
+    /* jp->p points at opening quote; returns malloc'd decoded string */
+    if (*jp->p != '"') return NULL;
+    jp->p++;
+    size_t cap = 16, len = 0;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+
+    while (*jp->p && *jp->p != '"') {
+        char c = *jp->p;
+        if (c == '\\') {
+            jp->p++;
+            char e = *jp->p;
+            switch (e) {
+            case '"': c = '"'; break;
+            case '\\': c = '\\'; break;
+            case '/': c = '/'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'u': {
+                /* BMP code point; handle surrogate pairs minimally */
+                unsigned int cp = 0;
+                for (int k = 1; k <= 4 && jp->p[k]; k++) {
+                    char h = jp->p[k];
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                }
+                jp->p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && jp->p[1] == '\\' && jp->p[2] == 'u') {
+                    unsigned int lo = 0;
+                    const char *q = jp->p + 3;
+                    for (int k = 0; k < 4 && q[k]; k++) {
+                        char h = q[k];
+                        lo <<= 4;
+                        if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                    }
+                    jp->p += 6;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+                /* UTF-8 encode */
+                char ub[4];
+                int un = 0;
+                if (cp < 0x80) { ub[0] = (char)cp; un = 1; }
+                else if (cp < 0x800) { ub[0] = (char)(0xC0 | (cp >> 6)); ub[1] = (char)(0x80 | (cp & 0x3F)); un = 2; }
+                else if (cp < 0x10000) { ub[0] = (char)(0xE0 | (cp >> 12)); ub[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); ub[2] = (char)(0x80 | (cp & 0x3F)); un = 3; }
+                else { ub[0] = (char)(0xF0 | (cp >> 18)); ub[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); ub[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); ub[3] = (char)(0x80 | (cp & 0x3F)); un = 4; }
+                if (len + (size_t)un + 1 > cap) { cap = (len + (size_t)un + 1) * 2; char *t = realloc(out, cap); if (!t) { free(out); return NULL; } out = t; }
+                memcpy(out + len, ub, (size_t)un);
+                len += (size_t)un;
+                jp->p++;   /* consume the final hex digit */
+                continue;
+            }
+            default: c = e; break;
+            }
+            jp->p++;
+        } else {
+            jp->p++;
+        }
+        if (len + 1 >= cap) { cap *= 2; char *t = realloc(out, cap); if (!t) { free(out); return NULL; } out = t; }
+        out[len++] = c;
+    }
+    if (*jp->p != '"') { free(out); return NULL; }
+    jp->p++;
+    out[len] = '\0';
+    return out;
+}
+
+static JNode *jparse_value(JParser *jp) {
+    jskip(jp);
+    char c = *jp->p;
+
+    if (c == '{') {
+        jp->p++;
+        JNode *o = jnew(JOBJ);
+        if (!o) return NULL;
+        jskip(jp);
+        if (*jp->p == '}') { jp->p++; return o; }
+        for (;;) {
+            jskip(jp);
+            char *key = jparse_string_raw(jp);
+            if (!key) { json_free(o); return NULL; }
+            jskip(jp);
+            if (*jp->p != ':') { free(key); json_free(o); return NULL; }
+            jp->p++;
+            JNode *val = jparse_value(jp);
+            if (!val) { free(key); json_free(o); return NULL; }
+            JNode **ni = realloc(o->items, (o->n + 1) * sizeof(*ni));
+            char **nk = realloc(o->keys, (o->n + 1) * sizeof(*nk));
+            if (!ni || !nk) { free(ni); free(nk); free(key); json_free(val); json_free(o); return NULL; }
+            o->items = ni; o->keys = nk;
+            o->items[o->n] = val;
+            o->keys[o->n] = key;
+            o->n++;
+            jskip(jp);
+            if (*jp->p == ',') { jp->p++; continue; }
+            if (*jp->p == '}') { jp->p++; return o; }
+            json_free(o); return NULL;
+        }
+    }
+
+    if (c == '[') {
+        jp->p++;
+        JNode *a = jnew(JARR);
+        if (!a) return NULL;
+        jskip(jp);
+        if (*jp->p == ']') { jp->p++; return a; }
+        for (;;) {
+            JNode *val = jparse_value(jp);
+            if (!val) { json_free(a); return NULL; }
+            JNode **ni = realloc(a->items, (a->n + 1) * sizeof(*ni));
+            if (!ni) { json_free(val); json_free(a); return NULL; }
+            a->items = ni;
+            a->items[a->n++] = val;
+            jskip(jp);
+            if (*jp->p == ',') { jp->p++; continue; }
+            if (*jp->p == ']') { jp->p++; return a; }
+            json_free(a); return NULL;
+        }
+    }
+
+    if (c == '"') {
+        char *s = jparse_string_raw(jp);
+        if (!s) return NULL;
+        JNode *n = jnew(JSTR);
+        if (!n) { free(s); return NULL; }
+        n->str = s;
+        return n;
+    }
+
+    if (!strncmp(jp->p, "true", 4)) { jp->p += 4; JNode *n = jnew(JBOOL); if (n) n->bval = 1; return n; }
+    if (!strncmp(jp->p, "false", 5)) { jp->p += 5; JNode *n = jnew(JBOOL); return n; }
+    if (!strncmp(jp->p, "null", 4)) { jp->p += 4; return jnew(JNULL); }
+
+    /* number */
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        const char *start = jp->p;
+        while (*jp->p && (isdigit((unsigned char)*jp->p) || *jp->p == '-' ||
+                          *jp->p == '+' || *jp->p == '.' || *jp->p == 'e' || *jp->p == 'E'))
+            jp->p++;
+        size_t len = (size_t)(jp->p - start);
+        char *raw = malloc(len + 1);
+        if (!raw) return NULL;
+        memcpy(raw, start, len);
+        raw[len] = '\0';
+        JNode *n = jnew(JNUM);
+        if (!n) { free(raw); return NULL; }
+        n->str = raw;
+        return n;
+    }
+
+    return NULL;
+}
+
+static JNode *json_parse(const char *s) {
+    JParser jp = { s, s };
+    JNode *v = jparse_value(&jp);
+    return v;
+}
+
+static JNode *json_get(JNode *o, const char *key) {
+    if (!o || o->type != JOBJ) return NULL;
+    for (size_t i = 0; i < o->n; i++)
+        if (strcmp(o->keys[i], key) == 0) return o->items[i];
+    return NULL;
+}
+
+static JNode *json_at(JNode *a, size_t i) {
+    if (!a || a->type != JARR || i >= a->n) return NULL;
+    return a->items[i];
+}
+
+static const char *json_str(JNode *n) {
+    if (!n) return NULL;
+    if (n->type == JSTR || n->type == JNUM) return n->str;
+    return NULL;
+}
+
+/* ───────────────────────── gzip (zlib) ───────────────────────── */
+
+/* Decompress a gzip/zlib buffer into a new malloc'd buffer. */
+static int gunzip_mem(const char *in, size_t inlen, Buf *out) {
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    /* 15+32: auto-detect gzip/zlib header */
+    if (inflateInit2(&strm, 15 + 32) != Z_OK) return -1;
+
+    strm.next_in = (Bytef *)in;
+    strm.avail_in = (uInt)inlen;
+
+    if (buf_reserve(out, inlen * 4 + 1024) < 0) { inflateEnd(&strm); return -1; }
+
+    int ret = Z_OK;
+    do {
+        if (strm.total_out >= out->cap - 1) {
+            if (buf_reserve(out, 65536) < 0) { inflateEnd(&strm); return -1; }
+        }
+        strm.next_out = (Bytef *)(out->data + out->len);
+        strm.avail_out = (uInt)(out->cap - out->len - 1);
+        ret = inflate(&strm, Z_NO_FLUSH);
+        out->len = strm.total_out;
+        out->data[out->len] = '\0';
+    } while (ret == Z_OK && strm.avail_in > 0);
+
+    inflateEnd(&strm);
+    return (ret == Z_OK || ret == Z_STREAM_END) ? 0 : -1;
+}
+
+/* ───────────────────────── tar extraction ───────────────────────── */
+
+static unsigned long long tar_octal(const char *s, size_t n) {
+    unsigned long long v = 0;
+    for (size_t i = 0; i < n && s[i]; i++) {
+        if (s[i] < '0' || s[i] > '7') break;
+        v = (v << 3) + (unsigned long long)(s[i] - '0');
+    }
+    return v;
+}
+
+/* Join destroot + entry name, rejecting absolute paths and "..". */
+static int safe_path(char *out, size_t outsz, const char *root, const char *name) {
+    while (*name == '/') name++;
+    if (strstr(name, "../") != NULL) return -1;
+    if (strcmp(name, "..") == 0) return -1;
+    if (snprintf(out, outsz, "%s/%s", root, name) >= (int)outsz) return -1;
+    return 0;
+}
+
+static void apply_whiteout(const char *root, const char *dirname, const char *base) {
+    /* base is ".wh.<name>" or ".wh..wh..opq" */
+    if (strcmp(base, ".wh..wh..opq") == 0) {
+        /* Opaque dir: remove everything already present in dirname */
+        char dirpath[PATH_SIZE];
+        if (safe_path(dirpath, sizeof(dirpath), root, dirname) < 0) return;
+        DIR *d = opendir(dirpath);
+        if (!d) return;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char child[PATH_SIZE];
+            if (snprintf(child, sizeof(child), "%s/%s", dirpath, de->d_name) < (int)sizeof(child))
+                remove(child);
+        }
+        closedir(d);
+        return;
+    }
+    /* Regular whiteout: delete "<dirname>/<name-after-.wh.>" */
+    const char *target = base + 4; /* skip ".wh." */
+    char path[PATH_SIZE];
+    char dirbuf[PATH_SIZE];
+    if (dirname[0])
+        snprintf(dirbuf, sizeof(dirbuf), "%s/%s", dirname, target);
+    else
+        snprintf(dirbuf, sizeof(dirbuf), "%s", target);
+    if (safe_path(path, sizeof(path), root, dirbuf) == 0)
+        remove(path);
+}
+
+static int untar_mem(const char *tar, size_t tarlen, const char *root) {
+    size_t off = 0;
+    char longname[PATH_SIZE] = "";
+
+    while (off + 512 <= tarlen) {
+        const char *h = tar + off;
+        int empty = 1;
+        for (int i = 0; i < 512; i++) if (h[i]) { empty = 0; break; }
+        if (empty) break; /* end-of-archive marker */
+
+        char name[PATH_SIZE];
+        char prefix[160];
+        memcpy(name, h + 0, 100);
+        name[100] = '\0';
+        unsigned long long size = tar_octal(h + 124, 12);
+        char typeflag = h[156];
+        memcpy(prefix, h + 345, 155);
+        prefix[155] = '\0';
+
+        off += 512;
+
+        if (longname[0]) {
+            /* Previous header was GNU 'L' — its data is the real name */
+            snprintf(name, sizeof(name), "%s", longname);
+            longname[0] = '\0';
+            if (typeflag == 'L' || typeflag == 'K') { /* nested longname: skip data */ }
+        }
+
+        size_t data_blocks = (size_t)((size + 511) / 512) * 512;
+        const char *data = tar + off;
+
+        if (typeflag == 'L') {
+            /* GNU long name for the NEXT header */
+            size_t cp = size < sizeof(longname) - 1 ? size : sizeof(longname) - 1;
+            memcpy(longname, data, cp);
+            longname[cp] = '\0';
+            /* strip trailing NULs */
+            for (size_t k = cp; k > 0 && longname[k - 1] == '\0'; k--) longname[k - 1] = '\0';
+            off += data_blocks;
+            continue;
+        }
+        if (typeflag == 'K' || typeflag == 'x' || typeflag == 'g') {
+            /* longlink / pax extended headers: skip */
+            off += data_blocks;
+            continue;
+        }
+
+        /* Build full name from prefix + name */
+        char full[PATH_SIZE];
+        if (prefix[0])
+            snprintf(full, sizeof(full), "%s/%s", prefix, name);
+        else
+            snprintf(full, sizeof(full), "%s", name);
+
+        char base[PATH_SIZE];
+        { const char *sl = strrchr(full, '/'); snprintf(base, sizeof(base), "%s", sl ? sl + 1 : full); }
+
+        /* Whiteout handling */
+        if (!strncmp(base, ".wh.", 4)) {
+            char dir[PATH_SIZE];
+            const char *slash = strrchr(full, '/');
+            if (slash) { size_t dl = (size_t)(slash - full); if (dl >= sizeof(dir)) dl = sizeof(dir) - 1; memcpy(dir, full, dl); dir[dl] = '\0'; }
+            else dir[0] = '\0';
+            apply_whiteout(root, dir, base);
+            off += data_blocks;
+            continue;
+        }
+
+        char path[PATH_SIZE];
+        if (safe_path(path, sizeof(path), root, full) < 0) {
+            off += data_blocks;
+            continue;
+        }
+
+        if (typeflag == '5') { /* directory */
+            mkdir_p(path, 0755);
+        } else if (typeflag == '2') { /* symlink */
+            char target[PATH_SIZE];
+            memcpy(target, h + 157, 100);
+            target[100] = '\0';
+            char parent[PATH_SIZE];
+            snprintf(parent, sizeof(parent), "%s", path);
+            char *slash = strrchr(parent, '/');
+            if (slash) *slash = '\0';
+            mkdir_p(parent, 0755);
+            remove(path);
+            symlink(target, path);
+        } else if (typeflag == '1') { /* hardlink: treat as symlink-ish copy target */
+            char target[PATH_SIZE];
+            memcpy(target, h + 157, 100);
+            target[100] = '\0';
+            char linkpath[PATH_SIZE];
+            char parent[PATH_SIZE];
+            snprintf(parent, sizeof(parent), "%s", path);
+            char *slash = strrchr(parent, '/');
+            if (slash) *slash = '\0';
+            if (safe_path(linkpath, sizeof(linkpath), root, target) == 0) {
+                mkdir_p(parent, 0755);
+                remove(path);
+                link(linkpath, path);
+            }
+        } else { /* regular file ('0' or '\0') */
+            char parent[PATH_SIZE];
+            snprintf(parent, sizeof(parent), "%s", path);
+            char *slash = strrchr(parent, '/');
+            if (slash) *slash = '\0';
+            mkdir_p(parent, 0755);
+
+            unsigned mode = (unsigned)tar_octal(h + 100, 8);
+            if (!mode) mode = 0644;
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)mode);
+            if (fd >= 0) {
+                if (size) { ssize_t w = write(fd, data, (size_t)size); (void)w; }
+                close(fd);
+            }
+        }
+
+        off += data_blocks;
+    }
+    return 0;
+}
+
+/* ───────────────────────── registry client ───────────────────────── */
+
+typedef struct { char registry[256]; char repo[256]; char tag[128]; } RegRef;
+
+/* Map a logical registry name to the endpoint hostname. */
+static const char *registry_host(const char *registry) {
+    if (!strcmp(registry, "docker.io") || !strcmp(registry, "index.docker.io") ||
+        !strcmp(registry, "registry-1.docker.io"))
+        return "registry-1.docker.io";
+    return registry;
+}
+
+static int reg_parse(const char *name, const char *tag, RegRef *r) {
+    memset(r, 0, sizeof(*r));
+
+    /* Split first path component */
+    const char *slash = strchr(name, '/');
+    size_t firstlen = slash ? (size_t)(slash - name) : strlen(name);
+    char first[256];
+    if (firstlen >= sizeof(first)) return -1;
+    memcpy(first, name, firstlen);
+    first[firstlen] = '\0';
+
+    int has_registry = (strchr(first, '.') != NULL || strchr(first, ':') != NULL ||
+                        !strcmp(first, "localhost"));
+    if (has_registry) {
+        snprintf(r->registry, sizeof(r->registry), "%s", first);
+        snprintf(r->repo, sizeof(r->repo), "%s", slash ? slash + 1 : "");
+    } else {
+        snprintf(r->registry, sizeof(r->registry), "docker.io");
+        snprintf(r->repo, sizeof(r->repo), "%s", name);
+    }
+    if (r->repo[0] == '\0') return -1;
+
+    /* Official image on Docker Hub -> library/ prefix */
+    if (!strcmp(r->registry, "docker.io") && !strchr(r->repo, '/')) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "library/%s", r->repo);
+        snprintf(r->repo, sizeof(r->repo), "%s", tmp);
+    }
+
+    snprintf(r->tag, sizeof(r->tag), "%s", (tag && tag[0]) ? tag : "latest");
+    return 0;
+}
+
+typedef struct { long status; Buf body; Buf headers; } HttpRes;
+
+static size_t hdr_write(void *ptr, size_t sz, size_t nmemb, void *ud) {
+    return buf_write(ptr, sz, nmemb, ud);
+}
+
+static int http_get(const char *url, const char *accept, const char *bearer,
+                    HttpRes *res) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    buf_init(&res->body);
+    buf_init(&res->headers);
+    res->status = 0;
+
+    struct curl_slist *hdrs = NULL;
+    if (accept)
+        hdrs = curl_slist_append(hdrs, accept);
+    if (bearer) {
+        char auth[512];
+        snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer);
+        hdrs = curl_slist_append(hdrs, auth);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buf_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res->body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, hdr_write);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &res->headers);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "podvm/0.1");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res->status);
+
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return (rc == CURLE_OK) ? 0 : -1;
+}
+
+/* Extract a parameter from a WWW-Authenticate: Bearer k=v,k2=v2 header. */
+static int challenge_param(const char *hdr, const char *key, char *out, size_t n) {
+    const char *p = strstr(hdr, key);
+    if (!p) return -1;
+    p += strlen(key);
+    if (*p == '=') p++;
+    if (*p == '"') {
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < n) out[i++] = *p++;
+        out[i] = '\0';
+        return 0;
+    }
+    size_t i = 0;
+    while (*p && *p != ',' && *p != ' ' && i + 1 < n) out[i++] = *p++;
+    out[i] = '\0';
+    return 0;
+}
+
+/* Fetch a Bearer token for the given realm/service/scope. */
+static int registry_token(const char *realm, const char *service,
+                          const char *scope, char *token, size_t n) {
+    char url[1024];
+    if (scope && scope[0])
+        snprintf(url, sizeof(url), "%s?service=%s&scope=%s", realm, service, scope);
+    else
+        snprintf(url, sizeof(url), "%s?service=%s", realm, service);
+
+    HttpRes res;
+    if (http_get(url, NULL, NULL, &res) < 0) return -1;
+    int ok = -1;
+    if (res.status == 200 && res.body.data) {
+        JNode *j = json_parse(res.body.data);
+        if (j) {
+            JNode *t = json_get(j, "token");
+            if (!t) t = json_get(j, "access_token");
+            const char *ts = json_str(t);
+            if (ts) { snprintf(token, n, "%s", ts); ok = 0; }
+            json_free(j);
+        }
+    }
+    buf_free(&res.body);
+    buf_free(&res.headers);
+    return ok;
+}
+
+/*
+ * GET url with Bearer auth. On 401, parse the WWW-Authenticate challenge,
+ * fetch a token, and retry once. Returns 0 on HTTP 200 with body in res.
+ */
+static int registry_get(const char *url, const char *accept,
+                        const char *default_scope, HttpRes *res) {
+    if (http_get(url, accept, NULL, res) < 0) return -1;
+    if (res->status != 401) return (res->status == 200) ? 0 : -1;
+
+    /* Find WWW-Authenticate header */
+    char *ww = NULL;
+    if (res->headers.data) {
+        char *p = res->headers.data;
+        while (p && *p) {
+            if (!strncasecmp(p, "www-authenticate:", 17)) {
+                ww = p;
+                break;
+            }
+            p = strchr(p, '\n');
+            if (p) p++;
+        }
+    }
+    if (!ww) return -1;
+
+    char realm[512] = "", service[256] = "", chal_scope[256] = "";
+    if (challenge_param(ww, "realm", realm, sizeof(realm)) < 0) return -1;
+    challenge_param(ww, "service", service, sizeof(service));
+    challenge_param(ww, "scope", chal_scope, sizeof(chal_scope));
+    const char *scope = chal_scope[0] ? chal_scope : default_scope;
+
+    char token[1024];
+    if (registry_token(realm, service, scope, token, sizeof(token)) < 0) return -1;
+
+    buf_free(&res->body);
+    buf_free(&res->headers);
+    if (http_get(url, accept, token, res) < 0) return -1;
+    return (res->status == 200) ? 0 : -1;
+}
+
+/* If the parsed manifest is an index/list, return the selected digest. */
+static int select_platform_manifest(JNode *mani, char *digest, size_t n) {
+    JNode *manifests = json_get(mani, "manifests");
+    if (!manifests || manifests->type != JARR) return 0; /* not an index */
+
+    const char *want_digest = NULL;
+    for (size_t i = 0; i < manifests->n; i++) {
+        JNode *m = json_at(manifests, i);
+        JNode *pl = json_get(m, "platform");
+        const char *os = json_str(json_get(pl, "os"));
+        const char *arch = json_str(json_get(pl, "architecture"));
+        const char *d = json_str(json_get(m, "digest"));
+        if (!d) continue;
+        int match = os && arch && !strcmp(os, "linux") && !strcmp(arch, "x86_64");
+        if (!match && os && arch && !strcmp(os, "linux") && !strcmp(arch, "amd64"))
+            match = 1;
+        if (match) { want_digest = d; break; }
+        if (!want_digest) want_digest = d; /* fallback: first entry */
+    }
+    if (!want_digest) return -1;
+    snprintf(digest, n, "%s", want_digest);
+    return 1;
+}
+
+/* ───────────────────────── public API ───────────────────────── */
 
 int image_parse(const char *image_str, ImageRef *ref) {
     if (!image_str || !ref) return -1;
-    
+
     memset(ref, 0, sizeof(*ref));
-    
-    /* Find colon for tag */
+
     const char *colon = strrchr(image_str, ':');
     const char *slash = strrchr(image_str, '/');
-    
-    /* Check if colon is after last slash (i.e., it's a tag) */
-    if (colon && (!slash || colon > slash)) {
-        /* Has tag */
-        size_t name_len = colon - image_str;
+
+    /* A ':' after the last '/' is a tag. A ':' before it is a registry
+     * port (host:port/repo), which is part of the name, not a tag. */
+    int colon_is_tag = (colon && (!slash || colon > slash));
+
+    if (colon_is_tag) {
+        size_t name_len = (size_t)(colon - image_str);
         if (name_len >= MAX_IMAGE_NAME) name_len = MAX_IMAGE_NAME - 1;
         memcpy(ref->name, image_str, name_len);
+        ref->name[name_len] = '\0';
         strncpy(ref->tag, colon + 1, MAX_IMAGE_NAME - 1);
     } else {
-        /* No tag, use latest */
         strncpy(ref->name, image_str, MAX_IMAGE_NAME - 1);
         strcpy(ref->tag, "latest");
     }
-    
     return 0;
 }
 
 int image_is_path(const char *str) {
     if (!str) return 0;
-    
-    /* Absolute path */
     if (str[0] == '/') return 1;
-    
-    /* Relative path */
-    if (strncmp(str, "./", 2) == 0 || strncmp(str, "../", 3) == 0) return 1;
-    
-    /* Check if it's an existing directory */
+    if (!strncmp(str, "./", 2) || !strncmp(str, "../", 3)) return 1;
     struct stat st;
     if (stat(str, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
-    
     return 0;
 }
 
@@ -90,120 +747,152 @@ const char *image_cache_dir(void) {
 }
 
 int image_pull(const char *image_name, const char *tag) {
-    printf("podvm: pulling image %s:%s...\n", image_name, tag);
-    fflush(stdout);
-    
-    /* Initialize curl */
+    RegRef rr;
+    if (reg_parse(image_name, tag, &rr) < 0) {
+        fprintf(stderr, "podvm: cannot parse image reference: %s\n", image_name);
+        return -1;
+    }
+
+    const char *host = registry_host(rr.registry);
+    char scope[512];
+    snprintf(scope, sizeof(scope), "repository:%s:pull", rr.repo);
+
+    char base[1024];
+    snprintf(base, sizeof(base), "https://%s/v2/%s", host, rr.repo);
+
+    char accept[512];
+    snprintf(accept, sizeof(accept),
+             "Accept: application/vnd.oci.image.index.v1+json,"
+             "application/vnd.docker.distribution.manifest.list.v2+json,"
+             "application/vnd.oci.image.manifest.v1+json,"
+             "application/vnd.docker.distribution.manifest.v2+json");
+
+    printf("podvm: pulling %s/%s:%s ...\n", rr.registry, rr.repo, rr.tag);
+
+    /* 1. Fetch manifest (or index) */
+    char mani_url[1200];
+    snprintf(mani_url, sizeof(mani_url), "%s/manifests/%s", base, rr.tag);
+    HttpRes res;
+    if (registry_get(mani_url, accept, scope, &res) < 0) {
+        fprintf(stderr, "podvm: manifest fetch failed for %s (HTTP %ld)\n",
+                mani_url, res.status);
+        buf_free(&res.body); buf_free(&res.headers);
+        return -1;
+    }
+
+    JNode *mani = json_parse(res.body.data ? res.body.data : "");
+    buf_free(&res.body); buf_free(&res.headers);
+    if (!mani) {
+        fprintf(stderr, "podvm: cannot parse manifest JSON\n");
+        return -1;
+    }
+
+    /* 2. If it's an index, resolve the platform manifest */
+    char subdigest[128];
+    int sel = select_platform_manifest(mani, subdigest, sizeof(subdigest));
+    if (sel < 0) {
+        fprintf(stderr, "podvm: no linux/amd64 manifest in index\n");
+        json_free(mani);
+        return -1;
+    }
+    if (sel > 0) {
+        json_free(mani);
+        snprintf(mani_url, sizeof(mani_url), "%s/manifests/%s", base, subdigest);
+        if (registry_get(mani_url, accept, scope, &res) < 0) {
+            fprintf(stderr, "podvm: sub-manifest fetch failed (HTTP %ld)\n", res.status);
+            buf_free(&res.body); buf_free(&res.headers);
+            return -1;
+        }
+        mani = json_parse(res.body.data ? res.body.data : "");
+        buf_free(&res.body); buf_free(&res.headers);
+        if (!mani) return -1;
+    }
+
+    /* 3. Download + extract layers */
+    char root[PATH_SIZE];
+    snprintf(root, sizeof(root), "%s/%s/%s", cache_dir, rr.registry, rr.repo);
+    if (snprintf(root, sizeof(root), "%s/%s/%s/%s", cache_dir, rr.registry, rr.repo, rr.tag)
+        >= (int)sizeof(root)) {
+        json_free(mani);
+        return -1;
+    }
+    if (mkdir_p(root, 0755) < 0) {
+        fprintf(stderr, "podvm: cannot create rootfs dir %s: %s\n", root, strerror(errno));
+        json_free(mani);
+        return -1;
+    }
+
+    JNode *layers = json_get(mani, "layers");
+    if (!layers || layers->type != JARR) {
+        fprintf(stderr, "podvm: manifest has no layers\n");
+        json_free(mani);
+        return -1;
+    }
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    
-    /* Create image directory */
-    char image_dir[PATH_SIZE];
-    snprintf(image_dir, sizeof(image_dir), "%s/%s/%s", cache_dir, image_name, tag);
-    
-    /* Create directories recursively */
-    if (mkdir_p(cache_dir, 0755) < 0) {
-        fprintf(stderr, "podvm: failed to create cache dir: %s\n", cache_dir);
-        curl_global_cleanup();
-        return -1;
+
+    int rc = 0;
+    for (size_t i = 0; i < layers->n && rc == 0; i++) {
+        JNode *L = json_at(layers, i);
+        const char *digest = json_str(json_get(L, "digest"));
+        if (!digest) continue;
+
+        char blob_url[1400];
+        snprintf(blob_url, sizeof(blob_url), "%s/blobs/%s", base, digest);
+
+        HttpRes bres;
+        if (registry_get(blob_url, NULL, scope, &bres) < 0) {
+            fprintf(stderr, "podvm: layer fetch failed: %s (HTTP %ld)\n",
+                    digest, bres.status);
+            buf_free(&bres.body); buf_free(&bres.headers);
+            rc = -1;
+            break;
+        }
+
+        /* Layers are gzipped tar (also accept raw tar). */
+        Buf tar;
+        buf_init(&tar);
+        int is_gzip = bres.body.len >= 2 &&
+                      (unsigned char)bres.body.data[0] == 0x1f &&
+                      (unsigned char)bres.body.data[1] == 0x8b;
+        if (is_gzip) {
+            if (gunzip_mem(bres.body.data, bres.body.len, &tar) < 0) {
+                fprintf(stderr, "podvm: gunzip failed for layer %s\n", digest);
+                rc = -1;
+            }
+        } else {
+            /* raw tar: alias the buffer */
+            tar.data = bres.body.data;
+            tar.len = bres.body.len;
+            tar.cap = bres.body.cap;
+            bres.body.data = NULL; /* prevent double free */
+        }
+
+        if (rc == 0 && untar_mem(tar.data ? tar.data : "", tar.len, root) < 0) {
+            fprintf(stderr, "podvm: untar failed for layer %s\n", digest);
+            rc = -1;
+        }
+
+        if (is_gzip) buf_free(&tar);
+        buf_free(&bres.body);
+        buf_free(&bres.headers);
     }
-    
-    char subdir[PATH_SIZE];
-    snprintf(subdir, sizeof(subdir), "%s/%s", cache_dir, image_name);
-    if (mkdir_p(subdir, 0755) < 0) {
-        fprintf(stderr, "podvm: failed to create image dir: %s\n", subdir);
-        curl_global_cleanup();
-        return -1;
-    }
-    
-    if (mkdir_p(image_dir, 0755) < 0) {
-        fprintf(stderr, "podvm: failed to create tag dir: %s\n", image_dir);
-        curl_global_cleanup();
-        return -1;
-    }
-    
-    /* TODO: Implement proper OCI registry pull
-     * 
-     * For now, create a placeholder image structure.
-     * Real implementation would:
-     * 1. Get auth token from registry
-     * 2. Fetch manifest
-     * 3. Download layers
-     * 4. Extract layers to image_dir
-     */
-    
-    /* Create minimal rootfs structure */
-    char path[PATH_SIZE];
-    
-    snprintf(path, sizeof(path), "%s/bin", image_dir);
-    mkdir(path, 0755);
-    
-    snprintf(path, sizeof(path), "%s/etc", image_dir);
-    mkdir(path, 0755);
-    
-    snprintf(path, sizeof(path), "%s/usr", image_dir);
-    mkdir(path, 0755);
-    
-    snprintf(path, sizeof(path), "%s/usr/bin", image_dir);
-    mkdir(path, 0755);
-    
-    snprintf(path, sizeof(path), "%s/tmp", image_dir);
-    mkdir(path, 0755);
-    
-    snprintf(path, sizeof(path), "%s/root", image_dir);
-    mkdir(path, 0755);
-    
-    /* Create a minimal shell */
-    snprintf(path, sizeof(path), "%s/bin/sh", image_dir);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "#!/bin/sh\n");
-        fprintf(f, "echo \"Hello from podvm (image: %s:%s)\"\n", image_name, tag);
-        fprintf(f, "if [ $# -gt 0 ]; then\n");
-        fprintf(f, "    exec \"$@\"\n");
-        fprintf(f, "fi\n");
-        fprintf(f, "exit 0\n");
-        fclose(f);
-        chmod(path, 0755);
-    }
-    
-    /* Create /bin/echo */
-    snprintf(path, sizeof(path), "%s/bin/echo", image_dir);
-    f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "#!/bin/sh\n");
-        fprintf(f, "echo \"$@\"\n");
-        fclose(f);
-        chmod(path, 0755);
-    }
-    
-    /* Create /etc/os-release */
-    snprintf(path, sizeof(path), "%s/etc/os-release", image_dir);
-    f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "NAME=\"%s\"\n", image_name);
-        fprintf(f, "VERSION=\"%s\"\n", tag);
-        fprintf(f, "ID=%s\n", image_name);
-        fprintf(f, "PRETTY_NAME=\"%s %s\"\n", image_name, tag);
-        fclose(f);
-    }
-    
-    printf("podvm: image %s:%s ready at %s\n", image_name, tag, image_dir);
-    printf("podvm: (note: using placeholder image - full registry pull not implemented)\n");
-    fflush(stdout);
-    
+
+    json_free(mani);
     curl_global_cleanup();
-    return 0;
+
+    if (rc == 0)
+        printf("podvm: image %s:%s ready at %s\n", image_name, rr.tag, root);
+    return rc;
 }
 
 int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
     if (!image_str || !rootfs_path) return -1;
-    
+
     /* If it's a path, use directly */
     if (image_is_path(image_str)) {
         strncpy(rootfs_path, image_str, path_size - 1);
         rootfs_path[path_size - 1] = '\0';
-        
-        /* Validate path exists */
         struct stat st;
         if (stat(rootfs_path, &st) < 0 || !S_ISDIR(st.st_mode)) {
             fprintf(stderr, "podvm: directory not found: %s\n", rootfs_path);
@@ -211,42 +900,42 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
         }
         return 0;
     }
-    
-    /* Parse image name */
+
     ImageRef ref;
     if (image_parse(image_str, &ref) < 0) {
         fprintf(stderr, "podvm: failed to parse image name: %s\n", image_str);
         return -1;
     }
-    
-    /* Check cache */
+
+    RegRef rr;
+    if (reg_parse(ref.name, ref.tag, &rr) < 0) {
+        fprintf(stderr, "podvm: cannot parse image reference: %s\n", ref.name);
+        return -1;
+    }
+
+    /* Check cache: <cache>/<registry>/<repo>/<tag> */
     char image_dir[PATH_SIZE];
-    snprintf(image_dir, sizeof(image_dir), "%s/%s/%s", cache_dir, ref.name, ref.tag);
-    
+    if (snprintf(image_dir, sizeof(image_dir), "%s/%s/%s/%s",
+                 cache_dir, rr.registry, rr.repo, rr.tag) >= (int)path_size)
+        return -1;
+
     struct stat st;
     if (stat(image_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        /* Image already cached */
         strncpy(rootfs_path, image_dir, path_size - 1);
         rootfs_path[path_size - 1] = '\0';
         printf("podvm: using cached image %s:%s\n", ref.name, ref.tag);
         return 0;
     }
-    
-    /* Try to pull */
-    if (image_pull(ref.name, ref.tag) < 0) {
-        fprintf(stderr, "podvm: failed to pull image: %s:%s\n", ref.name, ref.tag);
+
+    if (image_pull(ref.name, ref.tag) < 0)
         return -1;
-    }
-    
-    /* Validate pulled image */
+
     if (stat(image_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "podvm: image directory not found after pull: %s\n", image_dir);
+        fprintf(stderr, "podvm: image dir missing after pull: %s\n", image_dir);
         return -1;
     }
-    
-    /* Use pulled image */
+
     strncpy(rootfs_path, image_dir, path_size - 1);
     rootfs_path[path_size - 1] = '\0';
-    
     return 0;
 }

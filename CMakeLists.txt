@@ -10,11 +10,17 @@ add_compile_options(-Wall -Wextra -O2)
 # Main executable
 add_executable(podvm src/main.c src/strparse.c src/image.c)
 
-# Find libcurl (for future registry support)
+# Find libcurl (registry) and zlib (gzip layer decompression)
 find_package(CURL)
 if(CURL_FOUND)
     target_link_libraries(podvm ${CURL_LIBRARIES})
     target_include_directories(podvm PRIVATE ${CURL_INCLUDE_DIRS})
+endif()
+
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    target_link_libraries(podvm ${ZLIB_LIBRARIES})
+    target_include_directories(podvm PRIVATE ${ZLIB_INCLUDE_DIRS})
 endif()
 
 # Install
