@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.cpio
+*.cpio.gz
+
+# Guest binaries + initramfs images (rebuild via make)
+guest/init
+kernel/*.cpio
+kernel/*.cpio.gz
+kernel/bzImage
+
+# Test binaries
+tests/test_config
+tests/test_host_args
+tests/test_vsock
+tests/test_kernel_config
+tests/test_integration
