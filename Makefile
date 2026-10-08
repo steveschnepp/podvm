@@ -25,7 +25,7 @@ $(BUILD_DIR)/podvm: src/main.c src/strparse.c src/image.c src/strparse.h src/ima
 # Clean build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f tests/test_config tests/test_host_args tests/test_vsock tests/test_kernel_config tests/test_integration
+	rm -f tests/test_config tests/test_host_args tests/test_vsock tests/test_kernel_config tests/test_integration tests/test_image
 	rm -f guest/init guest/initramfs.cpio
 	cd guest && make clean 2>/dev/null || true
 
