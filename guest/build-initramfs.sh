@@ -45,7 +45,10 @@ if [ -d "$MODSRC" ]; then
         net/9p/9pnet net/9p/9pnet_virtio fs/9p/9p \
         net/vmw_vsock/vsock \
         net/vmw_vsock/vmw_vsock_virtio_transport_common \
-        net/vmw_vsock/vmw_vsock_virtio_transport; do
+        net/vmw_vsock/vmw_vsock_virtio_transport \
+        net/core/failover \
+        drivers/net/net_failover \
+        drivers/net/virtio_net; do
         for f in "$MODSRC/kernel/$m.ko.xz" "$MODSRC/kernel/$m.ko.gz" "$MODSRC/kernel/$m.ko"; do
             [ -f "$f" ] || continue
             base=$(basename "$f")
