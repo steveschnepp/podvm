@@ -47,11 +47,15 @@ void imgcfg_fold(const ImageConfig *ic, const RunSpec *base, RunSpec *out) {
     if (user_cmd) {
         /* User named a command: it replaces Cmd, after any Entrypoint. */
         PUSH_WORD(user_cmd);
-        /* user_args is comma-joined; re-push each element. */
-        char tmp[IMGCFG_ARGS_MAX];
-        snprintf(tmp, sizeof(tmp), "%s", user_args);
-        for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
-            PUSH_WORD(tok);
+        /* user_args is comma-joined; re-push each element. Only split
+         * when args were actually given -- snprintf("%s", NULL) would
+         * render the literal "(null)" and pass it as an argument. */
+        if (user_args) {
+            char tmp[IMGCFG_ARGS_MAX];
+            snprintf(tmp, sizeof(tmp), "%s", user_args);
+            for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
+                PUSH_WORD(tok);
+        }
     } else if (ic) {
         for (int i = 0; i < ic->ncmd; i++)
             PUSH_WORD(ic->cmd[i]);

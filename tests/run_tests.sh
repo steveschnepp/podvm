@@ -127,6 +127,9 @@ if [ -e /dev/kvm ]; then
     fi
     # Native-pull e2e: forces podvm's own registry client (PODVM_RESOLVE=native).
     run_test "E2E native pull" "timeout 250 sh tests/e2e_native.sh"
+    # Interactive e2e: -i gives the guest stdin (Ctrl-A reaches it). Python
+    # pty harness; skips without KVM/alpine.
+    run_test "E2E interactive (-i)" "timeout 150 python3 tests/e2e_interactive.py"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi

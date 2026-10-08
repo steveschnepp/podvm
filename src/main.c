@@ -444,10 +444,15 @@ static int start_qemu(void) {
      *             every keystroke (incl. Ctrl-A, a readline binding) goes
      *             to the container. Right for an interactive shell; the
      *             monitor is unavailable and you stop the VM by killing
-     *             the process. */
+     *             the process.
+     *
+     * We use -display none, NOT -nographic: -nographic implicitly wires
+     * the default serial to stdio, which conflicts with an explicit
+     * `-serial stdio` ("cannot use stdio by multiple character devices").
+     * -display none leaves serial entirely under our -serial control. */
+    qargs[qi++] = "-display"; qargs[qi++] = "none";
     qargs[qi++] = "-serial";
     qargs[qi++] = config.interactive ? "stdio" : "mon:stdio";
-    qargs[qi++] = "-nographic";
     qargs[qi++] = "-no-reboot";
     qargs[qi] = NULL;
 

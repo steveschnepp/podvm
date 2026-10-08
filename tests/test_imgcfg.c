@@ -81,6 +81,21 @@ int main(void) {
         CHECK(strcmp(out.args, "a,b") == 0);
     }
 
+    /* 4b. User command with NO args -> args must be empty, not "(null)".
+     *     (A regression the e2e caught: snprintf("%s", NULL) rendered the
+     *     literal string "(null)", which then became a real argument.) */
+    {
+        const char *cmd[] = {"serve", NULL};
+        mk_icfg(&ic, NULL, cmd, NULL, NULL, NULL);
+        memset(&base, 0, sizeof(base));
+        snprintf(base.entrypoint, sizeof(base.entrypoint), "/bin/cat");
+        /* base.args intentionally left empty */
+        imgcfg_fold(&ic, &base, &out);
+        CHECK(strcmp(out.entrypoint, "/bin/cat") == 0);
+        CHECK(out.args[0] == '\0');
+        CHECK(strstr(out.args, "(null)") == NULL);
+    }
+
     /* 5. Env: image vars merged, HOME ensured when image omits it. */
     {
         const char *env[] = {"PATH=/bin", "FOO=bar", NULL};
