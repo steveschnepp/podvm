@@ -350,7 +350,9 @@ static int http_get(const char *url, const char *accept, const char *bearer,
     if (accept)
         hdrs = curl_slist_append(hdrs, accept);
     if (bearer) {
-        char auth[512];
+        /* Bearer tokens run ~2.7KB; the header buffer must hold
+         * "Authorization: Bearer " plus the whole token. */
+        char auth[4096];
         snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer);
         hdrs = curl_slist_append(hdrs, auth);
     }
@@ -411,7 +413,18 @@ static int registry_token(const char *realm, const char *service,
             JNode *t = json_get(j, "token");
             if (!t) t = json_get(j, "access_token");
             const char *ts = json_str(t);
-            if (ts) { snprintf(token, n, "%s", ts); ok = 0; }
+            if (ts) {
+                /* Docker Hub JWTs are ~2.7KB; detect truncation
+                 * instead of silently clipping the token (which
+                 * yields an invalid JWT and a confusing 401). */
+                int w = snprintf(token, n, "%s", ts);
+                if (w < 0 || (size_t)w >= n) {
+                    fprintf(stderr, "podvm: auth token too long (%zu bytes)\n",
+                            strlen(ts));
+                } else {
+                    ok = 0;
+                }
+            }
             json_free(j);
         }
     }
@@ -450,7 +463,8 @@ static int registry_get(const char *url, const char *accept,
     challenge_param(ww, "scope", chal_scope, sizeof(chal_scope));
     const char *scope = chal_scope[0] ? chal_scope : default_scope;
 
-    char token[1024];
+    /* Docker Hub bearer tokens run ~2.7KB; keep headroom. */
+    char token[4096];
     if (registry_token(realm, service, scope, token, sizeof(token)) < 0) return -1;
 
     buf_free(&res->body);
