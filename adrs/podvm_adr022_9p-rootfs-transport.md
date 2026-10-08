@@ -42,13 +42,15 @@ Details that this decision forced:
   loads them via `finit_module` in dependency order. The synthetic kernel
   (ADR-007) builds everything in and ships no `/modules`; loading is a no-op
   there.
-- **`CONFIG_NET` enters the synthetic kernel.** `CONFIG_NET_9P` depends on
-  `CONFIG_NET`, so the "no guest networking" attack-surface property (ADR-007)
-  is temporarily relaxed by one net-stack-without-protocols config. Accepted:
-  a rootfs transport is a functional requirement, and 9p is the cheapest one
-  that needs no host daemon. When virtiofs returns, `CONFIG_VIRTIO_FS=y`
-  re-enables and `CONFIG_NET_9P*`/`CONFIG_9P_FS` can move back to the removed
-  list, restoring the no-`CONFIG_NET` property.
+- **`CONFIG_NET` enters the synthetic kernel -- and stays.** `CONFIG_NET_9P`
+  depends on `CONFIG_NET`, relaxing the "no guest networking" attack-surface
+  property (ADR-007). Accepted: a rootfs transport is a functional
+  requirement, and 9p is the cheapest one that needs no host daemon. This
+  was first framed as temporary; ADR-023 then established that guest
+  networking is planned regardless (QEMU user-mode, functional phase), so
+  `CONFIG_NET` is a permanent resident. When virtiofs returns,
+  `CONFIG_VIRTIO_FS=y` re-enables and `CONFIG_NET_9P*`/`CONFIG_9P_FS` move
+  back to the removed list -- but `CONFIG_NET=y` does not leave.
 - **`security_model=none`.** QEMU 9p runs with the invoking uid; podvm is
   single-user-rootfs-served-as-that-uid today. The security-model question is
   deferred to the virtiofs restoration (where virtiofsd's sandboxing options
@@ -96,7 +98,7 @@ begins.
      but `eb4e50d` -- the `mount_tag` fix -- landed after the docs and must
      be reverted too.)
   2. Re-add `CONFIG_VIRTIO_FS=y` to `kernel/config`, move `CONFIG_NET_9P*`
-     back to the removed list, re-evaluate whether `CONFIG_NET=y` can go.
+     back to the removed list (`CONFIG_NET=y` stays; ADR-023).
   3. Restore the memfd-shared memory backend (`-object memory-backend-memfd`,
      `-numa node,memdev=mem`) that vhost-user-fs requires and 9p does not.
   4. Decide the 9p role: delete entirely, or keep as `--fs=9p|virtiofs`
@@ -126,10 +128,12 @@ built.
 
 ## References
 
-- ADR-007 (synthetic kernel; attack-surface list now carries the temporary
-  `CONFIG_NET` entry), ADR-016 (vsock IPC; guest transport modules bundled in
+- ADR-007 (synthetic kernel; attack-surface list now carries the
+  `CONFIG_NET` entry, made permanent by ADR-023), ADR-016 (vsock IPC;
+  guest transport modules bundled in
   the same commit series), ADR-019 (virtiofs; superseded-for-now),
-  ADR-021 (FreeBSD; p9fs becomes the shared primary transport).
+  ADR-021 (FreeBSD; p9fs becomes the shared primary transport),
+  ADR-023 (user-mode networking first; makes `CONFIG_NET` permanent).
 - Mission logs: `2026-10-08_vsock-fix-oci-pull.md` (virtiofsd absence),
   `2026-10-08_pivot-to-9p.md` (this pivot, with restore instructions).
 - Kernel: `fs/9p/vfs_super.c` mount path (fs_context conversion, tag as

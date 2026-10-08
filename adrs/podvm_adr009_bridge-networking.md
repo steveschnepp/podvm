@@ -2,7 +2,9 @@
 
 **Date:** 2024-09-29
 
-**Status:** Accepted
+**Status:** Accepted, but deferred: the functional phase uses QEMU
+user-mode networking first (ADR-023). This ADR remains the design of
+record for bridge/tap networking in the performance phase.
 
 ## Context
 

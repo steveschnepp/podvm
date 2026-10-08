@@ -233,6 +233,8 @@ See [adrs/](adrs/) for detailed architecture decisions:
 - **ADR016**: Vsock IPC
 - **ADR019**: Virtiofs with QEMU (deferred; see ADR-022)
 - **ADR022**: 9p rootfs transport (current)
+- **ADR023**: User-mode networking first (current; bridge in the
+  performance phase)
 
 ## Security
 

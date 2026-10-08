@@ -20,8 +20,9 @@ CONFIG_VIRTIO_BALLOON=y
 
 # ──── 9p (container rootfs share) ────
 # 9p is the rootfs transport until the performance phase (ADR-022), when
-# virtiofs returns. CONFIG_NET_9P depends on CONFIG_NET, so a minimal net
-# stack is unavoidable -- see ADR-022 for the attack-surface tradeoff.
+# virtiofs returns. CONFIG_NET_9P depends on CONFIG_NET; CONFIG_NET is a
+# permanent resident (guest networking is planned, ADR-023), not a 9p
+# concession -- see ADR-022/ADR-023 for the attack-surface tradeoff.
 CONFIG_NET=y
 CONFIG_NET_9P=y
 CONFIG_NET_9P_VIRTIO=y
