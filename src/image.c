@@ -723,6 +723,34 @@ int image_pull(const char *image_name, const char *tag) {
         buf_free(&bres.headers);
     }
 
+    /*
+     * Fetch the config blob (Env/Entrypoint/Cmd/WorkingDir/User) and
+     * persist it next to the rootfs as .podvm-config.json so a cache hit
+     * still carries the image's default command. Best-effort: a missing
+     * config blob just means the image carries no defaults.
+     */
+    if (rc == 0) {
+        const char *cfgdigest = json_str(json_get(json_get(mani, "config"), "digest"));
+        if (cfgdigest) {
+            char cfgurl[1400];
+            snprintf(cfgurl, sizeof(cfgurl), "%s/blobs/%s", base, cfgdigest);
+            HttpRes cres;
+            buf_init(&cres.body);
+            buf_init(&cres.headers);
+            if (registry_get(cfgurl, NULL, scope, &cres) == 0 && cres.body.data) {
+                char cfgpath[PATH_SIZE];
+                snprintf(cfgpath, sizeof(cfgpath), "%s/.podvm-config.json", root);
+                FILE *cf = fopen(cfgpath, "wb");
+                if (cf) {
+                    fwrite(cres.body.data, 1, cres.body.len, cf);
+                    fclose(cf);
+                }
+            }
+            buf_free(&cres.body);
+            buf_free(&cres.headers);
+        }
+    }
+
     json_free(mani);
     curl_global_cleanup();
 
@@ -783,4 +811,44 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
     strncpy(rootfs_path, image_dir, path_size - 1);
     rootfs_path[path_size - 1] = '\0';
     return 0;
+}
+
+/*
+ * Load a cached image's config blob (Env/Entrypoint/Cmd/WorkingDir/User).
+ *
+ * image_pull() drops the config blob next to the unpacked rootfs as
+ * <dir>/.podvm-config.json; this reads it back so a cache hit still
+ * carries the image's default command. Returns 0 on success, -1 if the
+ * cached config is absent or unparseable (caller treats that as "image
+ * carries no defaults" and requires an explicit command).
+ */
+int image_config_load(const char *image_str, ImageConfig *c) {
+    if (!image_str || !c || image_is_path(image_str)) return -1;
+
+    ImageRef ref;
+    if (image_parse(image_str, &ref) < 0) return -1;
+
+    RegRef rr;
+    if (reg_parse(ref.name, ref.tag, &rr) < 0) return -1;
+
+    char cfgpath[PATH_SIZE];
+    if (snprintf(cfgpath, sizeof(cfgpath), "%s/%s/%s/%s/.podvm-config.json",
+                 cache_dir, rr.registry, rr.repo, rr.tag) >= (int)sizeof(cfgpath))
+        return -1;
+
+    FILE *f = fopen(cfgpath, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) < 0) { fclose(f); return -1; }
+    long len = ftell(f);
+    if (len < 0) { fclose(f); return -1; }
+    rewind(f);
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    buf[got] = '\0';
+    fclose(f);
+
+    int rc = image_config_parse(buf, c);
+    free(buf);
+    return rc;
 }

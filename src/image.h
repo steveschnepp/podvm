@@ -57,6 +57,12 @@ void image_config_free(ImageConfig *c);
 int image_config_parse(const char *json_text, ImageConfig *c);
 
 /*
+ * Load a cached image's config blob into c (init before, free after).
+ * Returns 0 on success, -1 if absent/unparseable.
+ */
+int image_config_load(const char *image_str, ImageConfig *c);
+
+/*
  * Parse image name (e.g., "debian:latest" -> name="debian", tag="latest")
  * Returns 0 on success.
  */
