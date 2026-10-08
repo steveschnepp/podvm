@@ -1,10 +1,16 @@
 /*
  * podvm guest init
  *
- * Minimal init for podvm guests.
- * Reads config from kernel cmdline, mounts virtiofs, chroots, execs.
+ * Minimal init for podvm guests (runs as PID 1).
  *
- * Build: musl-gcc -static -Os -o init init.c
+ * Config comes from two sources, in priority order:
+ *   1. kernel cmdline  (podvm.*=... tokens, always present via -append)
+ *   2. host vsock      (overrides cmdline when the host connects and sends)
+ *
+ * Flow: mount pseudofs -> parse cmdline -> try vsock override -> mount
+ * rootfs (virtiofs/9p) -> chroot -> set cwd/user -> exec entrypoint.
+ *
+ * Build: musl-gcc -static -Os (see guest/Makefile)
  */
 
 #include <stdio.h>
@@ -13,24 +19,30 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
+#include <linux/vm_sockets.h>
 
-#define MAX_ARGS  64
-#define MAX_ENVS  128
-#define PATH_SIZE 1024
-#define CMDLINE_SIZE 4096
+#include "strparse.h"
 
-/* Configuration from kernel cmdline */
+#define MAX_ARGS      64
+#define PATH_SIZE     1024
+#define CMDLINE_SIZE  4096
+
+/* vsock config channel (must match host) */
+#define VSOCK_PORT       5000
+#define VSOCK_TIMEOUT_MS 3000
+
+/* Configuration from kernel cmdline / host vsock */
 typedef struct {
     char root[PATH_SIZE];
     char entrypoint[PATH_SIZE];
-    char args[MAX_ARGS][PATH_SIZE];
+    char *args[MAX_ARGS];
     int  argc;
-    char envs[MAX_ENVS][PATH_SIZE];
-    int  envc;
     char cwd[PATH_SIZE];
     char hostname[256];
     int  uid;
@@ -48,68 +60,94 @@ static int read_cmdline(char *buf, size_t len) {
     return 0;
 }
 
-/* Find parameter value in cmdline */
-static const char *find_param(const char *cmdline, const char *prefix) {
-    const char *p = cmdline;
-    size_t plen = strlen(prefix);
-
-    while (*p) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        if (strncmp(p, prefix, plen) == 0)
-            return p + plen;
-        while (*p && *p != ' ') p++;
-    }
-    return NULL;
-}
-
-/* Parse comma-separated values */
-static int parse_csv(const char *input, char output[][PATH_SIZE], int max) {
-    int count = 0;
-    const char *p = input;
-
-    while (*p && count < max) {
-        const char *start = p;
-        while (*p && *p != ',') p++;
-        size_t len = p - start;
-        if (len >= PATH_SIZE) len = PATH_SIZE - 1;
-        memcpy(output[count], start, len);
-        output[count][len] = '\0';
-        count++;
-        if (*p == ',') p++;
-    }
-    return count;
-}
-
-/* Parse uid:gid */
-static void parse_user(const char *str, int *uid, int *gid) {
-    *uid = *gid = 0;
-    if (str) sscanf(str, "%d:%d", uid, gid);
-}
-
-/* Parse config from kernel cmdline */
-static void parse_config(Config *cfg, const char *cmdline) {
+/*
+ * Parse config tokens from a "podvm.*=..." string (cmdline or vsock payload).
+ * Only keys present in the input are set, so a later call layers overrides
+ * on top of an earlier one without clearing unrelated fields.
+ */
+static void parse_config(Config *cfg, const char *text) {
     const char *val;
 
-    memset(cfg, 0, sizeof(*cfg));
+    val = kv_find(text, "podvm.root=");
+    if (val) kv_copy_value(cfg->root, PATH_SIZE, val);
 
-    val = find_param(cmdline, "podvm.root=");
-    if (val) strncpy(cfg->root, val, PATH_SIZE - 1);
+    val = kv_find(text, "podvm.entrypoint=");
+    if (val) kv_copy_value(cfg->entrypoint, PATH_SIZE, val);
 
-    val = find_param(cmdline, "podvm.entrypoint=");
-    if (val) strncpy(cfg->entrypoint, val, PATH_SIZE - 1);
+    val = kv_find(text, "podvm.args=");
+    if (val) {
+        csv_free(cfg->args, cfg->argc);   /* free any previous args */
+        cfg->argc = csv_parse(val, cfg->args, MAX_ARGS);
+    }
 
-    val = find_param(cmdline, "podvm.args=");
-    if (val) cfg->argc = parse_csv(val, cfg->args, MAX_ARGS);
+    val = kv_find(text, "podvm.cwd=");
+    if (val) kv_copy_value(cfg->cwd, PATH_SIZE, val);
 
-    val = find_param(cmdline, "podvm.cwd=");
-    if (val) strncpy(cfg->cwd, val, PATH_SIZE - 1);
+    val = kv_find(text, "podvm.hostname=");
+    if (val) kv_copy_value(cfg->hostname, 256, val);
 
-    val = find_param(cmdline, "podvm.hostname=");
-    if (val) strncpy(cfg->hostname, val, 255);
+    val = kv_find(text, "podvm.user=");
+    if (val) parse_uid_gid(val, &cfg->uid, &cfg->gid);
+}
 
-    val = find_param(cmdline, "podvm.user=");
-    parse_user(val, &cfg->uid, &cfg->gid);
+/*
+ * Listen on vsock and, if the host connects and sends a config line within
+ * the timeout, copy it into buf. Returns bytes read, or -1 on
+ * unsupported/timeout/error (caller falls back to cmdline-only config).
+ */
+static int recv_config_vsock(char *buf, size_t len, int timeout_ms) {
+    struct sockaddr_vm addr;
+    struct pollfd pfd;
+    int lfd, cfd;
+    size_t n = 0;
+
+    lfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (lfd < 0)
+        return -1;   /* vsock not available in this guest */
+
+    memset(&addr, 0, sizeof(addr));
+    addr.svm_family = AF_VSOCK;
+    addr.svm_cid = VMADDR_CID_ANY;
+    addr.svm_port = VSOCK_PORT;
+
+    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(lfd, 1) < 0) {
+        close(lfd);
+        return -1;
+    }
+
+    /* Wait (bounded) for the host to connect. */
+    pfd.fd = lfd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, timeout_ms) <= 0) {
+        close(lfd);   /* timeout or poll error: no config from host */
+        return -1;
+    }
+
+    cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        close(lfd);
+        return -1;
+    }
+
+    /* Read one newline-terminated config line. */
+    while (n < len - 1) {
+        ssize_t r = read(cfd, buf + n, len - 1 - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (memchr(buf, '\n', n)) break;
+    }
+    buf[n] = '\0';
+
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+
+    /* ACK so the host knows the config was received. */
+    (void)!write(cfd, "OK", 2);
+
+    close(cfd);
+    close(lfd);
+    return (int)n;
 }
 
 /* Create directory recursively */
@@ -135,16 +173,18 @@ static void mount_pseudofs(void) {
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mkdir("/dev/pts", 0755);
     mount("devpts", "/dev/pts", "devpts", 0, NULL);
+    mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
 }
 
-/* Mount container rootfs via virtiofs */
+/* Mount container rootfs via virtiofs (fallback: 9p) */
 static int mount_rootfs(const Config *cfg) {
     mkdir_p(cfg->root, 0755);
 
-    /* Try virtiofs first, fall back to 9p */
-    if (mount(NULL, cfg->root, "virtiofs", 0, "tag=rootfs") == 0)
+    /* virtiofs: tag is the source argument, not a mount option */
+    if (mount("rootfs", cfg->root, "virtiofs", 0, NULL) == 0)
         return 0;
 
+    /* 9p: tag is a mount option */
     if (mount(NULL, cfg->root, "9p", 0,
               "trans=virtio,version=9p2000.L,tag=rootfs") == 0)
         return 0;
@@ -153,52 +193,27 @@ static int mount_rootfs(const Config *cfg) {
     return -1;
 }
 
-/* Build argv for execve */
-static void build_argv(const Config *cfg, char **argv) {
-    int i = 0;
-    argv[i++] = cfg->entrypoint;
-    for (int j = 0; j < cfg->argc && i < MAX_ARGS - 1; j++)
-        argv[i++] = cfg->args[j];
-    argv[i] = NULL;
-}
-
-/* Build envp for execve */
-static void build_envp(const Config *cfg, char **envp) {
-    int i = 0;
-
-    for (int j = 0; j < cfg->envc && i < MAX_ENVS - 1; j++)
-        envp[i++] = cfg->envs[j];
-
-    /* Ensure PATH */
-    int has_path = 0;
-    for (int j = 0; j < i; j++)
-        if (strncmp(envp[j], "PATH=", 5) == 0) { has_path = 1; break; }
-    if (!has_path)
-        envp[i++] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-    /* Ensure HOME */
-    int has_home = 0;
-    for (int j = 0; j < i; j++)
-        if (strncmp(envp[j], "HOME=", 5) == 0) { has_home = 1; break; }
-    if (!has_home)
-        envp[i++] = "HOME=/root";
-
-    envp[i] = NULL;
-}
-
 int main(void) {
     Config cfg;
     char cmdline[CMDLINE_SIZE];
+    char vsock_cfg[CMDLINE_SIZE];
 
     /* Step 1: Mount pseudo-filesystems */
     mount_pseudofs();
 
-    /* Step 2: Read and parse kernel cmdline */
+    /* Step 2: Baseline config from kernel cmdline */
+    memset(&cfg, 0, sizeof(cfg));
     if (read_cmdline(cmdline, sizeof(cmdline)) < 0) {
         fprintf(stderr, "podvm-init: cannot read /proc/cmdline\n");
         return 1;
     }
     parse_config(&cfg, cmdline);
+
+    /* Step 2b: Host vsock config overrides cmdline (best-effort, bounded). */
+    if (recv_config_vsock(vsock_cfg, sizeof(vsock_cfg), VSOCK_TIMEOUT_MS) > 0) {
+        parse_config(&cfg, vsock_cfg);
+        fprintf(stderr, "podvm-init: received config from host over vsock\n");
+    }
 
     if (cfg.root[0] == '\0') {
         fprintf(stderr, "podvm-init: podvm.root not set\n");
@@ -235,9 +250,10 @@ int main(void) {
 
     /* Step 8: Exec entrypoint */
     char *exec_argv[MAX_ARGS + 1];
-    char *exec_envp[MAX_ENVS + 1];
-    build_argv(&cfg, exec_argv);
-    build_envp(&cfg, exec_envp);
+    exec_argv[0] = cfg.entrypoint;
+    for (int j = 0; j < cfg.argc; j++)
+        exec_argv[1 + j] = cfg.args[j];
+    exec_argv[1 + cfg.argc] = NULL;
 
     fprintf(stderr, "podvm-init: exec %s\n", cfg.entrypoint);
     execvp(cfg.entrypoint, exec_argv);
