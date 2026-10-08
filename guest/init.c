@@ -40,6 +40,7 @@
 #define PATH_SIZE     1024
 #define CMDLINE_SIZE  4096
 #define MAX_ARG_VAL   256   /* matches the host's args[] buffer */
+#define MAX_ENV_VAL   1100  /* matches the host's env[] buffer (1024) */
 
 /* vsock config channel (must match host) */
 #define VSOCK_PORT       5000
@@ -51,6 +52,8 @@ typedef struct {
     char entrypoint[PATH_SIZE];
     char *args[MAX_ARGS];
     int  argc;
+    char *env[MAX_ARGS];   /* "K=V" strings from podvm.env= */
+    int  nenv;
     char cwd[PATH_SIZE];
     char hostname[256];
     int  uid;
@@ -98,6 +101,21 @@ static void parse_config(Config *cfg, const char *text) {
 
     val = kv_find(text, "podvm.cwd=");
     if (val) kv_copy_value(cfg->cwd, PATH_SIZE, val);
+
+    /* podvm.env= is a comma-separated list of K=V pairs. The host has
+     * always sent this; the guest previously ignored it, so image
+     * environment variables never reached the entrypoint. */
+    val = kv_find(text, "podvm.env=");
+    if (val) {
+        char tok[MAX_ENV_VAL];
+        kv_copy_value(tok, sizeof(tok), val);   /* trim at token boundary */
+        csv_free(cfg->env, cfg->nenv);
+        if (strcmp(tok, "-") == 0) {
+            cfg->nenv = 0;
+        } else {
+            cfg->nenv = csv_parse(tok, cfg->env, MAX_ARGS);
+        }
+    }
 
     val = kv_find(text, "podvm.hostname=");
     if (val) kv_copy_value(cfg->hostname, 256, val);
@@ -397,11 +415,22 @@ int main(void) {
     else
         chdir("/");
 
-    /* Step 8: Switch user */
+    /* Step 8: Apply environment. The image's env (podvm.env) is merged
+     * over the inherited minimal environment, so PATH and friends from the
+     * image reach the entrypoint. Best-effort per entry. */
+    for (int j = 0; j < cfg.nenv; j++) {
+        char *eq = strchr(cfg.env[j], '=');
+        if (!eq) continue;
+        *eq = '\0';
+        setenv(cfg.env[j], eq + 1, 1);
+        *eq = '=';   /* keep the string intact for any later use */
+    }
+
+    /* Step 9: Switch user */
     if (cfg.gid > 0) setgid(cfg.gid);
     if (cfg.uid > 0) setuid(cfg.uid);
 
-    /* Step 9: Exec entrypoint */
+    /* Step 10: Exec entrypoint */
     char *exec_argv[MAX_ARGS + 1];
     exec_argv[0] = cfg.entrypoint;
     for (int j = 0; j < cfg.argc; j++)
