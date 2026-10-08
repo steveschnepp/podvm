@@ -97,6 +97,18 @@ run_test "No BPF" "grep -q 'CONFIG_BPF=y' kernel/config && exit 1 || true"
 run_test "No modules" "grep -q 'CONFIG_MODULES=y' kernel/config && exit 1 || true"
 
 echo ""
+echo "Running end-to-end test..."
+echo ""
+
+# Real VM boot (needs KVM): 9p mount -> chroot -> exec -> clean exit.
+# Not a WARN-if-missing check: skip silently on KVM-less hosts.
+if [ -e /dev/kvm ]; then
+    run_test "E2E boot (9p + vsock)" "timeout 150 sh tests/e2e_boot.sh"
+else
+    echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
+fi
+
+echo ""
 echo "================"
 echo "Results:"
 echo "  ${GREEN}PASS: $PASS${NC}"
