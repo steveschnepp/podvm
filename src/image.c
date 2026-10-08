@@ -8,12 +8,9 @@
  *   1. Parse ref into registry / repository / tag.
  *   2. GET manifest (Bearer token auth on 401). If the response is a
  *      manifest list / index, select the linux/amd64 image manifest.
- *   3. For each layer blob: download (gzipped tar), verify its sha256
- *      against the manifest digest, gunzip (zlib), untar into the rootfs,
- *      applying OCI whiteout semantics.
- *
- * TODO: support zstd layers. Layer and config digests are verified
- * (sha256) against the manifest.
+ *   3. For each layer blob: download, verify its sha256 against the
+ *      manifest digest, decompress (gzip/zstd/raw), untar into the
+ *      rootfs, applying OCI whiteout semantics.
  */
 
 #include <stdio.h>
@@ -29,6 +26,7 @@
 #include <fcntl.h>
 #include <curl/curl.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #include "image.h"
 #include "json.h"
@@ -114,6 +112,40 @@ static int gunzip_mem(const char *in, size_t inlen, Buf *out) {
 
     inflateEnd(&strm);
     return (ret == Z_OK || ret == Z_STREAM_END) ? 0 : -1;
+}
+
+/* zstd magic number (RFC 8878): 0x28 0xB5 0x2F 0xFD. */
+#define ZSTD_MAGIC 0xFD2FB528U
+
+/*
+ * Decompress a zstd frame into a new malloc'd buffer.
+ *
+ * Registries increasingly publish zstd layers (OCI media type
+ * ...tar+zstd); without this the pull fails on them. We ask zstd for the
+ * decompressed size when the frame advertises it, and otherwise grow the
+ * buffer geometrically -- same shape as gunzip_mem.
+ */
+static int zstd_decompress_mem(const char *in, size_t inlen, Buf *out) {
+    unsigned long long dsz = ZSTD_getFrameContentSize(in, inlen);
+    size_t want = (dsz == ZSTD_CONTENTSIZE_UNKNOWN || dsz == ZSTD_CONTENTSIZE_ERROR)
+                  ? inlen * 4 + 1024
+                  : (size_t)dsz;
+    if (buf_reserve(out, want + 1) < 0) return -1;
+
+    size_t rc;
+    for (;;) {
+        rc = ZSTD_decompress(out->data + out->len, out->cap - out->len - 1,
+                             in, inlen);
+        if (!ZSTD_isError(rc)) {
+            out->len += rc;
+            out->data[out->len] = '\0';
+            return 0;
+        }
+        /* OutDstSize: grow and retry. Anything else is fatal. */
+        if (ZSTD_getErrorCode(rc) != ZSTD_error_dstSize_tooSmall)
+            return -1;
+        if (buf_reserve(out, 65536) < 0) return -1;
+    }
 }
 
 /* ───────────────────────── tar extraction ───────────────────────── */
@@ -726,15 +758,27 @@ int image_pull(const char *image_name, const char *tag) {
             break;
         }
 
-        /* Layers are gzipped tar (also accept raw tar). */
+        /* Layers are gzipped tar, zstd tar, or raw tar -- detect by
+         * magic bytes rather than trusting the manifest media type. */
         Buf tar;
         buf_init(&tar);
         int is_gzip = bres.body.len >= 2 &&
                       (unsigned char)bres.body.data[0] == 0x1f &&
                       (unsigned char)bres.body.data[1] == 0x8b;
+        int is_zstd = bres.body.len >= 4 &&
+                      (unsigned char)bres.body.data[0] == 0x28 &&
+                      (unsigned char)bres.body.data[1] == 0xB5 &&
+                      (unsigned char)bres.body.data[2] == 0x2F &&
+                      (unsigned char)bres.body.data[3] == 0xFD;
+        int decompressed = is_gzip || is_zstd;
         if (is_gzip) {
             if (gunzip_mem(bres.body.data, bres.body.len, &tar) < 0) {
                 fprintf(stderr, "podvm: gunzip failed for layer %s\n", digest);
+                rc = -1;
+            }
+        } else if (is_zstd) {
+            if (zstd_decompress_mem(bres.body.data, bres.body.len, &tar) < 0) {
+                fprintf(stderr, "podvm: zstd decompress failed for layer %s\n", digest);
                 rc = -1;
             }
         } else {
@@ -750,7 +794,7 @@ int image_pull(const char *image_name, const char *tag) {
             rc = -1;
         }
 
-        if (is_gzip) buf_free(&tar);
+        if (decompressed) buf_free(&tar);
         buf_free(&bres.body);
         buf_free(&bres.headers);
     }

@@ -10,7 +10,7 @@ add_compile_options(-Wall -Wextra -O2)
 # Main executable
 add_executable(podvm src/main.c src/strparse.c src/image.c src/json.c src/store.c src/sha256.c)
 
-# Find libcurl (registry) and zlib (gzip layer decompression)
+# Find libcurl (registry), zlib (gzip) and libzstd (zstd layers)
 find_package(CURL)
 if(CURL_FOUND)
     target_link_libraries(podvm ${CURL_LIBRARIES})
@@ -21,6 +21,26 @@ find_package(ZLIB)
 if(ZLIB_FOUND)
     target_link_libraries(podvm ${ZLIB_LIBRARIES})
     target_include_directories(podvm PRIVATE ${ZLIB_INCLUDE_DIRS})
+endif()
+
+# libzstd has no standard Find module; use pkg-config, else probe the lib
+# directly. Optional: without it zstd layers fail at link/run, gzip still
+# works, so we warn rather than hard-fail.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD QUIET libzstd)
+endif()
+if(ZSTD_FOUND)
+    target_link_libraries(podvm ${ZSTD_LIBRARIES})
+    target_include_directories(podvm PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_directories(podvm PRIVATE ${ZSTD_LIBRARY_DIRS})
+else()
+    find_library(ZSTD_LIB zstd)
+    if(ZSTD_LIB)
+        target_link_libraries(podvm ${ZSTD_LIB})
+    else()
+        message(WARNING "libzstd not found: zstd image layers will not decompress")
+    endif()
 endif()
 
 # Install

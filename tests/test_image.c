@@ -12,6 +12,7 @@
 #include <string.h>
 #include <assert.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #include "../src/image.c"
 
@@ -79,6 +80,40 @@ static void test_gzip(void) {
     CHECK(out.len == plain_len);
     CHECK(out.data && memcmp(out.data, plain, plain_len) == 0);
     buf_free(&out);
+}
+
+/* ── zstd round-trip ──────────────────────────────── */
+static void test_zstd(void) {
+    const char *plain = "the quick brown fox jumps over the lazy dog. "
+                        "pack my box with five dozen liquor jugs.";
+    size_t plain_len = strlen(plain);
+
+    /* compress -> zstd_decompress_mem */
+    size_t bound = ZSTD_compressBound(plain_len);
+    char *comp = malloc(bound);
+    CHECK(comp != NULL);
+    size_t clen = ZSTD_compress(comp, bound, plain, plain_len, 3);
+    CHECK(!ZSTD_isError(clen));
+
+    /* Sanity: it really is a zstd frame (the magic bytes the pull uses
+     * to pick the decompressor). */
+    CHECK(clen >= 4 && (unsigned char)comp[0] == 0x28 &&
+          (unsigned char)comp[1] == 0xB5 && (unsigned char)comp[2] == 0x2F &&
+          (unsigned char)comp[3] == 0xFD);
+
+    Buf out;
+    buf_init(&out);
+    CHECK(zstd_decompress_mem(comp, clen, &out) == 0);
+    CHECK(out.len == plain_len);
+    CHECK(out.data && memcmp(out.data, plain, plain_len) == 0);
+    buf_free(&out);
+    free(comp);
+
+    /* Corrupt input is rejected, not crashed on. */
+    Buf bad;
+    buf_init(&bad);
+    CHECK(zstd_decompress_mem("not a zstd frame", 16, &bad) == -1);
+    buf_free(&bad);
 }
 
 /* ── tar construction + extraction ────────────────────── */
@@ -256,6 +291,7 @@ static void test_config_parse(void) {
 int main(void) {
     test_json();
     test_gzip();
+    test_zstd();
     test_untar();
     test_image_parse();
     test_reg_parse();

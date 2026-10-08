@@ -3,7 +3,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
-LDFLAGS =
+LDFLAGS = -lzstd
 
 # Test binaries
 TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256
@@ -32,9 +32,9 @@ test_kernel_config: test_kernel_config.c
 test_integration: test_integration.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# Image pipeline tests (includes src/image.c; needs curl + zlib)
+# Image pipeline tests (includes src/image.c; needs curl + zlib + zstd)
 test_image: test_image.c ../src/image.c ../src/image.h ../src/json.c ../src/json.h ../src/sha256.c ../src/sha256.h
-	$(CC) $(CFLAGS) -o $@ test_image.c ../src/json.c ../src/sha256.c -I../src -lcurl -lz
+	$(CC) $(CFLAGS) -o $@ test_image.c ../src/json.c ../src/sha256.c -I../src -lcurl -lz -lzstd
 
 # SHA-256 known-answer tests (no deps)
 test_sha256: test_sha256.c ../src/sha256.c ../src/sha256.h
