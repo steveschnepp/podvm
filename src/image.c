@@ -8,11 +8,12 @@
  *   1. Parse ref into registry / repository / tag.
  *   2. GET manifest (Bearer token auth on 401). If the response is a
  *      manifest list / index, select the linux/amd64 image manifest.
- *   3. For each layer blob: download (gzipped tar), gunzip (zlib), untar
- *      into the rootfs, applying OCI whiteout semantics.
+ *   3. For each layer blob: download (gzipped tar), verify its sha256
+ *      against the manifest digest, gunzip (zlib), untar into the rootfs,
+ *      applying OCI whiteout semantics.
  *
- * TODO: verify layer digests (sha256) and support zstd layers. Config
- * blob (Env/Entrypoint/Cmd) is fetched but not yet surfaced to the host.
+ * TODO: support zstd layers. Layer and config digests are verified
+ * (sha256) against the manifest.
  */
 
 #include <stdio.h>
@@ -31,6 +32,7 @@
 
 #include "image.h"
 #include "json.h"
+#include "sha256.h"
 
 /* Default cache directory */
 #define DEFAULT_CACHE_DIR "/tmp/podvm/images"
@@ -284,6 +286,22 @@ static int untar_mem(const char *tar, size_t tarlen, const char *root) {
         off += data_blocks;
     }
     return 0;
+}
+
+/* ───────────────────────── digest verification ───────────────────────── */
+
+/*
+ * Check a downloaded buffer against the manifest's expected digest
+ * ("sha256:<hex>"). Returns 1 if it matches (or there is nothing to
+ * check against -- a missing/unsupported-algorithm digest is not a
+ * mismatch we can judge), 0 if it does not match.
+ */
+static int digest_matches(const char *data, size_t len, const char *digest) {
+    if (!digest || strncmp(digest, "sha256:", 7) != 0)
+        return 1;
+    char got[65];
+    sha256_hex(data, len, got);
+    return strcmp(got, digest + 7) == 0;
 }
 
 /* ───────────────────────── registry client ───────────────────────── */
@@ -694,6 +712,20 @@ int image_pull(const char *image_name, const char *tag) {
             break;
         }
 
+        /* Integrity: the manifest names the blob by its sha256, so a
+         * truncated or tampered download must not be extracted. */
+        if (!digest_matches(bres.body.data ? bres.body.data : "", bres.body.len,
+                            digest)) {
+            char got[65];
+            sha256_hex(bres.body.data ? bres.body.data : "", bres.body.len, got);
+            fprintf(stderr, "podvm: layer digest mismatch for %s\n", digest);
+            fprintf(stderr, "podvm:   expected %s\n", digest);
+            fprintf(stderr, "podvm:   got      sha256:%s\n", got);
+            buf_free(&bres.body); buf_free(&bres.headers);
+            rc = -1;
+            break;
+        }
+
         /* Layers are gzipped tar (also accept raw tar). */
         Buf tar;
         buf_init(&tar);
@@ -737,7 +769,8 @@ int image_pull(const char *image_name, const char *tag) {
             HttpRes cres;
             buf_init(&cres.body);
             buf_init(&cres.headers);
-            if (registry_get(cfgurl, NULL, scope, &cres) == 0 && cres.body.data) {
+            if (registry_get(cfgurl, NULL, scope, &cres) == 0 && cres.body.data &&
+                digest_matches(cres.body.data, cres.body.len, cfgdigest)) {
                 char cfgpath[PATH_SIZE];
                 snprintf(cfgpath, sizeof(cfgpath), "%s/.podvm-config.json", root);
                 FILE *cf = fopen(cfgpath, "wb");
