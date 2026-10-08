@@ -100,19 +100,19 @@ static int store_lookup(const char *image, char *image_id, size_t idn,
     if (!j || j->type != JARR) { json_free(j); return -1; }
 
     /*
-     * Build the candidate name list: the raw ref (with :latest default),
-     * the docker.io/library/ form for bare names, and localhost/ for
-     * bare names (podman-built images).
+     * Build the candidate name list. Try the ref as given, then the
+     * fully-qualified forms podman normalizes to:
+     *   docker.io/library/<name>  (Docker Hub official image)
+     *   localhost/<name>          (locally-built image)
+     * Defaulting the tag to :latest when the ref carries none.
      */
     char cand[3][STORE_PATH_MAX];
     int nc = 0;
     snprintf(cand[nc++], STORE_PATH_MAX, "%s", image);
-    if (!strchr(image, '/') && !strchr(image, ':')) {
-        snprintf(cand[nc++], STORE_PATH_MAX, "docker.io/library/%s:latest", image);
-        snprintf(cand[nc++], STORE_PATH_MAX, "localhost/%s:latest", image);
-    } else if (!strchr(image, '/')) {
-        /* "debian:bookworm" -> docker.io/library/debian:bookworm */
-        snprintf(cand[nc++], STORE_PATH_MAX, "docker.io/library/%s", image);
+    if (!strchr(image, '/')) {
+        const char *suffix = strchr(image, ':') ? "" : ":latest";
+        snprintf(cand[nc++], STORE_PATH_MAX, "docker.io/library/%s%s", image, suffix);
+        snprintf(cand[nc++], STORE_PATH_MAX, "localhost/%s%s", image, suffix);
     }
 
     int found = 0;
