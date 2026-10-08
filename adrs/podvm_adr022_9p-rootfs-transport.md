@@ -26,9 +26,10 @@ a fallback mount in `guest/init.c:mount_rootfs()`. 9p therefore converts the
 green; restore virtiofs afterwards as the default, with 9p retained as a
 fallback.** This is a temporary simplification, not a verdict on virtiofs.
 
-Concretely, commits `0a8a186..e478aec` (host QEMU args, guest mount, kernel
-config, tests, e2e boot test) replace virtiofs with 9p. Reverting that range
-restores the virtiofs path intact; nothing was rewritten or discarded.
+Concretely, commits `0a8a186..e478aec` plus `eb4e50d` (host QEMU args, guest
+mount, kernel config, tests, e2e boot test) replace virtiofs with 9p.
+Reverting that set restores the virtiofs path intact; nothing was rewritten
+or discarded.
 
 Details that this decision forced:
 
@@ -83,8 +84,17 @@ begins.
 - ADR-021's FreeBSD path is *strengthened*: p9fs on FreeBSD 15.x now shares
   the primary transport design with Linux instead of being a fallback.
 - **Follow-ups when virtiofs returns (performance phase):**
-  1. Revert range `0a8a186..e478aec` (or re-apply the inverse diff), keeping
-     the e2e test and swapping its transport assertion.
+  1. Revert the pivot's code commits newest-first, keeping the e2e test
+     and swapping its transport assertion:
+
+     ```
+     git revert --no-commit eb4e50d e478aec d0d0f5b 2fb2af7 a9ecd0b 0a8a186
+     # restore/adjust tests/e2e_boot.sh, then commit
+     ```
+
+     (A plain `git revert 0a8a186..e478aec` also works for the range proper,
+     but `eb4e50d` -- the `mount_tag` fix -- landed after the docs and must
+     be reverted too.)
   2. Re-add `CONFIG_VIRTIO_FS=y` to `kernel/config`, move `CONFIG_NET_9P*`
      back to the removed list, re-evaluate whether `CONFIG_NET=y` can go.
   3. Restore the memfd-shared memory backend (`-object memory-backend-memfd`,
