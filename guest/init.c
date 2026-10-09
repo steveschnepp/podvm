@@ -418,11 +418,20 @@ int main(void) {
         }
     }
 
-    /* Step 7: Set working directory */
-    if (cfg.cwd[0])
-        chdir(cfg.cwd);
-    else
+    /* Step 7: Set working directory. docker creates a missing WORKDIR
+     * instead of failing, so do the same for -w: mkdir, then chdir,
+     * and only warn if that still cannot work (e.g. a read-only
+     * rootfs). */
+    if (cfg.cwd[0]) {
+        mkdir_p(cfg.cwd, 0755);
+        if (chdir(cfg.cwd) < 0) {
+            fprintf(stderr, "podvm-init: chdir %s: %s; continuing in /\n",
+                    cfg.cwd, strerror(errno));
+            chdir("/");
+        }
+    } else {
         chdir("/");
+    }
 
     /* Step 8: Apply environment. The image's env (podvm.env) is merged
      * over the inherited minimal environment, so PATH and friends from the

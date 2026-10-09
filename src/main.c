@@ -680,6 +680,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "      --env-file <f>  Read KEY=VALUE lines from a file\n");
     fprintf(stderr, "  -u, --user <spec>   Run as <name|uid>[:<group|gid>] (resolved\n");
     fprintf(stderr, "                      against the container's /etc/passwd)\n");
+    fprintf(stderr, "  -w, --workdir <dir> Working directory inside the container\n");
+    fprintf(stderr, "                      (absolute; created if missing)\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -720,6 +722,7 @@ int main(int argc, char **argv) {
         {"env",         required_argument, 0, 'e'},
         {"env-file",    required_argument, 0, OPT_ENVFILE},
         {"user",        required_argument, 0, 'u'},
+        {"workdir",     required_argument, 0, 'w'},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -728,7 +731,7 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:ie:u:m:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:ie:u:w:m:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
@@ -745,6 +748,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             snprintf(config.user, sizeof(config.user), "%s", optarg);
+            break;
+        case 'w':
+            if (optarg[0] != '/') {
+                fprintf(stderr, "podvm: --workdir must be an absolute path: '%s'\n",
+                        optarg);
+                return 1;
+            }
+            snprintf(config.cwd, sizeof(config.cwd), "%s", optarg);
             break;
         case 'm':
             config.memory = atoi(optarg);

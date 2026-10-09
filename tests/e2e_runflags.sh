@@ -114,5 +114,21 @@ run_podvm u4.log podvm-e2e-user:test || fail "image-USER run failed"
 cp "$WORK/u4.log" "$WORK/last.log"
 grep -q "uid=1234" "$WORK/u4.log" || fail "image USER no longer applies without -u"
 
-echo "E2E-RUNFLAGS PASS (so far): -e/--env/--env-file and -u/--user reach the guest"
+# ---- -w/--workdir ----
+
+# An existing directory: the command runs there.
+run_podvm w1.log -w /etc "$IMG" /bin/pwd || fail "-w /etc run failed"
+cp "$WORK/w1.log" "$WORK/last.log"
+grep -q "/etc" "$WORK/w1.log" || fail "-w /etc did not land the command in /etc"
+
+# A missing directory: created, like docker's WORKDIR (not silently /).
+run_podvm w2.log -w /newdir "$IMG" /bin/pwd || fail "-w /newdir run failed"
+cp "$WORK/w2.log" "$WORK/last.log"
+grep -q "/newdir" "$WORK/w2.log" || fail "-w did not create the missing directory"
+
+# A relative path is rejected before any VM starts.
+"$PODVM" -w relative "$IMG" /bin/true > "$WORK/bad2.log" 2>&1 \
+    && fail "-w relative accepted"
+
+echo "E2E-RUNFLAGS PASS: -e/--env/--env-file, -u/--user, -w/--workdir reach the guest"
 exit 0

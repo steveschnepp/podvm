@@ -160,6 +160,8 @@ Options:
                       overrides the image's value for the key)
       --env-file <f>  Read KEY=VALUE lines from a file
   -u, --user <spec>   Run as <name|uid>[:<group|gid>]
+  -w, --workdir <dir> Working directory inside the container
+                      (absolute; created if missing)
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
