@@ -162,6 +162,8 @@ Options:
   -u, --user <spec>   Run as <name|uid>[:<group|gid>]
   -w, --workdir <dir> Working directory inside the container
                       (absolute; created if missing)
+  -p, --publish <spec> Publish a container port to the host:
+                      [hostip:]hostport:containerport (tcp)
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path

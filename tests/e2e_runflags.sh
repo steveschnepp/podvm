@@ -130,5 +130,32 @@ grep -q "/newdir" "$WORK/w2.log" || fail "-w did not create the missing director
 "$PODVM" -w relative "$IMG" /bin/true > "$WORK/bad2.log" 2>&1 \
     && fail "-w relative accepted"
 
-echo "E2E-RUNFLAGS PASS: -e/--env/--env-file, -u/--user, -w/--workdir reach the guest"
+# ---- -p/--publish ----
+
+# Serve a one-shot HTTP response on guest port 80 via busybox nc
+# (alpine's busybox has no httpd applet), publish it on the host, and
+# fetch it through slirp hostfwd. Kill the whole process group (setsid)
+# so no QEMU outlives the test holding the vsock CID.
+setsid timeout 60 "$PODVM" -r "$WORK/initramfs.cpio" -p 18080:80 \
+    "$IMG" /bin/sh -c 'while :; do printf "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nAlpine" | nc -l -p 80; done' \
+    > "$WORK/p1.log" 2>&1 &
+PODPID=$!
+GOT=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    OUT=$(curl -s --max-time 2 http://127.0.0.1:18080/os-release 2>/dev/null)
+    case "$OUT" in *Alpine*) GOT=1; break;; esac
+    sleep 1
+done
+kill -TERM -- "-$PODPID" 2>/dev/null
+wait "$PODPID" 2>/dev/null
+[ -n "$GOT" ] || { cp "$WORK/p1.log" "$WORK/last.log"; \
+    fail "-p 18080:80 did not publish the guest port"; }
+
+# Malformed publishes are rejected host-side.
+"$PODVM" -p garbage "$IMG" /bin/true > "$WORK/bad3.log" 2>&1 \
+    && fail "-p garbage accepted"
+"$PODVM" -p 99999:80 "$IMG" /bin/true > "$WORK/bad4.log" 2>&1 \
+    && fail "-p 99999:80 accepted"
+
+echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p reach the guest/host as specified"
 exit 0

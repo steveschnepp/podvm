@@ -38,6 +38,10 @@
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
 
+/* Published ports: -p [hostip:]hostport:containerport (tcp). The
+ * destination is always the guest's slirp address (10.0.2.15). */
+#define MAX_PUBLISH 16
+
 /* Configuration */
 static struct {
     char kernel[MAX_PATH];
@@ -116,6 +120,8 @@ static void handle_signal(int sig) {
 /* Guest CID (must match -device vhost-vsock-pci,guest-cid=) */
 #define GUEST_CID_STR "3"
 #define GUEST_CID     3
+/* Guest address under slirp (must match the guest's static config) */
+#define GUEST_IP_STR "10.0.2.15"
 
 /* vsock availability on the host (auto-detected) */
 static int vsock_available = 0;
@@ -125,6 +131,64 @@ static int vsock_available = 0;
 #define MAX_CHAIN 64
 static StoreLayer store_layers[MAX_CHAIN];
 static int store_nlayers = 0;
+
+/* -p/--publish entries (tcp only; validated in publish_add). */
+static struct {
+    char hostip[64];
+    int  hostport;
+    int  containerport;
+} publishes[MAX_PUBLISH];
+static int npublishes = 0;
+
+/*
+ * Parse and store one -p spec: [hostip:]hostport:containerport.
+ * Numeric ports 1..65535; hostip defaults to 127.0.0.1 (docker's
+ * default bind). IPv6 hostips are rejected -- the colon-splitting is
+ * unambiguous only without them.
+ */
+static int publish_add(const char *spec) {
+    char buf[128];
+    char *cport, *hport;
+    const char *ip = "127.0.0.1";
+
+    if (npublishes >= MAX_PUBLISH) {
+        fprintf(stderr, "podvm: too many -p entries (max %d)\n", MAX_PUBLISH);
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%s", spec);
+
+    cport = strrchr(buf, ':');
+    if (!cport) goto bad;
+    *cport++ = '\0';
+    hport = strrchr(buf, ':');
+    if (hport) {
+        *hport++ = '\0';
+        ip = buf;
+    } else {
+        hport = buf;
+    }
+
+    {
+        char *end;
+        long hp = strtol(hport, &end, 10);
+        if (*end || hp < 1 || hp > 65535) goto bad;
+        long cp = strtol(cport, &end, 10);
+        if (*end || cp < 1 || cp > 65535) goto bad;
+        if (strlen(ip) >= sizeof(publishes[0].hostip)) goto bad;
+
+        snprintf(publishes[npublishes].hostip,
+                 sizeof(publishes[0].hostip), "%s", ip);
+        publishes[npublishes].hostport = (int)hp;
+        publishes[npublishes].containerport = (int)cp;
+        npublishes++;
+    }
+    return 0;
+
+bad:
+    fprintf(stderr, "podvm: invalid -p '%s' "
+                    "(want [hostip:]hostport:containerport, tcp)\n", spec);
+    return -1;
+}
 
 /* Detect host vsock support via /dev/vhost-vsock */
 static void detect_vsock(void) {
@@ -491,6 +555,7 @@ static int start_qemu(void) {
     char cpu_str[32];
     char fsdev_str[MAX_PATH + 64];
     char vsock_cid_str[32];
+    char netdev_str[512];
 
     /* Bounded argv so we can conditionally append the vsock device. */
     const char *qargs[64];
@@ -513,6 +578,10 @@ static int start_qemu(void) {
     printf("podvm:   vsock:     %s (cid %s)\n",
            vsock_available ? "yes" : "no",
            vsock_available ? vsock_cid_str : "-");
+    for (int i = 0; i < npublishes; i++)
+        printf("podvm:   publish:   tcp:%s:%d -> " GUEST_IP_STR ":%d\n",
+               publishes[i].hostip, publishes[i].hostport,
+               publishes[i].containerport);
     printf("podvm:   cmdline:   %s\n", cmdline);
 
     /* Machine / resources */
@@ -527,8 +596,23 @@ static int start_qemu(void) {
     /* User-mode networking (slirp): in-process, no daemon, no root,
      * no host state (ADR-023). Guest gets DHCP 10.0.2.15, DNS at
      * 10.0.2.3, gateway 10.0.2.2. Bridge/tap returns in the
-     * performance phase. */
-    qargs[qi++] = "-netdev";  qargs[qi++] = "user,id=net0";
+     * performance phase. -p appends hostfwd rules, one per entry. */
+    snprintf(netdev_str, sizeof(netdev_str), "user,id=net0");
+    {
+        size_t noff = strlen(netdev_str);
+        for (int i = 0; i < npublishes; i++) {
+            int w = snprintf(netdev_str + noff, sizeof(netdev_str) - noff,
+                             ",hostfwd=tcp:%s:%d-" GUEST_IP_STR ":%d",
+                             publishes[i].hostip, publishes[i].hostport,
+                             publishes[i].containerport);
+            if (w < 0 || (size_t)w >= sizeof(netdev_str) - noff) {
+                fprintf(stderr, "podvm: -p list too long\n");
+                return -1;
+            }
+            noff += (size_t)w;
+        }
+    }
+    qargs[qi++] = "-netdev";  qargs[qi++] = netdev_str;
     qargs[qi++] = "-device";  qargs[qi++] = "virtio-net-pci,netdev=net0";
     /* vsock (only when the host supports it) */
     if (vsock_available) {
@@ -682,6 +766,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "                      against the container's /etc/passwd)\n");
     fprintf(stderr, "  -w, --workdir <dir> Working directory inside the container\n");
     fprintf(stderr, "                      (absolute; created if missing)\n");
+    fprintf(stderr, "  -p, --publish <spec> Publish a container port to the host:\n");
+    fprintf(stderr, "                      [hostip:]hostport:containerport (tcp)\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -723,6 +809,7 @@ int main(int argc, char **argv) {
         {"env-file",    required_argument, 0, OPT_ENVFILE},
         {"user",        required_argument, 0, 'u'},
         {"workdir",     required_argument, 0, 'w'},
+        {"publish",     required_argument, 0, 'p'},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -731,7 +818,7 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:ie:u:w:m:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:ie:u:w:p:m:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
@@ -756,6 +843,9 @@ int main(int argc, char **argv) {
                 return 1;
             }
             snprintf(config.cwd, sizeof(config.cwd), "%s", optarg);
+            break;
+        case 'p':
+            if (publish_add(optarg) < 0) return 1;
             break;
         case 'm':
             config.memory = atoi(optarg);
