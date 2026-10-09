@@ -157,5 +157,25 @@ wait "$PODPID" 2>/dev/null
 "$PODVM" -p 99999:80 "$IMG" /bin/true > "$WORK/bad4.log" 2>&1 \
     && fail "-p 99999:80 accepted"
 
-echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p reach the guest/host as specified"
+# ---- --network=none ----
+
+# No netdev is attached, and the guest does not configure eth0.
+run_podvm n1.log --network=none \
+    "$IMG" /bin/sh -c 'ip link show eth0 > /dev/null 2>&1 && echo HASETH0 || echo NOETH0' \
+    || fail "--network=none run failed"
+cp "$WORK/n1.log" "$WORK/last.log"
+grep -q "NOETH0" "$WORK/n1.log" || fail "--network=none still configured eth0"
+if grep -q "virtio-net-pci" "$WORK/n1.log"; then
+    fail "--network=none still attached a netdev"
+fi
+
+# -p with no networking is a contradiction, caught host-side.
+"$PODVM" --network=none -p 18081:80 "$IMG" /bin/true > "$WORK/bad5.log" 2>&1 \
+    && fail "-p with --network=none accepted"
+
+# host/bridge are not implemented (tap comes with ADR-009).
+"$PODVM" --network=host "$IMG" /bin/true > "$WORK/bad6.log" 2>&1 \
+    && fail "--network=host accepted"
+
+echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network reach the guest/host as specified"
 exit 0

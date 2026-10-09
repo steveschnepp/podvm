@@ -61,6 +61,7 @@ typedef struct {
     int  uid;              /* resolved after chroot from the container's
                             * /etc/passwd + /etc/group (see userdb.c) */
     int  gid;
+    int  net_none;         /* podvm.net=none: no netdev, skip eth0 */
 } Config;
 
 /* Read /proc/cmdline */
@@ -130,6 +131,17 @@ static void parse_config(Config *cfg, const char *text) {
     if (val) {
         kv_copy_value(cfg->user, sizeof(cfg->user), val);
         kv_unescape(cfg->user);
+    }
+
+    /* podvm.net=none: the host attached no netdev; do not try to
+     * configure eth0 (the ioctl would just fail and warn). */
+    val = kv_find(text, "podvm.net=");
+    if (val) {
+        char tok[32];
+        kv_copy_value(tok, sizeof(tok), val);
+        kv_unescape(tok);
+        if (strcmp(tok, "none") == 0)
+            cfg->net_none = 1;
     }
 }
 
@@ -391,8 +403,10 @@ int main(void) {
     if (cfg.hostname[0])
         sethostname(cfg.hostname, strlen(cfg.hostname));
 
-    /* Step 3b: Bring up eth0 for slirp networking (best-effort). */
-    setup_network();
+    /* Step 3b: Bring up eth0 for slirp networking (best-effort). Skipped
+     * when the host said --network=none. */
+    if (!cfg.net_none)
+        setup_network();
 
     /* Step 4: Mount container rootfs */
     if (mount_rootfs(&cfg) < 0)

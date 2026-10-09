@@ -53,6 +53,7 @@ static struct {
     char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
     char name[256];           /* container name; enables persistent state */
+    int  net_none;      /* --network=none: no netdev, guest skips eth0 */
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -i flag */
@@ -382,6 +383,13 @@ static void build_config_tokens(char *buf, size_t len) {
         "podvm.cwd=%s "
         "podvm.user=%s",
         entry, args, env, cwd, user);
+
+    /* Only sent when non-default, so ordinary cmdlines (and the e2e
+     * assertions on them) are unchanged. */
+    if (config.net_none) {
+        size_t used = strlen(buf);
+        snprintf(buf + used, len - used, " podvm.net=none");
+    }
 }
 
 /* Build kernel cmdline */
@@ -578,6 +586,7 @@ static int start_qemu(void) {
     printf("podvm:   vsock:     %s (cid %s)\n",
            vsock_available ? "yes" : "no",
            vsock_available ? vsock_cid_str : "-");
+    printf("podvm:   net:       %s\n", config.net_none ? "none" : "slirp (user-mode)");
     for (int i = 0; i < npublishes; i++)
         printf("podvm:   publish:   tcp:%s:%d -> " GUEST_IP_STR ":%d\n",
                publishes[i].hostip, publishes[i].hostport,
@@ -596,9 +605,11 @@ static int start_qemu(void) {
     /* User-mode networking (slirp): in-process, no daemon, no root,
      * no host state (ADR-023). Guest gets DHCP 10.0.2.15, DNS at
      * 10.0.2.3, gateway 10.0.2.2. Bridge/tap returns in the
-     * performance phase. -p appends hostfwd rules, one per entry. */
-    snprintf(netdev_str, sizeof(netdev_str), "user,id=net0");
-    {
+     * performance phase. -p appends hostfwd rules, one per entry.
+     * --network=none skips the netdev entirely; the guest is told via
+     * podvm.net=none and does not try to configure eth0. */
+    if (!config.net_none) {
+        snprintf(netdev_str, sizeof(netdev_str), "user,id=net0");
         size_t noff = strlen(netdev_str);
         for (int i = 0; i < npublishes; i++) {
             int w = snprintf(netdev_str + noff, sizeof(netdev_str) - noff,
@@ -611,9 +622,9 @@ static int start_qemu(void) {
             }
             noff += (size_t)w;
         }
+        qargs[qi++] = "-netdev";  qargs[qi++] = netdev_str;
+        qargs[qi++] = "-device";  qargs[qi++] = "virtio-net-pci,netdev=net0";
     }
-    qargs[qi++] = "-netdev";  qargs[qi++] = netdev_str;
-    qargs[qi++] = "-device";  qargs[qi++] = "virtio-net-pci,netdev=net0";
     /* vsock (only when the host supports it) */
     if (vsock_available) {
         qargs[qi++] = "-device";
@@ -750,7 +761,7 @@ static int cmd_rm(int argc, char **argv) {
 }
 
 /* Long-only options: --rm has no short form (-r is taken by --initramfs). */
-enum { OPT_RM = 1000, OPT_ENVFILE = 1001 };
+enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002 };
 
 /* Print usage */
 static void usage(const char *prog) {
@@ -768,6 +779,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "                      (absolute; created if missing)\n");
     fprintf(stderr, "  -p, --publish <spec> Publish a container port to the host:\n");
     fprintf(stderr, "                      [hostip:]hostport:containerport (tcp)\n");
+    fprintf(stderr, "      --network <mode>  slirp (default) or none (no network)\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -810,6 +822,7 @@ int main(int argc, char **argv) {
         {"user",        required_argument, 0, 'u'},
         {"workdir",     required_argument, 0, 'w'},
         {"publish",     required_argument, 0, 'p'},
+        {"network",     required_argument, 0, OPT_NETWORK},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -846,6 +859,17 @@ int main(int argc, char **argv) {
             break;
         case 'p':
             if (publish_add(optarg) < 0) return 1;
+            break;
+        case OPT_NETWORK:
+            if (!strcmp(optarg, "none")) {
+                config.net_none = 1;
+            } else if (!strcmp(optarg, "slirp")) {
+                config.net_none = 0;
+            } else {
+                fprintf(stderr, "podvm: --network must be slirp or none "
+                                "(host/bridge need tap; ADR-009/perf phase)\n");
+                return 1;
+            }
             break;
         case 'm':
             config.memory = atoi(optarg);
@@ -889,6 +913,12 @@ int main(int argc, char **argv) {
     /* Need at least image/rootfs and command */
     if (optind >= argc) {
         usage(argv[0]);
+        return 1;
+    }
+
+    if (config.net_none && npublishes > 0) {
+        fprintf(stderr, "podvm: -p/--publish requires networking "
+                        "(--network=none disables it)\n");
         return 1;
     }
 

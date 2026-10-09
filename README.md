@@ -164,6 +164,7 @@ Options:
                       (absolute; created if missing)
   -p, --publish <spec> Publish a container port to the host:
                       [hostip:]hostport:containerport (tcp)
+      --network <mode>  slirp (default) or none (no network)
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
