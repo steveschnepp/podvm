@@ -413,7 +413,8 @@ int main(void) {
     {
         int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
-            (void)!write(fd, "nameserver " SLIRP_DNS "\n", 22);
+            static const char resolv[] = "nameserver " SLIRP_DNS "\n";
+            (void)!write(fd, resolv, sizeof(resolv) - 1);
             close(fd);
         }
     }
