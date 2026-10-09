@@ -137,6 +137,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
     # Run-flag parity e2e: podman-parity run flags reach the guest.
     run_test "E2E run flags (podman parity)" "sh tests/e2e_runflags.sh"
+    # images/rmi e2e: deletes cached alpine on purpose -- must be last.
+    run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi

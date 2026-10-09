@@ -232,5 +232,12 @@ grep -q "more" "$WORK/volrw/new.txt" || fail "host-side file has wrong content"
 "$PODVM" --tmpfs relative "$IMG" /bin/true > "$WORK/bad10.log" 2>&1 \
     && fail "--tmpfs with a relative path accepted"
 
-echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only/-v/--tmpfs all behave"
+# ---- --hostname ----
+
+run_podvm h1.log --hostname build-host "$IMG" /bin/sh -c 'hostname' \
+    || fail "--hostname run failed"
+cp "$WORK/h1.log" "$WORK/last.log"
+grep -q "build-host" "$WORK/h1.log" || fail "--hostname did not reach the guest"
+
+echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only/-v/--tmpfs/--hostname behave"
 exit 0

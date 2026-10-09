@@ -93,4 +93,48 @@ int image_pull(const char *image_name, const char *tag);
  */
 const char *image_cache_dir(void);
 
+/*
+ * Cache management (podvm images / podvm rmi).
+ *
+ * The cache holds one directory per <registry>/<repo>/<tag> with a
+ * flattened rootfs and (usually) a .podvm-config.json. Built images
+ * (podvm build) land in the same layout, so run/images/rmi see one
+ * cache.
+ */
+
+typedef struct {
+    char name[MAX_IMAGE_NAME];       /* display registry/repo (normalized) */
+    char tag[MAX_IMAGE_NAME];
+    char id[16];                     /* 12 hex, derived from the cache path */
+    char path[MAX_PATH];             /* absolute cache dir */
+    unsigned long long size;         /* bytes used (recursive) */
+} ImageCacheEntry;
+
+/*
+ * Map an image reference to its cache directory (no network, no pull).
+ * Returns 0 on success, -1 for a path reference or an unparseable ref.
+ */
+int image_cache_path(const char *image_str, char *out, size_t n);
+
+/*
+ * List cached images (entries filled up to max). Returns the count
+ * (0 = empty cache), -1 on error. Display names are normalized:
+ * docker.io/registry-1.docker.io and library/ are dropped.
+ */
+int image_cache_list(ImageCacheEntry *ents, int max);
+
+/*
+ * Per-image locking, the mirror of the container-name guard: a run
+ * that serves a cached rootfs to a VM holds a SHARED lock, and rmi
+ * takes an EXCLUSIVE one, so a live container's image cannot be
+ * deleted out from under it. Lock files live in <cache>-locks/ (a
+ * sibling of the cache, never inside a deletable image dir) and are
+ * never deleted -- same inode-is-identity rule as container locks.
+ *
+ * Returns the fd (keep open for the run's lifetime; NOT CLOEXEC --
+ * the QEMU child inherits it), or -1; errno is EWOULDBLOCK for the
+ * exclusive case when the image is in use.
+ */
+int image_lock(const char *image_str, int exclusive);
+
 #endif /* IMAGE_H */

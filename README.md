@@ -170,6 +170,7 @@ Options:
   -v, --volume <h:t[:ro]>  Bind-mount a host directory into the
                       container (both paths absolute)
       --tmpfs <dir>   Mount a tmpfs at <dir> in the container
+      --hostname <name>  Set the container hostname
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
@@ -183,6 +184,8 @@ Options:
 
 Subcommands:
   rm <name>...        Delete named containers' persistent state
+  images              List cached images
+  rmi <image>...      Remove cached images (refused while in use)
 ```
 
 The first positional argument may be a rootfs directory **or** an image

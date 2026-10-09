@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
@@ -39,6 +40,20 @@
 static char cache_dir[PATH_SIZE] = DEFAULT_CACHE_DIR;
 
 /* ───────────────────────── small helpers ───────────────────────── */
+
+/*
+ * Cache layout: <cache>/<registry>/<repo with '/' mangled to '+'>/<tag>.
+ * Flattening the repo keeps the walk unambiguous -- exactly three
+ * levels, and a repo dir can never be mistaken for a tag dir (which a
+ * nested "library/alpine" layout made impossible to tell apart from
+ * "library" + tag "alpine").
+ */
+static void mangle_repo(const char *repo, char *out, size_t n) {
+    size_t i = 0;
+    for (; repo[i] && i + 1 < n; i++)
+        out[i] = (repo[i] == '/') ? '+' : repo[i];
+    out[i] = '\0';
+}
 
 static int mkdir_p(const char *path, int mode) {
     char tmp[PATH_SIZE];
@@ -705,11 +720,14 @@ int image_pull(const char *image_name, const char *tag) {
 
     /* 3. Download + extract layers */
     char root[PATH_SIZE];
-    snprintf(root, sizeof(root), "%s/%s/%s", cache_dir, rr.registry, rr.repo);
-    if (snprintf(root, sizeof(root), "%s/%s/%s/%s", cache_dir, rr.registry, rr.repo, rr.tag)
-        >= (int)sizeof(root)) {
-        json_free(mani);
-        return -1;
+    {
+        char repo[256];
+        mangle_repo(rr.repo, repo, sizeof(repo));
+        if (snprintf(root, sizeof(root), "%s/%s/%s/%s",
+                     cache_dir, rr.registry, repo, rr.tag) >= (int)sizeof(root)) {
+            json_free(mani);
+            return -1;
+        }
     }
     if (mkdir_p(root, 0755) < 0) {
         fprintf(stderr, "podvm: cannot create rootfs dir %s: %s\n", root, strerror(errno));
@@ -863,10 +881,9 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
         return -1;
     }
 
-    /* Check cache: <cache>/<registry>/<repo>/<tag> */
+    /* Check cache: <cache>/<registry>/<mangled-repo>/<tag> */
     char image_dir[PATH_SIZE];
-    if (snprintf(image_dir, sizeof(image_dir), "%s/%s/%s/%s",
-                 cache_dir, rr.registry, rr.repo, rr.tag) >= (int)path_size)
+    if (image_cache_path(image_str, image_dir, sizeof(image_dir)) < 0)
         return -1;
 
     struct stat st;
@@ -909,9 +926,11 @@ int image_config_load(const char *image_str, ImageConfig *c) {
     if (reg_parse(ref.name, ref.tag, &rr) < 0) return -1;
 
     char cfgpath[PATH_SIZE];
-    if (snprintf(cfgpath, sizeof(cfgpath), "%s/%s/%s/%s/.podvm-config.json",
-                 cache_dir, rr.registry, rr.repo, rr.tag) >= (int)sizeof(cfgpath))
+    if (image_cache_path(image_str, cfgpath, sizeof(cfgpath)) < 0)
         return -1;
+    size_t cfglen = strlen(cfgpath);
+    if (cfglen + 20 >= sizeof(cfgpath)) return -1;
+    snprintf(cfgpath + cfglen, sizeof(cfgpath) - cfglen, "/.podvm-config.json");
 
     FILE *f = fopen(cfgpath, "rb");
     if (!f) return -1;
@@ -928,4 +947,162 @@ int image_config_load(const char *image_str, ImageConfig *c) {
     int rc = image_config_parse(buf, c);
     free(buf);
     return rc;
+}
+
+/* ───────────────────────── cache listing & locking ─────────────────────── */
+
+int image_cache_path(const char *image_str, char *out, size_t n) {
+    if (!image_str || image_is_path(image_str)) return -1;
+
+    ImageRef ref;
+    if (image_parse(image_str, &ref) < 0) return -1;
+    RegRef rr;
+    if (reg_parse(ref.name, ref.tag, &rr) < 0) return -1;
+
+    char repo[256];
+    mangle_repo(rr.repo, repo, sizeof(repo));
+    if (snprintf(out, n, "%s/%s/%s/%s", cache_dir, rr.registry, repo, rr.tag)
+        >= (int)n)
+        return -1;
+    return 0;
+}
+
+/* Recursive byte usage of a tree (symlinks count their own inode). */
+static unsigned long long dir_size(const char *path) {
+    unsigned long long sum = 0;
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char p[PATH_SIZE];
+        if (snprintf(p, sizeof(p), "%s/%s", path, de->d_name) >= (int)sizeof(p))
+            continue;
+        struct stat st;
+        if (lstat(p, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode))
+            sum += dir_size(p);
+        else
+            sum += (unsigned long long)st.st_size;
+    }
+    closedir(d);
+    return sum;
+}
+
+int image_cache_list(ImageCacheEntry *ents, int max) {
+    int n = 0;
+    DIR *rd = opendir(cache_dir);
+    if (!rd) return 0;              /* no cache yet = no images */
+
+    struct dirent *reg;
+    while ((reg = readdir(rd)) != NULL && n < max) {
+        if (reg->d_name[0] == '.') continue;
+        char regpath[PATH_SIZE];
+        if (snprintf(regpath, sizeof(regpath), "%s/%s", cache_dir, reg->d_name)
+            >= (int)sizeof(regpath))
+            continue;
+        DIR *rd2 = opendir(regpath);
+        if (!rd2) continue;
+
+        struct dirent *repo;
+        while ((repo = readdir(rd2)) != NULL && n < max) {
+            if (repo->d_name[0] == '.') continue;
+            char repopath[PATH_SIZE];
+            if (snprintf(repopath, sizeof(repopath), "%s/%s", regpath, repo->d_name)
+                >= (int)sizeof(repopath))
+                continue;
+            DIR *rd3 = opendir(repopath);
+            if (!rd3) continue;
+
+            struct dirent *tag;
+            while ((tag = readdir(rd3)) != NULL && n < max) {
+                if (tag->d_name[0] == '.') continue;
+                ImageCacheEntry *e = &ents[n];
+                if (snprintf(e->path, sizeof(e->path), "%s/%s/%s/%s",
+                             cache_dir, reg->d_name, repo->d_name, tag->d_name)
+                    >= (int)sizeof(e->path))
+                    continue;
+                struct stat st;
+                if (stat(e->path, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
+
+                /* Display name, normalized: docker.io (and its aliases)
+                 * and the implied library/ are dropped, like docker;
+                 * mangled repo slashes come back as '/'. */
+                int hub = !strcmp(reg->d_name, "docker.io") ||
+                          !strcmp(reg->d_name, "registry-1.docker.io") ||
+                          !strcmp(reg->d_name, "index.docker.io");
+                char repo_disp[256];
+                size_t ri = 0;
+                for (; repo->d_name[ri] && ri + 1 < sizeof(repo_disp); ri++)
+                    repo_disp[ri] = (repo->d_name[ri] == '+') ? '/'
+                                                             : repo->d_name[ri];
+                repo_disp[ri] = '\0';
+                if (hub) {
+                    const char *r = repo_disp;
+                    if (!strncmp(r, "library/", 8)) r += 8;
+                    snprintf(e->name, sizeof(e->name), "%s", r);
+                } else {
+                    snprintf(e->name, sizeof(e->name), "%s/%s",
+                             reg->d_name, repo_disp);
+                }
+                snprintf(e->tag, sizeof(e->tag), "%s", tag->d_name);
+
+                /* A stable cosmetic id derived from the cache path. */
+                char hex[65];
+                sha256_hex(e->path, strlen(e->path), hex);
+                snprintf(e->id, sizeof(e->id), "%.12s", hex);
+
+                e->size = dir_size(e->path);
+                n++;
+            }
+            closedir(rd3);
+        }
+        closedir(rd2);
+    }
+    closedir(rd);
+    return n;
+}
+
+/*
+ * Lock file for an image: <cache>-locks/<mangled registry_repo_tag>.
+ * Sibling of the cache, never inside a deletable image dir (same
+ * inode-is-identity rule as the container locks); '/' mangles to '+'
+ * so refs map to unique flat filenames.
+ */
+static int image_lock_path(const char *image_str, char *out, size_t n) {
+    char entry[PATH_SIZE];
+    if (image_cache_path(image_str, entry, sizeof(entry)) < 0) return -1;
+
+    char dir[PATH_SIZE];
+    if (snprintf(dir, sizeof(dir), "%s-locks", cache_dir) >= (int)sizeof(dir))
+        return -1;
+    if (mkdir_p(dir, 0755) < 0) return -1;
+
+    const char *rel = entry + strlen(cache_dir) + 1;   /* strip the cache prefix */
+    char mangled[PATH_SIZE];
+    size_t i = 0;
+    for (; rel[i] && i + 1 < sizeof(mangled); i++)
+        mangled[i] = (rel[i] == '/') ? '+' : rel[i];
+    mangled[i] = '\0';
+
+    if (snprintf(out, n, "%s/%s", dir, mangled) >= (int)n) return -1;
+    return 0;
+}
+
+int image_lock(const char *image_str, int exclusive) {
+    char path[PATH_SIZE];
+    if (image_lock_path(image_str, path, sizeof(path)) < 0) return -1;
+
+    /* Deliberately NOT O_CLOEXEC: the QEMU child inherits the fd, so
+     * the lock's lifetime is the VM's. */
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    int op = exclusive ? (LOCK_EX | LOCK_NB) : (LOCK_SH | LOCK_NB);
+    if (flock(fd, op) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;                    /* EWOULDBLOCK: image in use */
+        return -1;
+    }
+    return fd;
 }

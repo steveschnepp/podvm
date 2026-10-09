@@ -53,6 +53,7 @@ static struct {
     char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
     char name[256];           /* container name; enables persistent state */
+    char hostname[256];       /* --hostname; sent as podvm.hostname= */
     int  net_none;      /* --network=none: no netdev, guest skips eth0 */
     int  read_only;     /* --read-only: serve the lower ro, no upper */
     int  memory;       /* MB */
@@ -506,6 +507,12 @@ static void build_config_tokens(char *buf, size_t len) {
         size_t used = strlen(buf);
         snprintf(buf + used, len - used, " podvm.tmpfs=%s", tesc);
     }
+    if (config.hostname[0]) {
+        char hostesc[600];
+        escape_value(hostesc, sizeof(hostesc), config.hostname);
+        size_t used = strlen(buf);
+        snprintf(buf + used, len - used, " podvm.hostname=%s", hostesc);
+    }
 }
 
 /* Build kernel cmdline */
@@ -920,14 +927,119 @@ static int cmd_rm(int argc, char **argv) {
     return rc;
 }
 
-/* Long-only options: --rm has no short form (-r is taken by --initramfs). */
+/* Long-only options: --rm has no short form (-r is taken by --initramfs;
+ * docker's -h hostname clashes with help, so --hostname is long-only). */
 enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002,
-       OPT_READONLY = 1003, OPT_TMPFS = 1004 };
+       OPT_READONLY = 1003, OPT_TMPFS = 1004, OPT_HOSTNAME = 1005 };
+
+/*
+ * `podvm images` -- list the image cache (native pulls AND podvm build
+ * output; the two share one layout, so run/images/rmi see one cache).
+ */
+static int cmp_imgent(const void *a, const void *b) {
+    const ImageCacheEntry *x = a, *y = b;
+    int c = strcmp(x->name, y->name);
+    return c ? c : strcmp(x->tag, y->tag);
+}
+
+static void human_size(unsigned long long b, char *out, size_t n) {
+    static const char *unit[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = (double)b;
+    int u = 0;
+    while (v >= 1024.0 && u + 1 < (int)(sizeof(unit) / sizeof(unit[0]))) {
+        v /= 1024.0;
+        u++;
+    }
+    snprintf(out, n, u ? "%.1f%s" : "%.0f%s", v, unit[u]);
+}
+
+static int cmd_images(void) {
+    enum { MAX_IMGS = 512 };
+    static ImageCacheEntry ents[MAX_IMGS];
+    int n = image_cache_list(ents, MAX_IMGS);
+    if (n < 0) {
+        fprintf(stderr, "podvm: cannot list the image cache\n");
+        return 1;
+    }
+    if (n == 0) {
+        printf("no images in the podvm cache (%s)\n", image_cache_dir());
+        return 0;
+    }
+    qsort(ents, (size_t)n, sizeof(ents[0]), cmp_imgent);
+
+    printf("%-48s %-12s %-10s %s\n", "NAME", "TAG", "IMAGE ID", "SIZE");
+    for (int i = 0; i < n; i++) {
+        char sz[32];
+        human_size(ents[i].size, sz, sizeof(sz));
+        printf("%-48s %-12s %-10s %s\n",
+               ents[i].name, ents[i].tag, ents[i].id, sz);
+    }
+    return 0;
+}
+
+/*
+ * `podvm rmi <image>...` -- remove cached images. An image a live
+ * container is using is refused (shared/exclusive flock, the mirror of
+ * the run-side guard). Bulk semantics match `podvm rm`: every ref is
+ * attempted; non-zero if any failed.
+ */
+static int cmd_rmi(int argc, char **argv) {
+    if (argc < 3 || !strcmp(argv[2], "-h") || !strcmp(argv[2], "--help")) {
+        fprintf(stderr, "Usage: podvm rmi <image> [<image>...]\n");
+        fprintf(stderr, "Remove cached images (native pulls and podvm build "
+                        "output).\n");
+        return argc < 3 ? 1 : 0;
+    }
+
+    int rc = 0;
+    for (int i = 2; i < argc; i++) {
+        const char *ref = argv[i];
+        char dir[STORE_PATH_MAX];
+        struct stat st;
+
+        if (image_is_path(ref) || image_cache_path(ref, dir, sizeof(dir)) < 0) {
+            fprintf(stderr, "podvm: not an image reference: %s\n", ref);
+            rc = 1;
+            continue;
+        }
+        if (stat(dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "podvm: no such image: %s\n", ref);
+            rc = 1;
+            continue;
+        }
+
+        int lockfd = image_lock(ref, 1);
+        if (lockfd < 0) {
+            if (errno == EWOULDBLOCK)
+                fprintf(stderr, "podvm: image %s is in use by a running "
+                                "container; stop it first\n", ref);
+            else
+                fprintf(stderr, "podvm: cannot lock image %s: %s\n",
+                        ref, strerror(errno));
+            rc = 1;
+            continue;
+        }
+
+        int rmc = container_rm_rf(dir);
+        int rme = errno;
+        close(lockfd);
+        if (rmc < 0) {
+            fprintf(stderr, "podvm: cannot remove %s: %s\n",
+                    dir, strerror(rme));
+            rc = 1;
+            continue;
+        }
+        printf("podvm: removed image %s\n", ref);
+    }
+    return rc;
+}
 
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
     fprintf(stderr, "       %s rm <name> [<name>...]\n", prog);
+    fprintf(stderr, "       %s images\n", prog);
+    fprintf(stderr, "       %s rmi <image> [<image>...]\n", prog);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
@@ -945,6 +1057,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -v, --volume <h:t[:ro]>  Bind-mount a host directory into\n");
     fprintf(stderr, "                      the container (both paths absolute)\n");
     fprintf(stderr, "      --tmpfs <dir>   Mount a tmpfs at <dir> in the container\n");
+    fprintf(stderr, "      --hostname <name>  Set the container hostname\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -957,6 +1070,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -h, --help          Show this help\n");
     fprintf(stderr, "\nSubcommands:\n");
     fprintf(stderr, "  rm <name>...        Delete named containers' persistent state\n");
+    fprintf(stderr, "  images              List cached images\n");
+    fprintf(stderr, "  rmi <image>...      Remove cached images (refused while in use)\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
     fprintf(stderr, "  %s -i debian echo hello\n", prog);
@@ -973,6 +1088,10 @@ int main(int argc, char **argv) {
      * never consumed as the image positional argument. */
     if (argc > 1 && strcmp(argv[1], "rm") == 0)
         return cmd_rm(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "images") == 0)
+        return cmd_images();
+    if (argc > 1 && strcmp(argv[1], "rmi") == 0)
+        return cmd_rmi(argc, argv);
     const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {
@@ -990,6 +1109,7 @@ int main(int argc, char **argv) {
         {"network",     required_argument, 0, OPT_NETWORK},
         {"read-only",   no_argument,       0, OPT_READONLY},
         {"tmpfs",       required_argument, 0, OPT_TMPFS},
+        {"hostname",     required_argument, 0, OPT_HOSTNAME},
         {"volume",      required_argument, 0, 'v'},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
@@ -1047,6 +1167,13 @@ int main(int argc, char **argv) {
             break;
         case OPT_TMPFS:
             if (tmpfs_add(optarg) < 0) return 1;
+            break;
+        case OPT_HOSTNAME:
+            if (!optarg[0]) {
+                fprintf(stderr, "podvm: --hostname must not be empty\n");
+                return 1;
+            }
+            snprintf(config.hostname, sizeof(config.hostname), "%s", optarg);
             break;
         case 'm':
             config.memory = atoi(optarg);
@@ -1252,6 +1379,20 @@ int main(int argc, char **argv) {
             else
                 fprintf(stderr, "podvm: cannot lock container '%s': %s\n",
                         config.name, strerror(errno));
+            return 1;
+        }
+    }
+
+    /* A cached rootfs is served to the VM over 9p: hold a shared lock
+     * so `podvm rmi` cannot delete it under a live container. Podman
+     * storage and plain directories are not podvm's cache, so they are
+     * not locked here. The QEMU child inherits the fd. */
+    int img_lock_fd = -1;
+    if (!used_podman && !image_is_path(image_ref)) {
+        img_lock_fd = image_lock(image_ref, 0);
+        if (img_lock_fd < 0) {
+            fprintf(stderr, "podvm: cannot lock image %s: %s\n",
+                    image_ref, strerror(errno));
             return 1;
         }
     }
