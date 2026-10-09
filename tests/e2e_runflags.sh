@@ -21,6 +21,8 @@ WORK=$(mktemp -d /tmp/podvm-e2e-runflags.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 PODVM=build/podvm
+# Keep any container state this test creates out of the real ~/.local.
+export XDG_STATE_HOME="$WORK/state"
 
 fail() {
     echo "E2E-RUNFLAGS FAIL: $1"
@@ -177,5 +179,28 @@ fi
 "$PODVM" --network=host "$IMG" /bin/true > "$WORK/bad6.log" 2>&1 \
     && fail "--network=host accepted"
 
-echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network reach the guest/host as specified"
+# ---- --read-only ----
+
+# podman-storage path: the overlay gets no upper, so writes fail and
+# no state dir is created even with -n. Reads still work.
+run_podvm ro1.log --read-only -n rotest \
+    "$IMG" /bin/sh -c 'touch /ro-test 2>/dev/null && echo WRITABLE || echo READONLY; cat /etc/os-release | head -1' \
+    || fail "--read-only run failed"
+cp "$WORK/ro1.log" "$WORK/last.log"
+grep -q "READONLY" "$WORK/ro1.log" || fail "--read-only allowed a write to the rootfs"
+if grep -q "Alpine" "$WORK/ro1.log"; then :; else
+    fail "--read-only broke reads"
+fi
+[ ! -e "$XDG_STATE_HOME/podvm/containers/rotest" ] \
+    || fail "--read-only created a state dir anyway"
+
+# native-pull path: the 9p serve itself is readonly=on.
+PODVM_RESOLVE=native timeout "$TIMEOUT_SECS" "$PODVM" -r "$WORK/initramfs.cpio" \
+    --read-only "$IMG" /bin/sh -c 'touch /ro-test 2>/dev/null && echo WRITABLE || echo READONLY' \
+    > "$WORK/ro2.log" 2>&1 || fail "--read-only native run failed"
+cp "$WORK/ro2.log" "$WORK/last.log"
+grep -q "READONLY" "$WORK/ro2.log" \
+    || fail "--read-only allowed a write on the native-pull path"
+
+echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only behave as specified"
 exit 0

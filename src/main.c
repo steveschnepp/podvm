@@ -54,6 +54,7 @@ static struct {
     char user[128];           /* from image User ("uid:gid") */
     char name[256];           /* container name; enables persistent state */
     int  net_none;      /* --network=none: no netdev, guest skips eth0 */
+    int  read_only;     /* --read-only: serve the lower ro, no upper */
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -i flag */
@@ -479,15 +480,20 @@ static int setup_userns_overlay(void) {
         return -1;
     }
 
-    /* Writable layer: upper + work. With --name, these live in the
-     * container's persistent state dir on the host, so writes survive the
-     * VM (write-back, ADR-026). Without a name we keep the historical
-     * throwaway behavior: upper/work on a private tmpfs that dies with
-     * the VM. Either way 'merged' is the 9p-served rootfs.
+    /* Writable layer: upper + work. With --name (and without
+     * --read-only) these live in the container's persistent state dir
+     * on the host, so writes survive the VM (write-back, ADR-026).
+     * Everything else -- unnamed runs, and --read-only -- uses a
+     * private tmpfs upper that dies with the VM. --read-only still
+     * needs an upper because overlayfs in a userns requires one
+     * (lower-only mounts are init-userns-only, EINVAL); the mount
+     * below is made MS_RDONLY, so no write can reach it and nothing
+     * persists. Either way 'merged' is the 9p-served rootfs.
      *
-     * The overlay is mounted inside the QEMU child's userns (uid 0 mapped
-     * to the invoking uid), so files created in the persistent upper are
-     * owned by the invoking user outside -- no root-owned state. */
+     * The overlay is mounted inside the QEMU child's userns (uid 0
+     * mapped to the invoking uid), so files created in the persistent
+     * upper are owned by the invoking user outside -- no root-owned
+     * state. */
     char basedir[STORE_PATH_MAX], updir[STORE_PATH_MAX], wkdir[STORE_PATH_MAX];
     char state[CONTAINER_PATH_MAX];
     /* No state dir (no --name, or no HOME to keep it under) means the
@@ -495,7 +501,7 @@ static int setup_userns_overlay(void) {
     if (container_state_dir(config.name, state, sizeof(state)) < 0)
         state[0] = '\0';
 
-    if (state[0]) {
+    if (state[0] && !config.read_only) {
         snprintf(updir, sizeof(updir), "%s/u", state);
         snprintf(wkdir, sizeof(wkdir), "%s/w", state);
         if (mkdir_p(state, 0755) < 0 ||
@@ -549,7 +555,8 @@ static int setup_userns_overlay(void) {
              "lowerdir=%s,upperdir=%s,workdir=%s,userxattr",
              lowers, updir, wkdir);
 
-    if (mount("overlay", config.rootfs_dir, "overlay", 0, opts) < 0) {
+    if (mount("overlay", config.rootfs_dir, "overlay",
+              config.read_only ? MS_RDONLY : 0, opts) < 0) {
         fprintf(stderr, "podvm: overlay mount failed: %s\n", strerror(errno));
         return -1;
     }
@@ -573,8 +580,8 @@ static int start_qemu(void) {
     snprintf(memory_str, sizeof(memory_str), "%dM", config.memory);
     snprintf(cpu_str, sizeof(cpu_str), "%d", config.cpus);
     snprintf(fsdev_str, sizeof(fsdev_str),
-             "local,id=fsdev0,path=%s,security_model=none",
-             config.rootfs_dir);
+             "local,id=fsdev0,path=%s,security_model=none%s",
+             config.rootfs_dir, config.read_only ? ",readonly=on" : "");
     snprintf(vsock_cid_str, sizeof(vsock_cid_str), "%d", GUEST_CID);
 
     printf("podvm: starting QEMU\n");
@@ -761,7 +768,8 @@ static int cmd_rm(int argc, char **argv) {
 }
 
 /* Long-only options: --rm has no short form (-r is taken by --initramfs). */
-enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002 };
+enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002,
+       OPT_READONLY = 1003 };
 
 /* Print usage */
 static void usage(const char *prog) {
@@ -780,6 +788,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -p, --publish <spec> Publish a container port to the host:\n");
     fprintf(stderr, "                      [hostip:]hostport:containerport (tcp)\n");
     fprintf(stderr, "      --network <mode>  slirp (default) or none (no network)\n");
+    fprintf(stderr, "      --read-only     Mount the container rootfs read-only\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -823,6 +832,7 @@ int main(int argc, char **argv) {
         {"workdir",     required_argument, 0, 'w'},
         {"publish",     required_argument, 0, 'p'},
         {"network",     required_argument, 0, OPT_NETWORK},
+        {"read-only",   no_argument,       0, OPT_READONLY},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -870,6 +880,9 @@ int main(int argc, char **argv) {
                                 "(host/bridge need tap; ADR-009/perf phase)\n");
                 return 1;
             }
+            break;
+        case OPT_READONLY:
+            config.read_only = 1;
             break;
         case 'm':
             config.memory = atoi(optarg);
