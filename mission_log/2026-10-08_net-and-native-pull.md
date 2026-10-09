@@ -2,9 +2,8 @@
 name: net-and-native-pull
 description: fix the never-tested native registry pull (bearer token truncation) and implement slirp networking so DNS+HTTPS works from inside the guest -- no static link needed
 project: podvm
+previous: 2026-10-08_podman-storage.md
 ---
-
-- Previous: `2026-10-08_podman-storage.md`
 
 # Mission Log: Achieving Pull (Native Client + Guest Networking)
 

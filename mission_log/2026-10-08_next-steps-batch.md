@@ -2,9 +2,8 @@
 name: next-steps-batch
 description: close out the five ranked next steps -- image config blob, sha256 digest verification, zstd layers, the dead -i flag, and native-pull e2e coverage
 project: podvm
+previous: 2026-10-08_net-and-native-pull.md
 ---
-
-- Previous: `2026-10-08_net-and-native-pull.md`
 
 # Mission Log: Clearing the Ranked Next-Steps Queue
 

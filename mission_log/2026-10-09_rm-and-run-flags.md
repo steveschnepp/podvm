@@ -2,9 +2,8 @@
 name: rm-and-run-flags
 description: podvm rm + --rm close the write-back lifecycle, then tier-1 (-e/-u/-w) and tier-2 (-v/-p/--network/--read-only) podman flag parity -- three sessions, one log
 project: podvm
+previous: 2026-10-09_config-channel-and-runtime-gaps.md
 ---
-
-- Previous: `2026-10-09_config-channel-and-runtime-gaps.md`
 
 # Mission Log: Container-State Removal and Podman Flag Parity
 
