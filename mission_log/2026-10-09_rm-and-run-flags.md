@@ -266,3 +266,116 @@ host-side rejections). Full-suite re-run queued after tier 2.
    performance phase, FreeBSD.
 
 ---
+
+## Session 3: Tier-2 Podman Flag Parity (2026-10-09)
+
+Four more flags, one commit each: `-p/--publish` (`e713f9e`),
+`--network=none` (`4c51abd`), `--read-only` (`01bc85d`),
+`-v/--volume` + `--tmpfs` (`e11c37e`). Full suite after: **29 PASS /
+1 WARN (musl-gcc) / 0 FAIL**.
+
+### What We Did
+
+1. **`-p/--publish`**: `[hostip:]hostport:containerport` (tcp) becomes
+   QEMU slirp `hostfwd` rules appended to the user netdev; host-side
+   argv only. The e2e serves a one-shot HTTP response from the guest
+   with busybox `nc` and curls it through the forward -- alpine's
+   busybox has **no httpd applet**, which the first draft assumed and
+   the first run disproved.
+2. **`--network=none`**: no netdev attached; the guest learns via a
+   new `podvm.net=none` token and skips the eth0 ioctl. `host`/`bridge`
+   are rejected with a pointer to ADR-009 (tap belongs to the
+   performance phase), and `-p` + `none` is caught as a contradiction.
+3. **`--read-only`**: MS_RDONLY overlay mount (podman path) /
+   `readonly=on` fsdev (native path). This one fought back -- see
+   below.
+4. **`-v/--volume` + `--tmpfs`**: each volume is served over its own 9p
+   tag (`vol0`..) since the rootfs tag is taken; the guest mounts them
+   at container paths after chroot. Both flags travel as new
+   `podvm.vol=`/`podvm.tmpfs=` csv tokens, element-wise escaped so
+   targets may contain spaces. `:ro` maps to `readonly=on` + `MS_RDONLY`.
+
+### What We Learned
+
+#### Technical
+
+- **overlayfs in an unprivileged userns requires an upperdir.** The
+  obvious read-only overlay -- `lowerdir=` only -- is init-userns-only
+  and fails with EINVAL in the QEMU child's userns. Verified with a
+  minimal `unshare -Urm` repro before reworking. The read-only overlay
+  keeps an upper (throwaway tmpfs) and is mounted `MS_RDONLY` instead.
+- **An empty branch in an if/else-if chain is a silent no-op** -- the
+  first `--read-only` restructure left `upperdir=,workdir=` empty and
+  the mount failed with a bare EINVAL. `strace -f -e mount` on the
+  child showed the exact option string in one shot. When a mount errno
+  is opaque, strace the syscall; don't reason from the source.
+- **Test a container command against the image before baking it into
+  an e2e.** `httpd` is not in alpine's busybox; `nc` is. One
+  `podman run --rm` check would have saved a failed e2e cycle.
+- **Background VM tests must kill the whole process group** (setsid +
+  `kill -- -PGID`), or QEMU outlives the test holding the vsock CID.
+- **`-p` hostfwd accepts connections before the guest is ready**
+  (QEMU holds them), so polling from t=0 works; no readiness sleep is
+  needed on the host side.
+
+#### Process
+
+- Every tier-2 feature landed as its own commit with its e2e rows, so
+  the whole day bisects: 8 flag commits, 1 docs commit per session,
+  1 drive-by guest fix.
+
+### What We Decided
+
+- `-p`: tcp only, numeric ports, hostip defaults to 127.0.0.1 (docker's
+  default bind); udp and IPv6 hostips deferred.
+- `--network`: only `slirp` and `none` exist; pretending `host` works
+  would be a lie until ADR-009's tap/bridge.
+- `--read-only` creates no state dir even with `-n` (throwaway tmpfs
+  upper + ro mount), so `--rm` has nothing to clean.
+- Volumes: bind mounts of existing host *directories* only (no named
+  volumes, no file mounts); `:` and `,` rejected in paths because
+  QEMU's fsdev parsing and the guest's `tag:target:ro` split both
+  depend on them. Guest mount failures warn but do not abort (podvm's
+  best-effort posture; docker would refuse to start).
+- `--tmpfs` takes a bare absolute path (no mode= options yet).
+
+### Rules Added
+
+- **An overlayfs mount in an unprivileged userns needs an upperdir**;
+  read-only overlays must be "upper + MS_RDONLY", not "lower-only".
+- **When a mount() fails with an opaque errno, strace the child's
+  syscall** rather than re-reading the option-building code.
+- **Probe applets/tools inside the actual image** before encoding them
+  in an e2e (`command -v` under `podman run`).
+- **Tests that background a VM: setsid + process-group kill**, never a
+  plain kill of the launcher.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/main.c` | `-p`, `--network`, `--read-only`, `-v`, `--tmpfs`; per-volume fsdevs; hostfwd netdev; new config tokens |
+| `guest/init.c` | `podvm.net=`, `podvm.vol=`, `podvm.tmpfs=` parsing; volume/tmpfs mounts after chroot |
+| `tests/e2e_runflags.sh` | Grows to 16 boots + 12 host-side rejection checks |
+| `tests/run_tests.sh`, `README.md` | Wiring (label now "podman parity") + docs |
+
+### Test Results
+
+```
+E2E run flags (podman parity) PASS   (16 boots: all 8 flags)
+...
+PASS: 29   WARN: 1   FAIL: 0
+```
+
+### Next Steps
+
+1. `flock` on the write-back state dir (still the only correctness
+   hole); `rm` could then refuse a live container.
+2. `podvm images`/`rmi`/cache GC for `/tmp/podvm/images` (the state-GC
+   twin).
+3. `--hostname` is now nearly free -- guest init already honors
+   `podvm.hostname=`; only the host flag is missing.
+4. Layer compaction (ADR-020 revisit), `podvm build`, the performance
+   phase (ADR-019/009), FreeBSD (ADR-021).
+
+---

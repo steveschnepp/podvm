@@ -135,8 +135,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
     # rm/--rm e2e: state removal on demand and on exit.
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
-    # Run-flag parity e2e: -e/-u/-w reach the guest.
-    run_test "E2E run flags (-e/-u/-w)" "sh tests/e2e_runflags.sh"
+    # Run-flag parity e2e: podman-parity run flags reach the guest.
+    run_test "E2E run flags (podman parity)" "sh tests/e2e_runflags.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi
