@@ -58,6 +58,7 @@ static struct {
     char hostname[256];       /* --hostname; sent as podvm.hostname= */
     int  net_none;      /* --network=none: no netdev, guest skips eth0 */
     int  read_only;     /* --read-only: serve the lower ro, no upper */
+    int  detach;        /* -d: background the VM; serial to <state>/log */
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -i flag */
@@ -915,7 +916,26 @@ static int start_qemu(void) {
      * -display none leaves serial entirely under our -serial control. */
     qargs[qi++] = "-display"; qargs[qi++] = "none";
     qargs[qi++] = "-serial";
-    qargs[qi++] = config.interactive ? "stdio" : "mon:stdio";
+    /* Attached: the monitor may share stdio (mon:stdio) unless -i gave
+     * the guest stdin exclusively. Detached: the serial goes to the
+     * container's log file -- nobody owns stdio anymore. */
+    char serial_backend[STORE_PATH_MAX + 32];
+    if (config.detach) {
+        char sdir[CONTAINER_PATH_MAX];
+        if (container_state_dir(config.name, sdir, sizeof(sdir)) < 0 || !sdir[0]) {
+            fprintf(stderr, "podvm: --detach needs a container state dir\n");
+            return -1;
+        }
+        if (mkdir_p(sdir, 0755) < 0) {
+            fprintf(stderr, "podvm: cannot create %s: %s\n", sdir, strerror(errno));
+            return -1;
+        }
+        snprintf(serial_backend, sizeof(serial_backend), "file:%s/log", sdir);
+    } else {
+        snprintf(serial_backend, sizeof(serial_backend), "%s",
+                 config.interactive ? "stdio" : "mon:stdio");
+    }
+    qargs[qi++] = serial_backend;
     qargs[qi++] = "-no-reboot";
     qargs[qi] = NULL;
 
@@ -1724,6 +1744,146 @@ out:
     return rc;
 }
 
+/*
+ * `podvm stop <name>...` -- stop a detached container. The pidfile is
+ * checked against /proc (the cmdline must be this container's QEMU, via
+ * its serial log path) so a recycled pid is never signalled. Then
+ * SIGTERM, a bounded wait for the VM's name lock to drop (the lock is
+ * the ground truth for "the upper is free"), then SIGKILL.
+ */
+static int cmd_stop(int argc, char **argv) {
+    if (argc < 3 || !strcmp(argv[2], "-h") || !strcmp(argv[2], "--help")) {
+        fprintf(stderr, "Usage: podvm stop <name> [<name>...]\n");
+        fprintf(stderr, "Stop detached containers.\n");
+        return argc < 3 ? 1 : 0;
+    }
+
+    int rc = 0;
+    for (int i = 2; i < argc; i++) {
+        const char *name = argv[i];
+        char sdir[CONTAINER_PATH_MAX];
+        char pidpath[CONTAINER_PATH_MAX + 16], logarg[CONTAINER_PATH_MAX + 32];
+        struct stat st;
+
+        if (!container_name_valid(name)) {
+            fprintf(stderr, "podvm: invalid container name: '%s'\n", name);
+            rc = 1;
+            continue;
+        }
+        if (container_state_dir(name, sdir, sizeof(sdir)) < 0 ||
+            stat(sdir, &st) < 0) {
+            fprintf(stderr, "podvm: no such container: %s\n", name);
+            rc = 1;
+            continue;
+        }
+        snprintf(pidpath, sizeof(pidpath), "%s/pid", sdir);
+        FILE *pf = fopen(pidpath, "r");
+        if (!pf) {
+            fprintf(stderr, "podvm: container '%s' is not running\n", name);
+            rc = 1;
+            continue;
+        }
+        int pid = 0;
+        (void)fscanf(pf, "%d", &pid);
+        fclose(pf);
+
+        snprintf(logarg, sizeof(logarg), "file:%s/log", sdir);
+        int stale = (pid <= 0);
+        if (!stale) {
+            char procpath[64], cl[4096];
+            snprintf(procpath, sizeof(procpath), "/proc/%d/cmdline", pid);
+            int fd = open(procpath, O_RDONLY);
+            if (fd < 0) {
+                stale = 1;
+            } else {
+                ssize_t n = read(fd, cl, sizeof(cl) - 1);
+                close(fd);
+                if (n <= 0) stale = 1;
+                else {
+                    cl[n] = '\0';
+                    /* /proc cmdline is NUL-separated argv; turn NULs
+                     * into spaces so strstr can see every argument. */
+                    for (ssize_t k = 0; k < n; k++)
+                        if (cl[k] == '\0') cl[k] = ' ';
+                    if (!strstr(cl, "qemu-system") || !strstr(cl, logarg))
+                        stale = 1;
+                }
+            }
+        }
+        if (stale) {
+            fprintf(stderr, "podvm: container '%s' is not running "
+                            "(stale pidfile)\n", name);
+            unlink(pidpath);
+            rc = 1;
+            continue;
+        }
+
+        kill(pid, SIGTERM);
+        int stopped = 0;
+        for (int t = 0; t < 40 && !stopped; t++) {   /* 10s */
+            if (container_locked(name) == 0) stopped = 1;
+            else usleep(250000);
+        }
+        if (!stopped) {
+            kill(pid, SIGKILL);
+            for (int t = 0; t < 20 && !stopped; t++) {   /* +5s */
+                if (container_locked(name) == 0) stopped = 1;
+                else usleep(250000);
+            }
+        }
+        if (!stopped) {
+            fprintf(stderr, "podvm: container '%s' did not stop\n", name);
+            rc = 1;
+            continue;
+        }
+        unlink(pidpath);
+        printf("podvm: stopped %s\n", name);
+    }
+    return rc;
+}
+
+/*
+ * `podvm logs <name>` -- print a detached container's serial log.
+ * (Attached runs write their serial to the terminal; there is no file
+ * to read.)
+ */
+static int cmd_logs(int argc, char **argv) {
+    if (argc < 3 || !strcmp(argv[2], "-h") || !strcmp(argv[2], "--help")) {
+        fprintf(stderr, "Usage: podvm logs <name>\n");
+        fprintf(stderr, "Print a container's serial log (detached runs).\n");
+        return argc < 3 ? 1 : 0;
+    }
+    if (argc > 3) {
+        fprintf(stderr, "podvm logs: takes a single container name\n");
+        return 1;
+    }
+
+    const char *name = argv[2];
+    char sdir[CONTAINER_PATH_MAX], logpath[CONTAINER_PATH_MAX + 16];
+    if (!container_name_valid(name)) {
+        fprintf(stderr, "podvm: invalid container name: '%s'\n", name);
+        return 1;
+    }
+    if (container_state_dir(name, sdir, sizeof(sdir)) < 0) {
+        fprintf(stderr, "podvm: cannot locate the state dir\n");
+        return 1;
+    }
+    snprintf(logpath, sizeof(logpath), "%s/log", sdir);
+
+    FILE *f = fopen(logpath, "r");
+    if (!f) {
+        fprintf(stderr, "podvm: no log for container '%s' "
+                        "(not started with --detach?)\n", name);
+        return 1;
+    }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        fwrite(buf, 1, n, stdout);
+    fclose(f);
+    return 0;
+}
+
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
@@ -1734,6 +1894,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
+    fprintf(stderr, "  -d, --detach        Run in the background (requires --name;\n");
+    fprintf(stderr, "                      serial goes to <state>/log)\n");
     fprintf(stderr, "  -e, --env <K=V>     Set an environment variable (repeatable;\n");
     fprintf(stderr, "                      overrides the image's value for the key)\n");
     fprintf(stderr, "      --env-file <f>  Read KEY=VALUE lines from a file\n");
@@ -1761,6 +1923,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -h, --help          Show this help\n");
     fprintf(stderr, "\nSubcommands:\n");
     fprintf(stderr, "  rm <name>...        Delete named containers' persistent state\n");
+    fprintf(stderr, "  stop <name>...      Stop detached containers\n");
+    fprintf(stderr, "  logs <name>         Print a detached container's serial log\n");
     fprintf(stderr, "  images              List cached images\n");
     fprintf(stderr, "  rmi <image>...      Remove cached images (refused while in use)\n");
     fprintf(stderr, "  build               Build a Dockerfile into a cached image\n");
@@ -1786,6 +1950,10 @@ int main(int argc, char **argv) {
         return cmd_rmi(argc, argv);
     if (argc > 1 && strcmp(argv[1], "build") == 0)
         return cmd_build(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "stop") == 0)
+        return cmd_stop(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "logs") == 0)
+        return cmd_logs(argc, argv);
     const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {
@@ -1806,6 +1974,7 @@ int main(int argc, char **argv) {
         {"hostname",     required_argument, 0, OPT_HOSTNAME},
         {"volume",      required_argument, 0, 'v'},
         {"rm",          no_argument,       0, OPT_RM},
+        {"detach",      no_argument,       0, 'd'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1813,10 +1982,13 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:ie:u:w:p:v:m:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:die:u:w:p:v:m:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
+            break;
+        case 'd':
+            config.detach = 1;
             break;
         case 'e':
             if (env_add(optarg) < 0) return 1;
@@ -1918,6 +2090,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "podvm: -p/--publish requires networking "
                         "(--network=none disables it)\n");
         return 1;
+    }
+
+    /* Detached runs are named and have no supervisor to clean up after
+     * them. */
+    if (config.detach) {
+        if (!config.name[0]) {
+            fprintf(stderr, "podvm: --detach requires --name\n");
+            return 1;
+        }
+        if (config.autoremove) {
+            fprintf(stderr, "podvm: --detach cannot be combined with --rm "
+                            "(nothing would clean the state up)\n");
+            return 1;
+        }
+        if (config.interactive) {
+            fprintf(stderr, "podvm: --detach cannot be combined with "
+                            "--interactive\n");
+            return 1;
+        }
     }
 
     /* Get image or rootfs directory */
@@ -2107,13 +2298,50 @@ int main(int argc, char **argv) {
 
     /* Detect host vsock support (determines QEMU device + config channel). */
     detect_vsock();
-    start_exit_helper();
+    if (!config.detach)
+        start_exit_helper();
 
     /* Start QEMU (9p serves the rootfs in-process; no virtiofsd) */
     if (start_qemu() < 0) {
         fprintf(stderr, "podvm: failed to start QEMU\n");
         maybe_autoremove();   /* --rm still drops the name's state */
         return 1;
+    }
+
+    /* Detached: hand the VM over. QEMU inherited the state and image
+     * locks, so they are held exactly as long as it lives; the serial
+     * is already going to <state>/log. Without the vsock exchange the
+     * guest uses the kernel cmdline config -- warn if it may be
+     * truncated (x86 cmdline limit ~2048). */
+    if (config.detach) {
+        char cmdline[MAX_CMDLINE];
+        char sdir[CONTAINER_PATH_MAX], pidpath[CONTAINER_PATH_MAX + 16];
+        build_cmdline(cmdline, sizeof(cmdline));
+        if (strlen(cmdline) > 2000)
+            fprintf(stderr, "podvm: warning: config is %zu bytes; detached "
+                            "runs cannot use the vsock channel and the "
+                            "kernel cmdline may truncate it\n",
+                    strlen(cmdline));
+        if (container_state_dir(config.name, sdir, sizeof(sdir)) < 0) {
+            fprintf(stderr, "podvm: cannot locate the state dir\n");
+            kill(qemu_pid, SIGTERM);
+            return 1;
+        }
+        snprintf(pidpath, sizeof(pidpath), "%s/pid", sdir);
+        FILE *pf = fopen(pidpath, "w");
+        if (!pf) {
+            fprintf(stderr, "podvm: cannot write %s: %s\n",
+                    pidpath, strerror(errno));
+            kill(qemu_pid, SIGTERM);
+            return 1;
+        }
+        fprintf(pf, "%d\n", (int)qemu_pid);
+        fclose(pf);
+        printf("podvm: %s is running in the background (pid %d)\n",
+               config.name, (int)qemu_pid);
+        printf("podvm:   logs: podvm logs %s\n", config.name);
+        printf("podvm:   stop:  podvm stop %s\n", config.name);
+        return 0;
     }
 
     /* Send config to guest over vsock (best-effort; cmdline is the

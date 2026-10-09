@@ -140,6 +140,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E run flags (podman parity)" "sh tests/e2e_runflags.sh"
     # Build e2e: Dockerfile -> runnable cached image (RUN = real VMs).
     run_test "E2E build (Dockerfile)" "sh tests/e2e_build.sh"
+    # Detached lifecycle: -d + logs + stop.
+    run_test "E2E detach (-d/stop/logs)" "sh tests/e2e_detach.sh"
     # images/rmi e2e: deletes cached alpine on purpose -- must be last.
     run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
 else
