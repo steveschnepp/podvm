@@ -76,9 +76,13 @@ convention every container user already expects.
 ## Implications
 
 State lives under `$XDG_STATE_HOME`, so it is per-user and follows the
-XDG convention; `podvm` never cleans it up. Deleting the directory is
-how a container's state is removed (there is no `podvm rm` yet). The
-directory can grow without bound as the container writes -- this is the
+XDG convention; `podvm` never cleans it up automatically. A container's
+state is removed with `podvm rm <name>`, or discarded when a `--rm` run
+exits; deleting the directory by hand remains equivalent. The
+name validation (`podvm` rejects `.`, `..`, and names containing `/`) is
+what keeps both paths inside the state root.
+
+The directory can grow without bound as the container writes -- this is the
 same characteristic as any container writable layer, and OCI layer
 committing (the part of ADR-020 aimed at `podvm build`) is the natural
 next step to compact it.

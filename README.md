@@ -127,20 +127,45 @@ podvm -i /path/to/rootfs /bin/sh
 
 # With custom memory/CPU
 podvm -m 256 -c 2 /path/to/rootfs /bin/sh
+
+# Named container: the writable layer survives the run (write-back)
+podvm -n build alpine /bin/sh
+
+# Discard that state when the run exits
+podvm --rm -n build alpine /bin/sh
+
+# ...or remove it on demand
+podvm rm build
 ```
+
+Named containers keep their writable layer in
+`$XDG_STATE_HOME/podvm/containers/<name>` (defaulting to
+`~/.local/state/...`), so writes made inside the container are visible to
+the next run with the same name. Unnamed runs are throwaway: writes die
+with the VM.
 
 ### Options
 
 ```
 Usage: podvm [options] <image|rootfs-dir> [command] [args...]
+       podvm rm <name> [<name>...]
 
 Options:
-  -i, --interactive   Interactive (attach stdin/stdout)
+  -i, --interactive   Give the guest stdin exclusively
+                      (default: QEMU monitor shares it; Ctrl-A C)
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
   -r, --initramfs <path> Initramfs path
+  -n, --name <name>   Container name; persists the writable layer across
+                      runs (write-back). Without it, writes are discarded
+                      when the VM exits.
+      --rm            Remove the named container's state when the run
+                      exits (no-op without --name)
   -h, --help          Show help
+
+Subcommands:
+  rm <name>...        Delete named containers' persistent state
 ```
 
 The first positional argument may be a rootfs directory **or** an image

@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg test_userdb
+TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg test_userdb test_container
 
 .PHONY: all test clean
 
@@ -48,6 +48,10 @@ test_imgcfg: test_imgcfg.c ../src/imgcfg.c ../src/imgcfg.h ../src/image.h
 test_userdb: test_userdb.c ../src/userdb.c ../src/userdb.h
 	$(CC) $(CFLAGS) -o $@ test_userdb.c ../src/userdb.c -I../src
 
+# Container state tests (name validation, state dir, rm -rf; no deps)
+test_container: test_container.c ../src/container.c ../src/container.h
+	$(CC) $(CFLAGS) -o $@ test_container.c ../src/container.c -I../src
+
 # Run all tests
 test: $(TESTS)
 	@echo "Running tests..."
@@ -75,6 +79,9 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== User DB Tests ==="
 	./test_userdb || true
+	@echo ""
+	@echo "=== Container State Tests ==="
+	./test_container || true
 	@echo ""
 	@echo "All tests complete!"
 

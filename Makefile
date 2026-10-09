@@ -18,14 +18,14 @@ CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 all: $(BUILD_DIR)/podvm
 
 # Build with CMake
-$(BUILD_DIR)/podvm: src/main.c src/strparse.c src/image.c src/strparse.h src/image.h
+$(BUILD_DIR)/podvm: src/main.c src/strparse.c src/image.c src/strparse.h src/image.h src/container.c src/container.h
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && cmake .. $(CMAKE_FLAGS) && make -j$(shell nproc)
 
 # Clean build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f tests/test_config tests/test_host_args tests/test_vsock tests/test_kernel_config tests/test_integration tests/test_image
+	$(MAKE) -C tests clean
 	rm -f guest/init guest/initramfs.cpio
 	cd guest && make clean 2>/dev/null || true
 

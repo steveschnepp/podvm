@@ -67,6 +67,7 @@ run_test "Image pipeline" "./tests/test_image"
 run_test "SHA-256" "./tests/test_sha256"
 run_test "Image config fold" "./tests/test_imgcfg"
 run_test "User resolution" "./tests/test_userdb"
+run_test "Container state" "./tests/test_container"
 
 echo ""
 echo "Running integration tests..."
@@ -132,6 +133,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E interactive (-i)" "timeout 150 python3 tests/e2e_interactive.py"
     # Write-back e2e: named container's writes persist across runs.
     run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
+    # rm/--rm e2e: state removal on demand and on exit.
+    run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi

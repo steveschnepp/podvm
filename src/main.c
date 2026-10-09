@@ -33,6 +33,7 @@
 #include "store.h"
 #include "strparse.h"
 #include "imgcfg.h"
+#include "container.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -50,7 +51,8 @@ static struct {
     char name[256];           /* container name; enables persistent state */
     int  memory;       /* MB */
     int  cpus;
-    int  interactive;  /* -it flag */
+    int  interactive;  /* -i flag */
+    int  autoremove;   /* --rm: drop the named state dir when the run ends */
 } config = {
     .kernel = "",  /* Empty = use host kernel */
     .initramfs = "/var/lib/podvm/kernel/initramfs.cpio",
@@ -72,31 +74,6 @@ static int mkdir_p(const char *path, mode_t mode) {
     }
     if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
     return 0;
-}
-
-/*
- * Host directory holding a named container's writable layer (the overlay
- * upper). Returning an empty string means "no persistent state" -- the
- * caller falls back to a throwaway tmpfs upper, so writes die with the
- * VM (the pre--write-back behavior).
- *
- * Lives under $XDG_STATE_HOME (or ~/.local/state), the conventional home
- * for mutable per-container state, mirroring podman's storage layout.
- */
-static void container_state_dir(char *out, size_t n) {
-    out[0] = '\0';
-    if (!config.name[0]) return;
-
-    const char *xdg = getenv("XDG_STATE_HOME");
-    char base[STORE_PATH_MAX];
-    if (xdg && xdg[0]) {
-        snprintf(base, sizeof(base), "%s/podvm/containers", xdg);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !home[0]) return;
-        snprintf(base, sizeof(base), "%s/.local/state/podvm/containers", home);
-    }
-    snprintf(out, n, "%s/%s", base, config.name);
 }
 
 /* Get host kernel path */
@@ -381,8 +358,11 @@ static int setup_userns_overlay(void) {
      * to the invoking uid), so files created in the persistent upper are
      * owned by the invoking user outside -- no root-owned state. */
     char basedir[STORE_PATH_MAX], updir[STORE_PATH_MAX], wkdir[STORE_PATH_MAX];
-    char state[STORE_PATH_MAX];
-    container_state_dir(state, sizeof(state));
+    char state[CONTAINER_PATH_MAX];
+    /* No state dir (no --name, or no HOME to keep it under) means the
+     * throwaway tmpfs upper below. Path building lives in container.c. */
+    if (container_state_dir(config.name, state, sizeof(state)) < 0)
+        state[0] = '\0';
 
     if (state[0]) {
         snprintf(updir, sizeof(updir), "%s/u", state);
@@ -553,9 +533,86 @@ static int wait_qemu(void) {
     return 1;
 }
 
+/*
+ * --rm: discard this named container's state when the run ends, however
+ * it ended. Never changes the run's own exit status -- a cleanup failure
+ * is reported but does not turn a successful run into a failure.
+ */
+static void maybe_autoremove(void) {
+    char dir[CONTAINER_PATH_MAX];
+    if (!config.autoremove) return;
+    if (container_state_dir(config.name, dir, sizeof(dir)) < 0 || !dir[0])
+        return;   /* unnamed run: nothing was persisted */
+
+    if (container_rm_rf(dir) == 0) {
+        printf("podvm: --rm: removed container state %s\n", dir);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "podvm: --rm: cannot remove %s: %s\n",
+                dir, strerror(errno));
+    }
+}
+
+/*
+ * `podvm rm <name>...` -- delete named containers' persistent state
+ * (their writable layer; ADR-026). Missing names are an error, like
+ * `docker rm` on a container that does not exist -- silently succeeding
+ * would hide typos. Every name is attempted, so one bulk invocation
+ * reports all problems; the exit status is non-zero if any failed.
+ */
+static int cmd_rm(int argc, char **argv) {
+    int rc = 0;
+
+    if (argc < 3 || !strcmp(argv[2], "-h") || !strcmp(argv[2], "--help")) {
+        fprintf(stderr, "Usage: podvm rm <name> [<name>...]\n");
+        fprintf(stderr, "Delete named containers' persistent state "
+                        "(their writable layer).\n");
+        return argc < 3 ? 1 : 0;
+    }
+
+    for (int i = 2; i < argc; i++) {
+        const char *name = argv[i];
+        char dir[CONTAINER_PATH_MAX];
+
+        if (!container_name_valid(name)) {
+            fprintf(stderr, "podvm: invalid container name: '%s'\n", name);
+            rc = 1;
+            continue;
+        }
+        if (container_state_dir(name, dir, sizeof(dir)) < 0 || !dir[0]) {
+            fprintf(stderr, "podvm: cannot locate the state dir "
+                            "(is HOME or XDG_STATE_HOME set?)\n");
+            return 1;
+        }
+        /* Defensive: only ever delete below .../podvm/containers/, even
+         * if the state-root logic above changes someday. */
+        if (!strstr(dir, "/podvm/containers/")) {
+            fprintf(stderr, "podvm: refusing to delete '%s' "
+                            "(not a podvm state dir)\n", dir);
+            rc = 1;
+            continue;
+        }
+        if (container_rm_rf(dir) < 0) {
+            if (errno == ENOENT) {
+                fprintf(stderr, "podvm: no such container: %s\n", name);
+            } else {
+                fprintf(stderr, "podvm: cannot remove %s: %s\n",
+                        dir, strerror(errno));
+            }
+            rc = 1;
+            continue;
+        }
+        printf("podvm: removed container '%s' (%s)\n", name, dir);
+    }
+    return rc;
+}
+
+/* Long-only options: --rm has no short form (-r is taken by --initramfs). */
+enum { OPT_RM = 1000 };
+
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
+    fprintf(stderr, "       %s rm <name> [<name>...]\n", prog);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
@@ -566,16 +623,27 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -n, --name <name>   Container name; persists the writable layer\n");
     fprintf(stderr, "                      across runs (write-back). Without it, writes\n");
     fprintf(stderr, "                      are discarded when the VM exits.\n");
+    fprintf(stderr, "      --rm            Remove the named container's state when the\n");
+    fprintf(stderr, "                      run exits (no-op without --name)\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
+    fprintf(stderr, "\nSubcommands:\n");
+    fprintf(stderr, "  rm <name>...        Delete named containers' persistent state\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
     fprintf(stderr, "  %s -i debian echo hello\n", prog);
     fprintf(stderr, "  %s -i /path/to/rootfs /bin/sh\n", prog);
+    fprintf(stderr, "  %s -n build -i alpine /bin/sh   (writes survive the run)\n", prog);
+    fprintf(stderr, "  %s rm build                     (discard them)\n", prog);
 }
 
 int main(int argc, char **argv) {
     int opt;
     int option_index = 0;
+
+    /* Subcommands are dispatched before getopt, so a subcommand name is
+     * never consumed as the image positional argument. */
+    if (argc > 1 && strcmp(argv[1], "rm") == 0)
+        return cmd_rm(argc, argv);
     const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {
@@ -585,6 +653,7 @@ int main(int argc, char **argv) {
         {"kernel",      required_argument, 0, 'k'},
         {"initramfs",   required_argument, 0, 'r'},
         {"name",        required_argument, 0, 'n'},
+        {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -610,11 +679,16 @@ int main(int argc, char **argv) {
             strncpy(config.initramfs, optarg, MAX_PATH - 1);
             break;
         case 'n':
-            if (strchr(optarg, '/')) {
-                fprintf(stderr, "podvm: --name must not contain '/'\n");
+            if (!container_name_valid(optarg)) {
+                fprintf(stderr, "podvm: invalid container name '%s' "
+                                "(no '/', not '.' or '..', no leading '-')\n",
+                        optarg);
                 return 1;
             }
-            strncpy(config.name, optarg, sizeof(config.name) - 1);
+            snprintf(config.name, sizeof(config.name), "%s", optarg);
+            break;
+        case OPT_RM:
+            config.autoremove = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -781,6 +855,7 @@ int main(int argc, char **argv) {
     /* Start QEMU (9p serves the rootfs in-process; no virtiofsd) */
     if (start_qemu() < 0) {
         fprintf(stderr, "podvm: failed to start QEMU\n");
+        maybe_autoremove();   /* --rm still drops the name's state */
         return 1;
     }
 
@@ -797,5 +872,9 @@ int main(int argc, char **argv) {
     }
 
     /* Wait for QEMU to exit */
-    return wait_qemu();
+    int rc = wait_qemu();
+
+    /* --rm: this named container's state dies with the run. */
+    maybe_autoremove();
+    return rc;
 }
