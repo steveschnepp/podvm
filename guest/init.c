@@ -42,11 +42,14 @@
 #define PATH_SIZE     1024
 #define CMDLINE_SIZE  4096
 #define MAX_ARG_VAL   4096  /* matches the host's args[] buffer */
-#define MAX_ENV_VAL   1100  /* matches the host's env[] buffer (1024) */
+#define MAX_ENV_VAL   4096  /* matches the host's env[] buffer */
 
 /* vsock config channel (must match host) */
 #define VSOCK_PORT       5000
 #define VSOCK_TIMEOUT_MS 3000
+/* Exit-report channel: the guest connects to the HOST (cid 2) after the
+ * entrypoint finishes and writes its exit code. (must match host) */
+#define VSOCK_EXIT_PORT  5001
 
 /* Configuration from kernel cmdline / host vsock */
 typedef struct {
@@ -391,6 +394,39 @@ static int mount_rootfs(const Config *cfg) {
     return -1;
 }
 
+/*
+ * Report the entrypoint's exit code to the host over vsock. Best-effort
+ * with bounded retries: if the host is not listening (an older podvm)
+ * or vsock is unavailable, we just go on -- the host falls back to its
+ * historical behavior instead of hanging.
+ */
+static void report_exit(int code) {
+    struct sockaddr_vm addr;
+    int fd = -1;
+
+    for (int i = 0; i < 50; i++) {
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        memset(&addr, 0, sizeof(addr));
+        addr.svm_family = AF_VSOCK;
+        addr.svm_cid = VMADDR_CID_HOST;
+        addr.svm_port = VSOCK_EXIT_PORT;
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
+        close(fd);
+        fd = -1;
+        if (errno != ECONNRESET && errno != EAGAIN && errno != EINTR &&
+            errno != ENODEV && errno != EOPNOTSUPP && errno != ETIMEDOUT)
+            return;                       /* hard error: no report */
+        usleep(20000);
+    }
+    if (fd < 0) return;
+
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d\n", code);
+    (void)!write(fd, buf, (size_t)n);
+    close(fd);
+}
+
 int main(void) {
     Config cfg;
     char cmdline[CMDLINE_SIZE];
@@ -546,7 +582,13 @@ int main(void) {
     if (cfg.gid > 0) setgid(cfg.gid);
     if (cfg.uid > 0) setuid(cfg.uid);
 
-    /* Step 10: Exec entrypoint */
+    /* Step 10: Run the entrypoint as a CHILD, not via exec. PID 1 must
+     * survive to report the exit code to the host and then exit
+     * cleanly: a kernel panic on init's death cannot carry an exit
+     * code, so 'podvm run cmd' could never tell a script that cmd
+     * failed. The child gets the signals a foreground process would
+     * (same process group, no job control), and a failed exec is 127,
+     * as docker reports it. */
     char *exec_argv[MAX_ARGS + 1];
     exec_argv[0] = cfg.entrypoint;
     for (int j = 0; j < cfg.argc; j++)
@@ -554,8 +596,25 @@ int main(void) {
     exec_argv[1 + cfg.argc] = NULL;
 
     fprintf(stderr, "podvm-init: exec %s\n", cfg.entrypoint);
-    execvp(cfg.entrypoint, exec_argv);
 
-    fprintf(stderr, "podvm-init: exec failed: %s\n", strerror(errno));
-    return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(cfg.entrypoint, exec_argv);
+        fprintf(stderr, "podvm-init: exec failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+    if (pid < 0) {
+        /* No fork available: fall back to the old exec-as-init path
+         * (no exit report, but the command still runs). */
+        execvp(cfg.entrypoint, exec_argv);
+        fprintf(stderr, "podvm-init: exec failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status)
+            : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
+    report_exit(code);
+    return code;
 }

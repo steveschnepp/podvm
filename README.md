@@ -139,6 +139,10 @@ podvm --rm -n build alpine /bin/sh
 
 # ...or remove it on demand
 podvm rm build
+
+# Build a Dockerfile into a runnable image (RUN steps boot real VMs)
+podvm build -t myapp:1 ./myapp-dir
+podvm myapp:1
 ```
 
 Named containers keep their writable layer in
@@ -186,6 +190,7 @@ Subcommands:
   rm <name>...        Delete named containers' persistent state
   images              List cached images
   rmi <image>...      Remove cached images (refused while in use)
+  build               Build a Dockerfile into a cached image
 ```
 
 The first positional argument may be a rootfs directory **or** an image

@@ -68,6 +68,7 @@ run_test "SHA-256" "./tests/test_sha256"
 run_test "Image config fold" "./tests/test_imgcfg"
 run_test "User resolution" "./tests/test_userdb"
 run_test "Container state" "./tests/test_container"
+run_test "Build parser" "./tests/test_build"
 
 echo ""
 echo "Running integration tests..."
@@ -137,6 +138,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
     # Run-flag parity e2e: podman-parity run flags reach the guest.
     run_test "E2E run flags (podman parity)" "sh tests/e2e_runflags.sh"
+    # Build e2e: Dockerfile -> runnable cached image (RUN = real VMs).
+    run_test "E2E build (Dockerfile)" "sh tests/e2e_build.sh"
     # images/rmi e2e: deletes cached alpine on purpose -- must be last.
     run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
 else

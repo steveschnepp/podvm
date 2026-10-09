@@ -155,3 +155,16 @@ int container_locked(const char *name) {
     close(fd);                            /* was free; we just release it */
     return 0;
 }
+
+void container_lock_unlink(const char *name) {
+    char path[CONTAINER_PATH_MAX];
+    if (lock_path(name, path, sizeof(path)) < 0) return;
+    unlink(path);                         /* best-effort */
+}
+
+int container_build_dir(char *out, size_t n) {
+    char base[CONTAINER_PATH_MAX];
+    if (state_base(base, sizeof(base)) < 0) return -1;
+    snprintf(out, n, "%s/build", base);
+    return mkdir_p(out, 0755);
+}

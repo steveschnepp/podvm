@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <linux/vm_sockets.h>
 
@@ -34,6 +35,7 @@
 #include "strparse.h"
 #include "imgcfg.h"
 #include "container.h"
+#include "build.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -49,7 +51,7 @@ static struct {
     char rootfs_dir[MAX_PATH];
     char entrypoint[MAX_PATH];
     char args[4096];       /* csv of escaped argv elements (guest tok[] matches) */
-    char env[1024];
+    char env[4096];         /* escaped csv of K=V (guest tok[] matches) */
     char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
     char name[256];           /* container name; enables persistent state */
@@ -128,6 +130,81 @@ static void handle_signal(int sig) {
 
 /* vsock availability on the host (auto-detected) */
 static int vsock_available = 0;
+
+/*
+ * Exit-code reporting. The guest runs the entrypoint as a child and,
+ * when it finishes, connects to the HOST (cid 2, port 5001) and writes
+ * the exit code. QEMU's own exit status is meaningless for this (a
+ * guest panic carries no command status), so without this channel
+ * 'podvm run cmd' could never tell a script that cmd failed -- and
+ * podvm build could not detect a failed RUN.
+ *
+ * The listener runs in a helper process so the QEMU wait is never
+ * blocked; the code comes back over a pipe. One-shot per run/step.
+ */
+#define VSOCK_EXIT_PORT 5001
+static pid_t exit_helper_pid = -1;
+static int exit_pipe[2] = { -1, -1 };
+
+static void start_exit_helper(void) {
+    if (!vsock_available || exit_helper_pid > 0) return;
+    if (pipe(exit_pipe) < 0) return;
+
+    exit_helper_pid = fork();
+    if (exit_helper_pid == 0) {
+        close(exit_pipe[0]);
+        int lfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        if (lfd < 0) _exit(1);
+        struct sockaddr_vm addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.svm_family = AF_VSOCK;
+        addr.svm_cid = VMADDR_CID_ANY;
+        addr.svm_port = VSOCK_EXIT_PORT;
+        if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+            listen(lfd, 1) < 0) {
+            close(lfd);
+            _exit(1);
+        }
+        struct pollfd pfd = { lfd, POLLIN, 0 };
+        if (poll(&pfd, 1, 30000) <= 0) _exit(1);
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) _exit(1);
+        char buf[32];
+        ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+        close(cfd);
+        close(lfd);
+        if (n <= 0) _exit(1);
+        buf[n] = '\0';
+        (void)!dprintf(exit_pipe[1], "%d\n", atoi(buf));
+        _exit(0);
+    }
+    close(exit_pipe[1]);
+    exit_pipe[1] = -1;
+}
+
+/* After wait_qemu(): collect the reported code. The guest reports
+ * before it exits, so by now the helper has either written or never
+ * will (old initramfs / no vsock) -- a short grace poll, then kill. */
+static int reap_exit_helper(void) {
+    if (exit_helper_pid <= 0) return -1;
+
+    int code = -1;
+    struct pollfd pfd = { exit_pipe[0], POLLIN, 0 };
+    if (poll(&pfd, 1, 200) > 0) {
+        char buf[32];
+        ssize_t n = read(exit_pipe[0], buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            code = atoi(buf);
+        }
+    }
+    kill(exit_helper_pid, SIGKILL);   /* done, or stale: either way reap */
+    waitpid(exit_helper_pid, NULL, 0);
+    close(exit_pipe[0]);
+    exit_pipe[0] = -1;
+    exit_helper_pid = -1;
+    return code;
+}
 
 /* Podman-storage mode: rootfs is an overlay over podman layer diffs,
  * mounted inside the QEMU child's user namespace (see run_qemu_child). */
@@ -714,6 +791,24 @@ static int start_qemu(void) {
     char vsock_cid_str[32];
     char netdev_str[512];
 
+    /* Fail early with a diagnosis instead of a silent QEMU exit and no
+     * serial output (which looks like a guest bug but is just a
+     * missing file). */
+    {
+        struct stat st;
+        if (stat(config.kernel, &st) < 0) {
+            fprintf(stderr, "podvm: kernel not found: %s (use -k)\n",
+                    config.kernel);
+            return -1;
+        }
+        if (stat(config.initramfs, &st) < 0) {
+            fprintf(stderr, "podvm: initramfs not found: %s "
+                            "(use -r, or 'make initramfs')\n",
+                    config.initramfs);
+            return -1;
+        }
+    }
+
     /* Bounded argv so we can conditionally append the vsock device and
      * one fsdev+device pair per -v volume. */
     const char *qargs[128];
@@ -1054,12 +1149,588 @@ static int cmd_rmi(int argc, char **argv) {
     return rc;
 }
 
+/* ───────────────────────── podvm build ───────────────────────── */
+
+/*
+ * `podvm build [-f Dockerfile] -t <name:tag> [context]` -- a Dockerfile
+ * becomes a podvm-native image in the cache (the same layout pulls
+ * use, so run/images/rmi see one cache).
+ *
+ * Each RUN boots a throwaway VM whose overlay chain is [committed
+ * layers, FROM's layers] with a fresh named-container upper; after the
+ * VM exits the upper IS the committed layer (rename'd into the build
+ * dir -- overlayfs has already applied every change to it, including
+ * whiteouts as char 0:0 devices, which the next overlay understands
+ * natively). COPY and metadata run host-side. The final image is the
+ * merged view, copied out through a host-side userns+overlay mount so
+ * the kernel -- not podvm -- assembles the chain.
+ *
+ * RUN scripts ride to the guest in a file in the step's upper
+ * (/.podvm-step.sh) rather than over the config channel: a file has no
+ * length or separator limits, so quotes, commas, and long scripts all
+ * survive. The file lands in committed layers; harmless at runtime.
+ */
+
+/* Escape each word of a raw csv (Dockerfile exec form) into escaped csv. */
+static int csv_escape_words(const char *raw, char *out, size_t n) {
+    size_t off = 0;
+    out[0] = '\0';
+    const char *t = raw;
+    while (t && *t) {
+        char word[BUILD_OP_STR], esc[BUILD_OP_STR * 2];
+        size_t w = 0;
+        while (*t && *t != ',' && w + 1 < sizeof(word)) word[w++] = *t++;
+        word[w] = '\0';
+        if (*t == ',') t++; else t = NULL;
+        if (kv_escape(esc, sizeof(esc), word) == (size_t)-1) esc[0] = '\0';
+        int k = snprintf(out + off, n - off, "%s%s", off ? "," : "", esc);
+        if (k < 0 || (size_t)k >= n - off) return -1;
+        off += (size_t)k;
+    }
+    return 0;
+}
+
+/* JSON-escape a string (quotes, backslash, control chars). */
+static void json_escape(const char *s, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; s[i] && o + 8 < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20) o += snprintf(out + o, n - o, "\\u%04x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+}
+
+/* Emit an escaped-csv as a JSON string array, unescaping each field. */
+static void json_csv_array(FILE *f, const char *label, const char *csv) {
+    fprintf(f, "\"%s\":[", label);
+    int first = 1;
+    const char *t = csv;
+    while (t && *t) {
+        char field[4096], unesc[4096], esc[8200];
+        size_t n = 0;
+        while (*t && n + 1 < sizeof(field)) {
+            if (*t == '\\' && t[1] && n + 2 < sizeof(field)) {
+                field[n++] = *t++;
+                field[n++] = *t++;
+                continue;
+            }
+            if (*t == ',') break;
+            field[n++] = *t++;
+        }
+        field[n] = '\0';
+        if (*t == ',') t++; else t = NULL;
+        snprintf(unesc, sizeof(unesc), "%s", field);
+        kv_unescape(unesc);
+        json_escape(unesc, esc, sizeof(esc));
+        fprintf(f, "%s\"%s\"", first ? "" : ",", esc);
+        first = 0;
+    }
+    fprintf(f, "]");
+}
+
+/* Insert a committed layer at the front of the chain (top-first). */
+static void chain_insert_front(char chain[MAX_CHAIN][MAX_PATH], int *n,
+                               const char *path) {
+    if (*n >= MAX_CHAIN - 1) return;      /* bounded; count reported */
+    memmove(&chain[1], &chain[0], (size_t)(*n) * sizeof(chain[0]));
+    snprintf(chain[0], MAX_PATH, "%s", path);
+    (*n)++;
+}
+
+static int cmd_build(int argc, char **argv) {
+    const char *df_arg = NULL, *tag = NULL, *context = NULL;
+
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-f") && i + 1 < argc) df_arg = argv[++i];
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) tag = argv[++i];
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            snprintf(config.initramfs, sizeof(config.initramfs), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "-k") && i + 1 < argc)
+            snprintf(config.kernel, sizeof(config.kernel), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            fprintf(stderr, "Usage: podvm build [-f Dockerfile] -t <name:tag> "
+                            "[-r initramfs] [-k kernel] [context]\n");
+            fprintf(stderr, "Build a Dockerfile into a podvm image. Supported: FROM,\n");
+            fprintf(stderr, "RUN (shell form), COPY, WORKDIR, ENV, USER, CMD, ENTRYPOINT;\n");
+            fprintf(stderr, "EXPOSE/LABEL are accepted and ignored. One stage only.\n");
+            return 0;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "podvm build: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!context) {
+            context = argv[i];
+        } else {
+            fprintf(stderr, "podvm build: unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!tag) {
+        fprintf(stderr, "podvm build: -t <name:tag> is required\n");
+        return 2;
+    }
+    if (!context) context = ".";
+    if (image_is_path(tag)) {
+        fprintf(stderr, "podvm build: tag must not be a path: '%s'\n", tag);
+        return 2;
+    }
+
+    char df_path[MAX_PATH];
+    if (df_arg) snprintf(df_path, sizeof(df_path), "%s", df_arg);
+    else snprintf(df_path, sizeof(df_path), "%s/Dockerfile", context);
+
+    FILE *df = fopen(df_path, "r");
+    if (!df) {
+        fprintf(stderr, "podvm build: cannot open %s: %s\n",
+                df_path, strerror(errno));
+        return 1;
+    }
+    fseek(df, 0, SEEK_END);
+    long dlen = ftell(df);
+    rewind(df);
+    if (dlen < 0) { fclose(df); return 1; }
+    char *text = malloc((size_t)dlen + 1);
+    if (!text) { fclose(df); return 1; }
+    size_t got = fread(text, 1, (size_t)dlen, df);
+    text[got] = '\0';
+    fclose(df);
+
+    BuildOp ops[BUILD_OPS_MAX];
+    char perr[512];
+    int nops = dockerfile_parse(text, ops, BUILD_OPS_MAX, perr, sizeof(perr));
+    free(text);
+    if (nops < 0) {
+        fprintf(stderr, "podvm build: %s: %s\n", df_path, perr);
+        return 1;
+    }
+    if (nops > 1) {
+        for (int i = 1; i < nops; i++) {
+            if (ops[i].kind == BFROM) {
+                fprintf(stderr, "podvm build: line %d: multi-stage builds "
+                                "are not supported\n", ops[i].line);
+                return 1;
+            }
+        }
+    }
+
+    detect_vsock();
+    if (config.kernel[0] == '\0')
+        get_host_kernel(config.kernel, sizeof(config.kernel));
+
+    char workdir[MAX_PATH], layersdir[MAX_PATH];
+    if (container_build_dir(workdir, sizeof(workdir)) < 0) {
+        fprintf(stderr, "podvm build: cannot create the build dir: %s\n",
+                strerror(errno));
+        return 1;
+    }
+    char wsuffix[MAX_PATH];
+    snprintf(wsuffix, sizeof(wsuffix), "/b%d", (int)getpid());
+    strncat(workdir, wsuffix, sizeof(workdir) - strlen(workdir) - 1);
+    snprintf(layersdir, sizeof(layersdir), "%s/layers", workdir);
+    if (mkdir_p(workdir, 0755) < 0 || mkdir_p(layersdir, 0755) < 0) {
+        fprintf(stderr, "podvm build: cannot create %s: %s\n",
+                workdir, strerror(errno));
+        return 1;
+    }
+
+    /* ── FROM: resolve to a layer chain + the image's config ── */
+    const char *from = ops[0].a;
+    char base_diffs[MAX_CHAIN][MAX_PATH];
+    int nbase = 0;
+    ImageConfig ic;
+    image_config_init(&ic);
+    int from_podman = 0, from_lock = -1;
+    char layer_chain[MAX_CHAIN][MAX_PATH];
+    int nlayers = 0;
+    char envlist[4096] = "";
+    char cwd[MAX_PATH] = "", user[128] = "";
+    char cmdcsv[4096] = "", entrycsv[4096] = "";
+    int rc = 0;
+
+    (void)from_podman;
+    if (image_is_path(from)) {
+        fprintf(stderr, "podvm build: line %d: FROM must be an image, "
+                        "not a directory\n", ops[0].line);
+        rc = 1;
+        goto out;
+    }
+    {
+        char top[STORE_PATH_MAX];
+        if (store_resolve(from, top, sizeof(top), 1) == 0) {
+            StoreLayer lay[MAX_CHAIN];
+            int c = store_chain(top, lay, MAX_CHAIN);
+            if (c <= 0) {
+                fprintf(stderr, "podvm build: no layer chain for %s\n", from);
+                rc = 1;
+                goto out;
+            }
+            for (int l = 0; l < c && l < MAX_CHAIN; l++)
+                snprintf(base_diffs[l], MAX_PATH, "%s", lay[l].diff);
+            nbase = c;
+            store_image_config(from, &ic);
+            from_podman = 1;
+        } else {
+            char root[STORE_PATH_MAX];
+            if (image_resolve(from, root, sizeof(root)) < 0) {
+                fprintf(stderr, "podvm build: cannot resolve FROM image %s\n", from);
+                rc = 1;
+                goto out;
+            }
+            snprintf(base_diffs[0], MAX_PATH, "%s", root);
+            nbase = 1;
+            image_config_load(from, &ic);
+            /* The base rootfs is served to every step VM: hold a
+             * shared lock so rmi cannot delete it mid-build. */
+            from_lock = image_lock(from, 0);
+            if (from_lock < 0) {
+                fprintf(stderr, "podvm build: cannot lock base image %s: %s\n",
+                        from, strerror(errno));
+                rc = 1;
+                goto out;
+            }
+        }
+    }
+    printf("podvm: build from %s (%d base layer%s)\n", from, nbase,
+           nbase == 1 ? "" : "s");
+
+    /* Seed metadata from the base image (docker: FROM inherits config). */
+    snprintf(cwd, sizeof(cwd), "%s", ic.cwd);
+    snprintf(user, sizeof(user), "%s", ic.user);
+    for (int e = 0; e < ic.nenv; e++) {
+        const char *eq = strchr(ic.env[e], '=');
+        size_t klen = eq ? (size_t)(eq - ic.env[e]) : strlen(ic.env[e]);
+        const char *val = eq ? eq + 1 : ic.env[e] + klen;
+        char enc[BUILD_OP_STR * 2], pair[BUILD_OP_STR * 2];
+        if (kv_escape(enc, sizeof(enc), val) == (size_t)-1) enc[0] = '\0';
+        snprintf(pair, sizeof(pair), "%.*s=%s", (int)klen, ic.env[e], enc);
+        if (build_env_set(envlist, sizeof(envlist), pair) < 0) break;
+    }
+    {
+        char raw[8192];
+        size_t off = 0;
+        for (int c = 0; c < ic.ncmd; c++) {
+            int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
+                             off ? "," : "", ic.cmd[c]);
+            if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
+            off += (size_t)w;
+        }
+        if (csv_escape_words(raw, cmdcsv, sizeof(cmdcsv)) < 0) cmdcsv[0] = '\0';
+        raw[0] = '\0'; off = 0;
+        for (int c = 0; c < ic.nentry; c++) {
+            int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
+                             off ? "," : "", ic.entrypoint[c]);
+            if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
+            off += (size_t)w;
+        }
+        if (csv_escape_words(raw, entrycsv, sizeof(entrycsv)) < 0) entrycsv[0] = '\0';
+    }
+
+    /* ── the op loop ── */
+    for (int i = 1; i < nops; i++) {
+        BuildOp *op = &ops[i];
+        switch (op->kind) {
+        case BENV: {
+            /* "K=V K2=V2": split on spaces; quoting not supported (v1). */
+            char tmp[BUILD_OP_STR];
+            snprintf(tmp, sizeof(tmp), "%s", op->a);
+            for (char *tok = strtok(tmp, " \t"); tok; tok = strtok(NULL, " \t")) {
+                char *eq = strchr(tok, '=');
+                if (!eq) {
+                    fprintf(stderr, "podvm build: line %d: ENV needs KEY=VALUE\n",
+                            op->line);
+                    rc = 1;
+                    goto out;
+                }
+                char enc[BUILD_OP_STR * 2], pair[BUILD_OP_STR * 2];
+                if (kv_escape(enc, sizeof(enc), eq + 1) == (size_t)-1) enc[0] = '\0';
+                *eq = '\0';
+                snprintf(pair, sizeof(pair), "%s=%s", tok, enc);
+                if (build_env_set(envlist, sizeof(envlist), pair) < 0) {
+                    fprintf(stderr, "podvm build: line %d: env list overflow\n",
+                            op->line);
+                    rc = 1;
+                    goto out;
+                }
+            }
+            break;
+        }
+        case BWORKDIR:
+            if (op->a[0] != '/') {
+                fprintf(stderr, "podvm build: line %d: WORKDIR must be absolute\n",
+                        op->line);
+                rc = 1;
+                goto out;
+            }
+            snprintf(cwd, sizeof(cwd), "%s", op->a);
+            break;
+        case BUSER:
+            snprintf(user, sizeof(user), "%s", op->a);
+            break;
+        case BCMD:
+            if (op->json_form) {
+                if (csv_escape_words(op->a, cmdcsv, sizeof(cmdcsv)) < 0) {
+                    fprintf(stderr, "podvm build: line %d: CMD too long\n", op->line);
+                    rc = 1;
+                    goto out;
+                }
+            } else {
+                /* shell form: docker stores ["sh","-c",raw] */
+                char enc[BUILD_OP_STR * 2];
+                if (kv_escape(enc, sizeof(enc), op->a) == (size_t)-1) enc[0] = '\0';
+                snprintf(cmdcsv, sizeof(cmdcsv), "sh,-c,%s", enc);
+            }
+            break;
+        case BENTRYPOINT:
+            if (op->json_form) {
+                if (csv_escape_words(op->a, entrycsv, sizeof(entrycsv)) < 0) {
+                    fprintf(stderr, "podvm build: line %d: ENTRYPOINT too long\n",
+                            op->line);
+                    rc = 1;
+                    goto out;
+                }
+            } else {
+                char enc[BUILD_OP_STR * 2];
+                if (kv_escape(enc, sizeof(enc), op->a) == (size_t)-1) enc[0] = '\0';
+                snprintf(entrycsv, sizeof(entrycsv), "sh,-c,%s", enc);
+            }
+            break;
+        case BCOPY: {
+            char ldir[MAX_PATH], srcabs[MAX_PATH], cerr[512];
+            if (op->a[0] == '/' || strstr(op->a, "..")) {
+                fprintf(stderr, "podvm build: line %d: COPY src must be a "
+                                "context-relative path without '..': '%s'\n",
+                        op->line, op->a);
+                rc = 1;
+                goto out;
+            }
+            snprintf(ldir, sizeof(ldir), "%s/c%03d", layersdir, i);
+            if (mkdir_p(ldir, 0755) < 0) {
+                fprintf(stderr, "podvm build: cannot create %s: %s\n",
+                        ldir, strerror(errno));
+                rc = 1;
+                goto out;
+            }
+            snprintf(srcabs, sizeof(srcabs), "%s/%s", context, op->a);
+            if (build_copy_path(srcabs, ldir, op->b, cerr, sizeof(cerr)) < 0) {
+                fprintf(stderr, "podvm build: line %d: %s\n", op->line, cerr);
+                rc = 1;
+                goto out;
+            }
+            printf("podvm: step %d: COPY %s %s\n", i, op->a, op->b);
+            chain_insert_front(layer_chain, &nlayers, ldir);
+            break;
+        }
+        case BRUN: {
+            char stepname[64], sdir[CONTAINER_PATH_MAX];
+            char upath[MAX_PATH], spath[MAX_PATH], ldir[MAX_PATH];
+            snprintf(stepname, sizeof(stepname), "pb%dp%d-s%d",
+                     (int)getpid(), (int)getppid(), i);
+
+            /* Step chain: committed layers (top-first), then the base. */
+            store_nlayers = 0;
+            for (int l = 0; l < nlayers && store_nlayers < MAX_CHAIN; l++)
+                snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                         "%s", layer_chain[l]);
+            for (int b = 0; b < nbase && store_nlayers < MAX_CHAIN; b++)
+                snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                         "%s", base_diffs[b]);
+
+            snprintf(config.name, sizeof(config.name), "%s", stepname);
+            snprintf(config.rootfs_dir, sizeof(config.rootfs_dir),
+                     "/tmp/podvm-build-ovl.%d.%d", (int)getpid(), i);
+            snprintf(config.entrypoint, sizeof(config.entrypoint), "/bin/sh");
+            snprintf(config.args, sizeof(config.args), "%s", "/.podvm-step.sh");
+            snprintf(config.env, sizeof(config.env), "%s", envlist);
+            snprintf(config.cwd, sizeof(config.cwd), "%s", cwd);
+            snprintf(config.user, sizeof(config.user), "%s", user);
+            config.interactive = 0;
+            config.read_only = 0;
+            config.autoremove = 0;
+
+            /* The script rides in the step's upper: no channel limits. */
+            if (container_state_dir(stepname, sdir, sizeof(sdir)) < 0 || !sdir[0]) {
+                fprintf(stderr, "podvm build: cannot locate the state dir\n");
+                rc = 1;
+                goto out;
+            }
+            snprintf(upath, sizeof(upath), "%s/u", sdir);
+            if (mkdir_p(upath, 0755) < 0) {
+                fprintf(stderr, "podvm build: cannot create %s: %s\n",
+                        upath, strerror(errno));
+                rc = 1;
+                goto out;
+            }
+            snprintf(spath, sizeof(spath), "%s/.podvm-step.sh", upath);
+            FILE *sf = fopen(spath, "w");
+            if (!sf) {
+                fprintf(stderr, "podvm build: cannot write %s: %s\n",
+                        spath, strerror(errno));
+                rc = 1;
+                goto out;
+            }
+            fprintf(sf, "%s\n", op->a);
+            fclose(sf);
+            chmod(spath, 0755);
+
+            printf("podvm: step %d: RUN %s\n", i, op->a);
+            start_exit_helper();
+            if (start_qemu() < 0) {
+                fprintf(stderr, "podvm build: cannot start the step VM\n");
+                container_rm_rf(sdir);
+                container_lock_unlink(stepname);
+                rc = 1;
+                goto out;
+            }
+            if (vsock_available) {
+                char vcfg[MAX_CMDLINE];
+                build_config_tokens(vcfg, sizeof(vcfg));
+                if (send_config_vsock(vcfg) < 0)
+                    fprintf(stderr, "podvm: vsock config failed; "
+                                    "step uses the cmdline\n");
+            }
+            int st = wait_qemu();
+            int gc = reap_exit_helper();
+            if (gc >= 0) {
+                st = gc;
+            } else if (st == 0) {
+                fprintf(stderr, "podvm build: warning: no exit report from "
+                                "the step VM (no vsock?); assuming success\n");
+            }
+            if (st != 0) {
+                fprintf(stderr, "podvm build: line %d: step failed "
+                                "(exit %d)\n", op->line, st);
+                container_rm_rf(sdir);
+                container_lock_unlink(stepname);
+                rc = 1;
+                goto out;
+            }
+
+            /* Commit: the upper IS the new layer. */
+            snprintf(ldir, sizeof(ldir), "%s/l%03d", layersdir, i);
+            if (rename(upath, ldir) < 0) {
+                fprintf(stderr, "podvm build: cannot commit the step layer: %s\n",
+                        strerror(errno));
+                container_rm_rf(sdir);
+                container_lock_unlink(stepname);
+                rc = 1;
+                goto out;
+            }
+            container_rm_rf(sdir);
+            container_lock_unlink(stepname);
+            chain_insert_front(layer_chain, &nlayers, ldir);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    /* ── assemble the merged view into the cache ── */
+    {
+        char final[STORE_PATH_MAX];
+        if (image_cache_path(tag, final, sizeof(final)) < 0) {
+            fprintf(stderr, "podvm build: cannot place image %s in the cache\n", tag);
+            rc = 1;
+            goto out;
+        }
+        if (container_rm_rf(final) < 0 && errno != ENOENT) {
+            fprintf(stderr, "podvm build: cannot replace %s: %s\n",
+                    final, strerror(errno));
+            rc = 1;
+            goto out;
+        }
+        if (mkdir_p(final, 0755) < 0) {
+            fprintf(stderr, "podvm build: cannot create %s: %s\n",
+                    final, strerror(errno));
+            rc = 1;
+            goto out;
+        }
+
+        store_nlayers = 0;
+        for (int l = 0; l < nlayers && store_nlayers < MAX_CHAIN; l++)
+            snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                     "%s", layer_chain[l]);
+        for (int b = 0; b < nbase && store_nlayers < MAX_CHAIN; b++)
+            snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                     "%s", base_diffs[b]);
+
+        pid_t apid = fork();
+        if (apid == 0) {
+            /* Child: userns overlay over the full chain (the kernel
+             * assembles whiteouts/opaque dirs), then cp the merged
+             * view into the cache dir. */
+            snprintf(config.rootfs_dir, sizeof(config.rootfs_dir),
+                     "/tmp/podvm-build-merge.%d", (int)getpid());
+            config.name[0] = '\0';
+            config.read_only = 0;
+            if (setup_userns_overlay() < 0) _exit(1);
+            pid_t cpid = fork();
+            if (cpid == 0) {
+                char srcdot[MAX_PATH + 4], dst[MAX_PATH + 4];
+                snprintf(srcdot, sizeof(srcdot), "%s/.", config.rootfs_dir);
+                snprintf(dst, sizeof(dst), "%s/", final);
+                /* --no-preserve=ownership: root-owned files are not
+                 * mapped into our userns (chown -> EINVAL), and the
+                 * pull path's untar never preserved ownership either.
+                 * Everything lands owned by the invoking user. */
+                execlp("cp", "cp", "-a", "--no-preserve=ownership",
+                       srcdot, dst, (char *)NULL);
+                _exit(127);
+            }
+            int st = 0;
+            waitpid(cpid, &st, 0);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
+        }
+        int ast = 0;
+        waitpid(apid, &ast, 0);
+        if (!WIFEXITED(ast) || WEXITSTATUS(ast) != 0) {
+            fprintf(stderr, "podvm build: assembling the image failed\n");
+            rc = 1;
+            goto out;
+        }
+
+        /* The OCI-shaped config blob the run path already reads. */
+        char cfgpath[MAX_PATH + 32];
+        snprintf(cfgpath, sizeof(cfgpath), "%s/.podvm-config.json", final);
+        FILE *cf = fopen(cfgpath, "w");
+        if (!cf) {
+            fprintf(stderr, "podvm build: cannot write %s: %s\n",
+                    cfgpath, strerror(errno));
+            rc = 1;
+            goto out;
+        }
+        char escwd[STORE_PATH_MAX], escuser[300];
+        json_escape(cwd, escwd, sizeof(escwd));
+        json_escape(user, escuser, sizeof(escuser));
+        fprintf(cf, "{\"architecture\":\"amd64\",\"os\":\"linux\",\"config\":{");
+        json_csv_array(cf, "Env", envlist);
+        fprintf(cf, ",");
+        json_csv_array(cf, "Entrypoint", entrycsv);
+        fprintf(cf, ",");
+        json_csv_array(cf, "Cmd", cmdcsv);
+        fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}}\n",
+                escwd, escuser);
+        fclose(cf);
+
+        printf("podvm: built %s (%d layer%s) at %s\n",
+               tag, nlayers + nbase, (nlayers + nbase) == 1 ? "" : "s", final);
+    }
+
+out:
+    container_rm_rf(workdir);
+    if (from_lock >= 0) close(from_lock);
+    image_config_free(&ic);
+    return rc;
+}
+
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
     fprintf(stderr, "       %s rm <name> [<name>...]\n", prog);
     fprintf(stderr, "       %s images\n", prog);
     fprintf(stderr, "       %s rmi <image> [<image>...]\n", prog);
+    fprintf(stderr, "       %s build [-f Dockerfile] -t <name:tag> [context]\n", prog);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
@@ -1092,6 +1763,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  rm <name>...        Delete named containers' persistent state\n");
     fprintf(stderr, "  images              List cached images\n");
     fprintf(stderr, "  rmi <image>...      Remove cached images (refused while in use)\n");
+    fprintf(stderr, "  build               Build a Dockerfile into a cached image\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
     fprintf(stderr, "  %s -i debian echo hello\n", prog);
@@ -1112,6 +1784,8 @@ int main(int argc, char **argv) {
         return cmd_images();
     if (argc > 1 && strcmp(argv[1], "rmi") == 0)
         return cmd_rmi(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "build") == 0)
+        return cmd_build(argc, argv);
     const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {
@@ -1433,6 +2107,7 @@ int main(int argc, char **argv) {
 
     /* Detect host vsock support (determines QEMU device + config channel). */
     detect_vsock();
+    start_exit_helper();
 
     /* Start QEMU (9p serves the rootfs in-process; no virtiofsd) */
     if (start_qemu() < 0) {
@@ -1456,7 +2131,10 @@ int main(int argc, char **argv) {
     /* Wait for QEMU to exit */
     int rc = wait_qemu();
 
+    /* The command's own exit code, when the guest reported it (vsock). */
+    int guest_code = reap_exit_helper();
+
     /* --rm: this named container's state dies with the run. */
     maybe_autoremove();
-    return rc;
+    return guest_code >= 0 ? guest_code : rc;
 }

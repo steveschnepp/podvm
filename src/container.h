@@ -72,4 +72,19 @@ int container_lock(const char *name);
  */
 int container_locked(const char *name);
 
+/*
+ * Remove a name's lock file (transient build steps use named
+ * containers; their lock files must not accumulate). Best-effort:
+ * only safe when the lock is NOT held and the name is transient.
+ */
+void container_lock_unlink(const char *name);
+
+/*
+ * Scratch root for `podvm build` (<base>/build), a sibling of
+ * containers/ so committed layers share its filesystem -- a committed
+ * overlay upper is rename()d into place, and rename cannot cross
+ * filesystems. Caller cleans up after itself.
+ */
+int container_build_dir(char *out, size_t n);
+
 #endif /* CONTAINER_H */
