@@ -849,8 +849,10 @@ static void maybe_autoremove(void) {
  * `podvm rm <name>...` -- delete named containers' persistent state
  * (their writable layer; ADR-026). Missing names are an error, like
  * `docker rm` on a container that does not exist -- silently succeeding
- * would hide typos. Every name is attempted, so one bulk invocation
- * reports all problems; the exit status is non-zero if any failed.
+ * would hide typos. A live name is refused (the same flock that
+ * serializes runs also serializes rm). Every name is attempted, so one
+ * bulk invocation reports all problems; the exit status is non-zero if
+ * any failed.
  */
 static int cmd_rm(int argc, char **argv) {
     int rc = 0;
@@ -884,12 +886,31 @@ static int cmd_rm(int argc, char **argv) {
             rc = 1;
             continue;
         }
-        if (container_rm_rf(dir) < 0) {
-            if (errno == ENOENT) {
+
+        int lockfd = container_lock(name);
+        if (lockfd < 0) {
+            if (errno == EWOULDBLOCK)
+                fprintf(stderr, "podvm: container '%s' is running; "
+                                "stop it before removing it\n", name);
+            else
+                fprintf(stderr, "podvm: cannot lock container '%s': %s\n",
+                        name, strerror(errno));
+            rc = 1;
+            continue;
+        }
+
+        /* Hold the lock across the deletion: a run starting in the same
+         * instant then fails fast instead of booting a VM whose state
+         * dir is being removed underneath it. */
+        int rmc = container_rm_rf(dir);
+        int rme = errno;
+        close(lockfd);
+        if (rmc < 0) {
+            if (rme == ENOENT) {
                 fprintf(stderr, "podvm: no such container: %s\n", name);
             } else {
                 fprintf(stderr, "podvm: cannot remove %s: %s\n",
-                        dir, strerror(errno));
+                        dir, strerror(rme));
             }
             rc = 1;
             continue;
@@ -1210,6 +1231,29 @@ int main(int argc, char **argv) {
                 image_ref);
         fprintf(stderr, "podvm: usage: podvm [options] <image|rootfs> [command]\n");
         return 1;
+    }
+
+    /*
+     * One live container per name. The write-back upper cannot serve
+     * two writers (overlayfs), so a named run on the overlay path takes
+     * an exclusive, non-blocking lock before booting; a second run
+     * fails fast. The QEMU child inherits the fd (no CLOEXEC), so the
+     * lock lives exactly as long as the VM -- even if this process dies
+     * first. Unnamed runs share nothing and --read-only uses a
+     * throwaway tmpfs upper, so neither needs the lock.
+     */
+    int state_lock_fd = -1;
+    if (store_nlayers > 0 && config.name[0] && !config.read_only) {
+        state_lock_fd = container_lock(config.name);
+        if (state_lock_fd < 0) {
+            if (errno == EWOULDBLOCK)
+                fprintf(stderr, "podvm: container '%s' is already running "
+                                "(one live run per name)\n", config.name);
+            else
+                fprintf(stderr, "podvm: cannot lock container '%s': %s\n",
+                        config.name, strerror(errno));
+            return 1;
+        }
     }
 
     /* Setup signal handlers */

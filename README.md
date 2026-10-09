@@ -145,7 +145,8 @@ Named containers keep their writable layer in
 `$XDG_STATE_HOME/podvm/containers/<name>` (defaulting to
 `~/.local/state/...`), so writes made inside the container are visible to
 the next run with the same name. Unnamed runs are throwaway: writes die
-with the VM.
+with the VM. One live run per name: a second `--name` run fails fast
+(an `flock` serializes them), and `podvm rm` refuses a running name.
 
 ### Options
 

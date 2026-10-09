@@ -88,9 +88,16 @@ committing (the part of ADR-020 aimed at `podvm build`) is the natural
 next step to compact it.
 
 Concurrent runs sharing a name would share an overlay upper, which
-overlayfs does not support for two writers. This is not yet guarded; the
-convention (one live container per name) is the same one docker
-enforces, but podvm does not currently detect the conflict.
+overlayfs does not support for two writers. This is guarded: a named
+run takes an exclusive, non-blocking `flock` on
+`$XDG_STATE_HOME/podvm/locks/<name>` before booting and holds it (via
+the inherited fd, so the lock's lifetime is the VM's) until the VM
+exits; a second run fails fast, and `podvm rm` holds the same lock
+across the deletion so it refuses a live name and cannot race a
+starting run. The lock file is never deleted -- its inode is the
+name's identity -- so removing the state dir cannot invalidate a held
+lock. The convention (one live container per name) is the one
+docker enforces; podvm now detects the conflict itself.
 
 ADR-020 is **not superseded** in full. Its guest-module design remains
 the plan for `podvm build` layer commits, which this does not address.

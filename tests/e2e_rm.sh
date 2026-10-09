@@ -114,4 +114,62 @@ timeout "$TIMEOUT_SECS" "$PODVM" -r "$WORK/initramfs.cpio" -n "$NAME" \
 [ ! -e "$CONTAINERS/$NAME" ] || fail "rm did not remove the real container's state"
 
 echo "E2E-RM part 2 PASS: --rm discarded state on exit, rm removed a real container"
+
+# ---- Part 3: the concurrency guard (real VMs) ----
+
+# One live run per name: a named run holds a flock on
+# $XDG_STATE_HOME/podvm/locks/<name> for the VM's lifetime. A second
+# run of the same name must refuse before booting, rm must refuse a
+# live name, and both must work again once the VM is gone.
+NAME2="podvm-lock-e2e"
+
+setsid timeout 60 "$PODVM" -r "$WORK/initramfs.cpio" -n "$NAME2" \
+    "$IMG" /bin/sh -c 'sleep 30' > "$WORK/a.log" 2>&1 &
+APID=$!
+
+# Wait for run A's VM to actually come up (its state dir appears).
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [ -d "$CONTAINERS/$NAME2/u" ] && break
+    sleep 1
+done
+[ -d "$CONTAINERS/$NAME2/u" ] || { cp "$WORK/a.log" "$WORK/last.log"; \
+    fail "run A never created its state dir"; }
+
+# A second run of the same name: refused, with a diagnosis, and no
+# second VM ever boots.
+"$PODVM" -r "$WORK/initramfs.cpio" -n "$NAME2" \
+    "$IMG" /bin/echo second > "$WORK/b.log" 2>&1 \
+    && fail "a second live run of the same name was allowed"
+grep -q "already running" "$WORK/b.log" \
+    || fail "second run did not diagnose the held lock"
+if grep -q "starting QEMU" "$WORK/b.log"; then
+    fail "the guard let a second VM boot"
+fi
+
+# rm refuses a live container.
+"$PODVM" rm "$NAME2" > "$WORK/rm8.log" 2>&1 \
+    && fail "rm of a live container succeeded"
+grep -q "is running" "$WORK/rm8.log" \
+    || fail "rm did not diagnose the live container"
+[ -d "$CONTAINERS/$NAME2/u" ] || fail "rm deleted a live container's state"
+
+# Stop run A's whole process group; the lock must be released.
+kill -TERM -- "-$APID" 2>/dev/null
+wait "$APID" 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    flock -n "$XDG_STATE_HOME/podvm/locks/$NAME2" -c true 2>/dev/null && break
+    sleep 1
+done
+
+# With the VM gone, both run and rm work again.
+timeout "$TIMEOUT_SECS" "$PODVM" -r "$WORK/initramfs.cpio" -n "$NAME2" \
+    "$IMG" /bin/echo third > "$WORK/c.log" 2>&1 \
+    || { cp "$WORK/c.log" "$WORK/last.log"; \
+         fail "run after the VM stopped did not succeed"; }
+"$PODVM" rm "$NAME2" > "$WORK/rm9.log" 2>&1 \
+    || { cp "$WORK/rm9.log" "$WORK/last.log"; \
+         fail "rm after the VM stopped did not succeed"; }
+[ ! -e "$CONTAINERS/$NAME2" ] || fail "rm left the state dir behind"
+
+echo "E2E-RM part 3 PASS: one live run per name; rm refuses a live container"
 exit 0
