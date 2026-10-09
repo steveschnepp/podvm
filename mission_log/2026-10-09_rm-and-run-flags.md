@@ -379,3 +379,111 @@ PASS: 29   WARN: 1   FAIL: 0
    phase (ADR-019/009), FreeBSD (ADR-021).
 
 ---
+
+## Session 4: The flock Guard (2026-10-09)
+
+Closed the last known correctness hole: two live `--name` runs shared
+one overlay upper, which overlayfs does not support for two writers.
+Two commits: primitives (`faefac5`), wiring (`f452182`). Suite after:
+**29 PASS / 1 WARN / 0 FAIL**.
+
+### What We Did
+
+1. **`container_lock(name)`** -- exclusive, non-blocking flock on
+   `$XDG_STATE_HOME/podvm/locks/<name>`, a *sibling* of `containers/`
+   that is never deleted: the lock file's inode is the name's identity,
+   so `rm`/`--rm` deleting the state dir cannot race a starting run
+   into locking a fresh file. The returned fd is deliberately not
+   CLOEXEC -- the QEMU child inherits it, so the lock's lifetime is
+   the VM's, even if the launcher is SIGKILLed.
+2. **Run path**: a named run on the overlay path (podman storage, not
+   `--read-only`) locks before booting; a second run fails fast with a
+   diagnosis and no second VM starts. Unnamed runs and `--read-only`
+   (throwaway tmpfs upper) share nothing and skip the lock.
+3. **`rm` holds the lock across the whole deletion** -- refusing a live
+   name, and closing the TOCTOU window that a probe-then-delete would
+   have left open (a run starting between probe and delete would boot
+   a VM whose state dir is being removed underneath it).
+4. **`e2e_rm.sh` part 3** proves it with real VMs: run A stays alive;
+   a second run of the same name is refused without booting; `rm` is
+   refused while live; after killing A's process group, both work
+   again. The lock-release wait uses `flock(1)` as a host probe.
+
+### What We Learned
+
+#### Technical
+
+- **`flock` is per open-file-description, not per process**: a second
+  `container_lock()` in the same process conflicts, so the whole guard
+  is unit-testable without forks.
+- **Lock the identity, outside the deletable tree.** The first design
+  instinct is a lock file inside the state dir; that re-opens the
+  race the guard exists to close, because deletion changes the inode.
+- **Probe-then-act is TOCTOU.** "Check the lock, release it, then
+  delete" leaves a window; holding the lock across the action closes
+  it for free.
+- **An inherited fd is a lifetime mechanism.** The lock lives exactly
+  as long as the VM with no bookkeeping, no pidfile, no signal
+  handler -- the kernel enforces it.
+
+#### Process
+
+- "Correctness is premium" paid for itself immediately: this was the
+  item that had survived four mission logs as "not yet guarded".
+
+### What We Decided
+
+- Lock files are never deleted (0-byte files accumulating per name
+  ever used is the accepted cost; a future `podvm system` GC can sweep
+  unreferenced ones).
+- Fast-fail, not blocking wait: docker's semantics are "name in use",
+  not queueing.
+- `rm` of a name that never ran may leave its 0-byte lock file behind
+  (harmless; noted, not fixed).
+- `container_locked()` (non-creating probe) stays as the tested
+  building block for a future `podvm ps`.
+
+### Rules Added
+
+- **Any resource shared by name gets a lock file outside the tree that
+  is deleted, and the file is never deleted** -- the inode is the
+  identity.
+- **Hold the lock across the action, not across the check.**
+  Probe-then-act is TOCTOU.
+- **flock is per-OFD**: same-process second opens conflict; tests do
+  not need forks to prove exclusion.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/container.c`/`.h` | `container_lock`, `container_locked`, shared `state_base()` |
+| `src/main.c` | run-path lock before boot; `rm` locks across deletion |
+| `tests/test_container.c` | Lock unit tests (free/held/conflict/EINVAL/location) |
+| `tests/e2e_rm.sh` | Part 3: live-name guard with real VMs |
+| `adrs/podvm_adr026_host-side-writeback.md`, `README.md` | "not yet guarded" replaced with the guard's design |
+
+### Test Results
+
+```
+Container state               PASS   (lock cases added)
+E2E rm (rm + --rm)            PASS   (part 3: run-vs-run + rm-vs-run)
+...
+PASS: 29   WARN: 1   FAIL: 0
+```
+
+### Next Steps
+
+1. `podvm images`/`rmi`/cache GC for `/tmp/podvm/images` (the state-GC
+   twin; the pattern is now proven twice).
+2. `--hostname` (guest already honors `podvm.hostname=`).
+3. ADR-023 cleanup: slirp constants hardcoded in `init.c` +
+   `GUEST_IP_STR` in `main.c` -- a `podvm.net=ip:gw:dns` token before
+   bridge networking lands.
+4. Stale test/doc debt: `test_host_args.c` mocks a CLI that drifted
+   (`-it`); `e2e_imgcfg.sh` header predates ADR-025.
+5. Big rocks unchanged: layer compaction + `podvm build` (ADR-020
+   revisit), the performance phase (ADR-019/009), `-d`/`stop`/`logs`,
+   FreeBSD.
+
+---
