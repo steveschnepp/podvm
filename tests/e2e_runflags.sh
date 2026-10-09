@@ -81,5 +81,38 @@ grep -q "FILE2=second" "$WORK/e3.log" || fail "--env-file second line did not re
 "$PODVM" -e NOEQUALS "$IMG" /bin/true > "$WORK/bad.log" 2>&1 \
     && fail "-e without '=' accepted"
 
-echo "E2E-RUNFLAGS PASS (so far): -e/--env/--env-file reach the guest and override the image"
+# ---- -u/--user ----
+
+# Numeric uid:gid from the CLI.
+run_podvm u1.log -u 1000:1000 "$IMG" /usr/bin/id || fail "-u 1000:1000 run failed"
+cp "$WORK/u1.log" "$WORK/last.log"
+grep -q "uid=1000" "$WORK/u1.log" || fail "-u 1000 did not reach the guest"
+grep -q "gid=1000" "$WORK/u1.log" || fail "-u gid 1000 did not reach the guest"
+
+# A named user, resolved against the CONTAINER's /etc/passwd (userdb,
+# after chroot). alpine ships 'nobody' (uid 65534).
+run_podvm u2.log -u nobody "$IMG" /usr/bin/id || fail "-u nobody run failed"
+cp "$WORK/u2.log" "$WORK/last.log"
+grep -q "uid=65534" "$WORK/u2.log" || fail "-u nobody was not resolved in the container"
+
+# A CLI -u beats the image's USER, and the image's USER still applies
+# when no -u is given. Throwaway image: alpine + appuser(1234) + USER.
+cat > "$WORK/Dockerfile.user" <<'EOF'
+FROM docker.io/library/alpine:latest
+RUN adduser -D -u 1234 appuser
+USER appuser
+CMD ["/usr/bin/id"]
+EOF
+podman build -q -t podvm-e2e-user:test -f "$WORK/Dockerfile.user" "$WORK" \
+    > "$WORK/build.log" 2>&1 || fail "cannot build test image"
+
+run_podvm u3.log -u 7:7 podvm-e2e-user:test /usr/bin/id || fail "-u override run failed"
+cp "$WORK/u3.log" "$WORK/last.log"
+grep -q "uid=7" "$WORK/u3.log" || fail "-u did not override the image's USER"
+
+run_podvm u4.log podvm-e2e-user:test || fail "image-USER run failed"
+cp "$WORK/u4.log" "$WORK/last.log"
+grep -q "uid=1234" "$WORK/u4.log" || fail "image USER no longer applies without -u"
+
+echo "E2E-RUNFLAGS PASS (so far): -e/--env/--env-file and -u/--user reach the guest"
 exit 0

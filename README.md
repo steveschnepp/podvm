@@ -159,6 +159,7 @@ Options:
   -e, --env <K=V>     Set an environment variable (repeatable;
                       overrides the image's value for the key)
       --env-file <f>  Read KEY=VALUE lines from a file
+  -u, --user <spec>   Run as <name|uid>[:<group|gid>]
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
