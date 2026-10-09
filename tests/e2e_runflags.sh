@@ -202,5 +202,35 @@ cp "$WORK/ro2.log" "$WORK/last.log"
 grep -q "READONLY" "$WORK/ro2.log" \
     || fail "--read-only allowed a write on the native-pull path"
 
-echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only behave as specified"
+# ---- -v/--volume + --tmpfs ----
+
+mkdir -p "$WORK/volrw" "$WORK/volro"
+echo "from-host" > "$WORK/volrw/data.txt"
+echo "ro-data" > "$WORK/volro/data.txt"
+
+run_podvm v1.log \
+    -v "$WORK/volrw:/mnt/rw" -v "$WORK/volro:/mnt/ro:ro" --tmpfs /run \
+    "$IMG" /bin/sh -c 'cat /mnt/rw/data.txt; cat /mnt/ro/data.txt; echo scratch > /run/s.txt && echo TMPFSOK; echo more > /mnt/rw/new.txt 2>/dev/null && echo RWOK || echo RWFAIL; echo x > /mnt/ro/no.txt 2>/dev/null && echo ROBROKEN || echo ROFAIL' \
+    || fail "-v/--tmpfs run failed"
+cp "$WORK/v1.log" "$WORK/last.log"
+grep -q "from-host" "$WORK/v1.log" || fail "-v: host file not visible in the guest"
+grep -q "ro-data" "$WORK/v1.log" || fail "-v :ro: host file not visible in the guest"
+grep -q "TMPFSOK" "$WORK/v1.log" || fail "--tmpfs mount not writable"
+grep -q "RWOK" "$WORK/v1.log" || fail "-v rw mount not writable from the guest"
+grep -q "ROFAIL" "$WORK/v1.log" || fail "-v :ro mount allowed a guest write"
+[ -f "$WORK/volrw/new.txt" ] || fail "guest write did not reach the host rw dir"
+grep -q "more" "$WORK/volrw/new.txt" || fail "host-side file has wrong content"
+[ ! -e "$WORK/volro/no.txt" ] || fail "guest wrote through a :ro volume"
+
+# Rejected before any VM starts.
+"$PODVM" -v "$WORK/nonexistent:/mnt" "$IMG" /bin/true > "$WORK/bad7.log" 2>&1 \
+    && fail "-v with a missing host dir accepted"
+"$PODVM" -v "rel:/mnt" "$IMG" /bin/true > "$WORK/bad8.log" 2>&1 \
+    && fail "-v with a relative host path accepted"
+"$PODVM" -v "$WORK:rel" "$IMG" /bin/true > "$WORK/bad9.log" 2>&1 \
+    && fail "-v with a relative target accepted"
+"$PODVM" --tmpfs relative "$IMG" /bin/true > "$WORK/bad10.log" 2>&1 \
+    && fail "--tmpfs with a relative path accepted"
+
+echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only/-v/--tmpfs all behave"
 exit 0

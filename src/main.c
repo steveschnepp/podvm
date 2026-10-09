@@ -142,6 +142,21 @@ static struct {
 } publishes[MAX_PUBLISH];
 static int npublishes = 0;
 
+/* -v/--volume bind mounts, each served to the guest over its own 9p
+ * tag (vol0, vol1, ...) because the rootfs tag is taken. */
+#define MAX_VOLUMES 8
+static struct {
+    char host[CONTAINER_PATH_MAX];     /* host dir (exists at parse time) */
+    char target[CONTAINER_PATH_MAX];   /* absolute path inside the container */
+    int  ro;
+} volumes[MAX_VOLUMES];
+static int nvolumes = 0;
+
+/* --tmpfs scratch mounts (absolute container paths). */
+#define MAX_TMPFS 8
+static char tmpfs_targets[MAX_TMPFS][CONTAINER_PATH_MAX];
+static int ntmpfs = 0;
+
 /*
  * Parse and store one -p spec: [hostip:]hostport:containerport.
  * Numeric ports 1..65535; hostip defaults to 127.0.0.1 (docker's
@@ -190,6 +205,74 @@ bad:
     fprintf(stderr, "podvm: invalid -p '%s' "
                     "(want [hostip:]hostport:containerport, tcp)\n", spec);
     return -1;
+}
+
+/*
+ * Parse and store one -v spec: host-dir:container-dir[:ro]. Both paths
+ * absolute; the host path must be an existing directory (QEMU would
+ * otherwise fail late with a worse message). Colons and commas are
+ * rejected in both paths: commas break QEMU's fsdev option parsing and
+ * colons break the guest-side tag:target:ro split. Docker's volume
+ * names (non-path first field) are not supported -- bind mounts only.
+ */
+static int volume_add(const char *spec) {
+    char buf[CONTAINER_PATH_MAX * 2];
+    int ro = 0;
+
+    if (nvolumes >= MAX_VOLUMES) {
+        fprintf(stderr, "podvm: too many -v entries (max %d)\n", MAX_VOLUMES);
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%s", spec);
+
+    {
+        char *last = strrchr(buf, ':');
+        if (last && !strcmp(last, ":ro")) {
+            *last = '\0';
+            ro = 1;
+        }
+        char *target = strrchr(buf, ':');
+        if (!target) goto bad;
+        *target++ = '\0';
+
+        if (buf[0] != '/' || target[0] != '/') goto bad;
+        if (strchr(buf, ':') || strchr(buf, ',') ||
+            strchr(target, ':') || strchr(target, ',')) goto bad;
+        if (strlen(buf) >= sizeof(volumes[0].host) ||
+            strlen(target) >= sizeof(volumes[0].target)) goto bad;
+
+        struct stat st;
+        if (stat(buf, &st) < 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "podvm: -v host path is not a directory: %s\n", buf);
+            return -1;
+        }
+
+        snprintf(volumes[nvolumes].host, sizeof(volumes[0].host), "%s", buf);
+        snprintf(volumes[nvolumes].target, sizeof(volumes[0].target), "%s", target);
+        volumes[nvolumes].ro = ro;
+        nvolumes++;
+    }
+    return 0;
+
+bad:
+    fprintf(stderr, "podvm: invalid -v '%s' (want absolute-host-dir:"
+                    "absolute-container-dir[:ro])\n", spec);
+    return -1;
+}
+
+/* --tmpfs <dir>: absolute container path for a guest tmpfs mount. */
+static int tmpfs_add(const char *spec) {
+    if (ntmpfs >= MAX_TMPFS) {
+        fprintf(stderr, "podvm: too many --tmpfs entries (max %d)\n", MAX_TMPFS);
+        return -1;
+    }
+    if (spec[0] != '/') {
+        fprintf(stderr, "podvm: --tmpfs path must be absolute: '%s'\n", spec);
+        return -1;
+    }
+    snprintf(tmpfs_targets[ntmpfs], sizeof(tmpfs_targets[0]), "%s", spec);
+    ntmpfs++;
+    return 0;
 }
 
 /* Detect host vsock support via /dev/vhost-vsock */
@@ -391,6 +474,38 @@ static void build_config_tokens(char *buf, size_t len) {
         size_t used = strlen(buf);
         snprintf(buf + used, len - used, " podvm.net=none");
     }
+    if (nvolumes) {
+        /* tag:target:ro|- per element; escape_csv escapes each element
+         * so targets may contain spaces (but not commas/colons --
+         * rejected at parse time). */
+        char volraw[MAX_CMDLINE], volesc[MAX_CMDLINE];
+        size_t voff = 0;
+        volraw[0] = '\0';
+        for (int i = 0; i < nvolumes; i++) {
+            int w = snprintf(volraw + voff, sizeof(volraw) - voff,
+                             "%svol%d:%s:%s", i ? "," : "", i,
+                             volumes[i].target, volumes[i].ro ? "ro" : "-");
+            if (w < 0 || (size_t)w >= sizeof(volraw) - voff) break;
+            voff += (size_t)w;
+        }
+        escape_csv(volesc, sizeof(volesc), volraw);
+        size_t used = strlen(buf);
+        snprintf(buf + used, len - used, " podvm.vol=%s", volesc);
+    }
+    if (ntmpfs) {
+        char traw[MAX_CMDLINE], tesc[MAX_CMDLINE];
+        size_t toff = 0;
+        traw[0] = '\0';
+        for (int i = 0; i < ntmpfs; i++) {
+            int w = snprintf(traw + toff, sizeof(traw) - toff,
+                             "%s%s", i ? "," : "", tmpfs_targets[i]);
+            if (w < 0 || (size_t)w >= sizeof(traw) - toff) break;
+            toff += (size_t)w;
+        }
+        escape_csv(tesc, sizeof(tesc), traw);
+        size_t used = strlen(buf);
+        snprintf(buf + used, len - used, " podvm.tmpfs=%s", tesc);
+    }
 }
 
 /* Build kernel cmdline */
@@ -572,9 +687,13 @@ static int start_qemu(void) {
     char vsock_cid_str[32];
     char netdev_str[512];
 
-    /* Bounded argv so we can conditionally append the vsock device. */
-    const char *qargs[64];
+    /* Bounded argv so we can conditionally append the vsock device and
+     * one fsdev+device pair per -v volume. */
+    const char *qargs[128];
     int qi = 0;
+    char vol_fsdev[MAX_VOLUMES][MAX_PATH + 64];
+    char vol_dev[MAX_VOLUMES][64];
+    char vol_tag[MAX_VOLUMES][16];
 
     build_cmdline(cmdline, sizeof(cmdline));
     snprintf(memory_str, sizeof(memory_str), "%dM", config.memory);
@@ -609,6 +728,19 @@ static int start_qemu(void) {
     /* 9p filesystem share (in-process; no daemon needed) */
     qargs[qi++] = "-fsdev";   qargs[qi++] = fsdev_str;
     qargs[qi++] = "-device";  qargs[qi++] = "virtio-9p-pci,fsdev=fsdev0,mount_tag=rootfs";
+    /* -v volumes: one fsdev + 9p device each, tags vol0..volN. The
+     * guest mounts them at the requested targets after chroot. */
+    for (int i = 0; i < nvolumes; i++) {
+        snprintf(vol_tag[i], sizeof(vol_tag[i]), "vol%d", i);
+        snprintf(vol_fsdev[i], sizeof(vol_fsdev[i]),
+                 "local,id=%s,path=%s,security_model=none%s",
+                 vol_tag[i], volumes[i].host,
+                 volumes[i].ro ? ",readonly=on" : "");
+        snprintf(vol_dev[i], sizeof(vol_dev[i]),
+                 "virtio-9p-pci,fsdev=%s,mount_tag=%s", vol_tag[i], vol_tag[i]);
+        qargs[qi++] = "-fsdev";  qargs[qi++] = vol_fsdev[i];
+        qargs[qi++] = "-device"; qargs[qi++] = vol_dev[i];
+    }
     /* User-mode networking (slirp): in-process, no daemon, no root,
      * no host state (ADR-023). Guest gets DHCP 10.0.2.15, DNS at
      * 10.0.2.3, gateway 10.0.2.2. Bridge/tap returns in the
@@ -769,7 +901,7 @@ static int cmd_rm(int argc, char **argv) {
 
 /* Long-only options: --rm has no short form (-r is taken by --initramfs). */
 enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002,
-       OPT_READONLY = 1003 };
+       OPT_READONLY = 1003, OPT_TMPFS = 1004 };
 
 /* Print usage */
 static void usage(const char *prog) {
@@ -789,6 +921,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "                      [hostip:]hostport:containerport (tcp)\n");
     fprintf(stderr, "      --network <mode>  slirp (default) or none (no network)\n");
     fprintf(stderr, "      --read-only     Mount the container rootfs read-only\n");
+    fprintf(stderr, "  -v, --volume <h:t[:ro]>  Bind-mount a host directory into\n");
+    fprintf(stderr, "                      the container (both paths absolute)\n");
+    fprintf(stderr, "      --tmpfs <dir>   Mount a tmpfs at <dir> in the container\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -833,6 +968,8 @@ int main(int argc, char **argv) {
         {"publish",     required_argument, 0, 'p'},
         {"network",     required_argument, 0, OPT_NETWORK},
         {"read-only",   no_argument,       0, OPT_READONLY},
+        {"tmpfs",       required_argument, 0, OPT_TMPFS},
+        {"volume",      required_argument, 0, 'v'},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -841,7 +978,7 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:ie:u:w:p:m:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:ie:u:w:p:v:m:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
@@ -883,6 +1020,12 @@ int main(int argc, char **argv) {
             break;
         case OPT_READONLY:
             config.read_only = 1;
+            break;
+        case 'v':
+            if (volume_add(optarg) < 0) return 1;
+            break;
+        case OPT_TMPFS:
+            if (tmpfs_add(optarg) < 0) return 1;
             break;
         case 'm':
             config.memory = atoi(optarg);

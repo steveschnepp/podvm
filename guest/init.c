@@ -38,6 +38,7 @@
 #include "userdb.h"
 
 #define MAX_ARGS      64
+#define MAX_VOLUMES   8    /* -v bind mounts + --tmpfs targets */
 #define PATH_SIZE     1024
 #define CMDLINE_SIZE  4096
 #define MAX_ARG_VAL   256   /* matches the host's args[] buffer */
@@ -62,6 +63,10 @@ typedef struct {
                             * /etc/passwd + /etc/group (see userdb.c) */
     int  gid;
     int  net_none;         /* podvm.net=none: no netdev, skip eth0 */
+    char *vols[MAX_VOLUMES];  /* "tag:target:ro|-" from podvm.vol= */
+    int  nvol;
+    char *tmpfs[MAX_VOLUMES]; /* target dirs from podvm.tmpfs= */
+    int  ntmpfs;
 } Config;
 
 /* Read /proc/cmdline */
@@ -142,6 +147,27 @@ static void parse_config(Config *cfg, const char *text) {
         kv_unescape(tok);
         if (strcmp(tok, "none") == 0)
             cfg->net_none = 1;
+    }
+
+    /* podvm.vol= / podvm.tmpfs=: csv lists; csv_parse unescapes each
+     * field, so targets may carry spaces. Re-parses (vsock overriding
+     * cmdline) free the previous fields, like args/env. */
+    val = kv_find(text, "podvm.vol=");
+    if (val) {
+        char tok[CMDLINE_SIZE];
+        kv_copy_value(tok, sizeof(tok), val);
+        csv_free(cfg->vols, cfg->nvol);
+        cfg->nvol = (strcmp(tok, "-") == 0)
+                  ? 0 : csv_parse(tok, cfg->vols, MAX_VOLUMES);
+    }
+
+    val = kv_find(text, "podvm.tmpfs=");
+    if (val) {
+        char tok[CMDLINE_SIZE];
+        kv_copy_value(tok, sizeof(tok), val);
+        csv_free(cfg->tmpfs, cfg->ntmpfs);
+        cfg->ntmpfs = (strcmp(tok, "-") == 0)
+                    ? 0 : csv_parse(tok, cfg->tmpfs, MAX_VOLUMES);
     }
 }
 
@@ -430,6 +456,48 @@ int main(void) {
             static const char resolv[] = "nameserver " SLIRP_DNS "\n";
             (void)!write(fd, resolv, sizeof(resolv) - 1);
             close(fd);
+        }
+    }
+
+    /* Step 6c: Extra mounts. -v volumes arrive over their own 9p tags
+     * (the rootfs tag is taken by the rootfs itself); --tmpfs targets
+     * get a guest-side tmpfs. Targets are container paths, so this runs
+     * after chroot. Best-effort: a failed mount warns and the container
+     * still starts (podvm's posture elsewhere; docker would refuse). */
+    for (int i = 0; i < cfg.nvol; i++) {
+        char spec[PATH_SIZE];
+        snprintf(spec, sizeof(spec), "%s", cfg.vols[i]);
+
+        char *ct = strchr(spec, ':');
+        if (!ct) {
+            fprintf(stderr, "podvm-init: bad vol spec '%s'\n", cfg.vols[i]);
+            continue;
+        }
+        *ct++ = '\0';                    /* spec = tag, ct = target[:ro|-] */
+        char *flag = strrchr(ct, ':');
+        int readonly = 0;
+        if (flag) {
+            *flag++ = '\0';
+            readonly = (strcmp(flag, "ro") == 0);
+        }
+
+        mkdir_p(ct, 0755);
+        if (mount(spec, ct, "9p", readonly ? MS_RDONLY : 0,
+                  "trans=virtio,version=9p2000.L") < 0) {
+            fprintf(stderr, "podvm-init: volume %s -> %s: %s\n",
+                    spec, ct, strerror(errno));
+        } else {
+            fprintf(stderr, "podvm-init: volume %s -> %s%s\n",
+                    spec, ct, readonly ? " (ro)" : "");
+        }
+    }
+    for (int i = 0; i < cfg.ntmpfs; i++) {
+        mkdir_p(cfg.tmpfs[i], 0755);
+        if (mount("tmpfs", cfg.tmpfs[i], "tmpfs", 0, NULL) < 0) {
+            fprintf(stderr, "podvm-init: tmpfs %s: %s\n",
+                    cfg.tmpfs[i], strerror(errno));
+        } else {
+            fprintf(stderr, "podvm-init: tmpfs %s\n", cfg.tmpfs[i]);
         }
     }
 

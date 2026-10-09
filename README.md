@@ -166,6 +166,9 @@ Options:
                       [hostip:]hostport:containerport (tcp)
       --network <mode>  slirp (default) or none (no network)
       --read-only     Mount the container rootfs read-only
+  -v, --volume <h:t[:ro]>  Bind-mount a host directory into the
+                      container (both paths absolute)
+      --tmpfs <dir>   Mount a tmpfs at <dir> in the container
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path
