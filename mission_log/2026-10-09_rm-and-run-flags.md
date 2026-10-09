@@ -486,3 +486,178 @@ PASS: 29   WARN: 1   FAIL: 0
    FreeBSD.
 
 ---
+
+## Session 5: images/rmi, --hostname, build, and the Detached Lifecycle (2026-10-09)
+
+Four work items in one sitting, one commit each (plus one correctness
+commit that fell out of the design work):
+
+1. **`podvm images` / `rmi` + `--hostname`** (`87a370a`). The cache
+   (`/tmp/podvm/images`) got a listing, removal with docker
+   semantics, and a shared/exclusive flock guard mirroring the
+   container-name one -- a run serving a cached rootfs holds SHARED,
+   `rmi` takes EXCLUSIVE, so a live container's image cannot be
+   deleted under it. Lock files live in `<cache>-locks/`, never
+   deleted (inode = identity). Cache layout flattened
+   (`docker.io/library+alpine/latest`) because the nested repo path
+   made a listing walk ambiguous -- "library" + tag "alpine" vs repo
+   "library/alpine" + tag "latest" were structurally identical. Old
+   cache entries invalidated (a /tmp cache re-pulls). `--hostname`
+   needed only the host flag and the token; guest init already
+   honored `podvm.hostname=`.
+2. **Channel comma fix** (`f6879b2`), forced into the open by build's
+   `ENV`: `podvm -e X=a,b` reached the guest as `X=a`. See "What We
+   Learned" -- this one was worth its own commit.
+3. **`podvm build`** (`e9f690a` parser, `e0703eb` driver). Dockerfile
+   -> podvm-native image in the cache, runnable by tag. Each RUN is a
+   real VM: chain = [committed layers, FROM...] as lowers with a
+   fresh named-container upper; the upper IS the commit (rename into
+   the build dir, same filesystem). Whiteouts travel as overlay's own
+   char 0:0 devices between steps; final assembly is a host-side
+   userns overlay + `cp --no-preserve=ownership` so the kernel does
+   the merging. COPY/metadata are host-side; the final
+   `.podvm-config.json` is the OCI shape the run path already reads.
+   A failing RUN aborts the build with no image and no stray state.
+   RUN scripts ride in a file in the step's upper
+   (`/.podvm-step.sh`) -- no channel length/separator limits.
+4. **`-d/--detach` + `stop` + `logs`** (`b25c2a3`). Daemon-less
+   lifecycle: `-d` (requires `--name`; rejects `--rm`/`-i`) hands the
+   VM over -- serial to `<state>/log`, pidfile written, QEMU holding
+   the inherited locks. `stop` SIGTERMs the pidfile pid after
+   verifying /proc cmdline is THIS container's QEMU, waits for the
+   name lock (the ground truth for "the upper is free"), SIGKILLs
+   after 10s. `logs` streams the serial file.
+
+Suite after: **33 PASS / 1 WARN / 0 FAIL** (up from 29).
+
+### What We Learned
+
+#### Technical
+
+- **A test assertion must never be satisfiable by the code under
+  test's own output.** The old `-e CSV=a,b,c` e2e "passed" because
+  `grep CSV=a,b,c` matched the host's own `cmdline:` echo -- the same
+  line that showed the value being *broken*. The real bug (commas
+  split as field separators) lived for a session behind a green
+  check. After the fix, the cmdline echo shows escaped values, so the
+  assertion is sound by construction.
+- **Escape csv fields where they are BUILT.** The encoder split the
+  raw list on every comma and then escaped the pieces -- by which
+  point a data comma was indistinguishable from a separator. Escaping
+  moved to the argv join, `-e`, the imgcfg fold, and the volume lists
+  (the only sites that know), and `csv_encode` became a
+  split-on-unescaped-comma pass-through. Wire format unchanged for
+  plain values; the guest needed no change.
+- **Guest exit codes never reached the host.** QEMU's status is
+  meaningless for a guest panic, so `podvm run cmd` could not tell a
+  script that cmd failed -- exposed by build's "failing RUN must fail
+  the build" test. The guest now runs the entrypoint as a child,
+  waits, and reports the code over vsock to a host helper process
+  (cid host:5001 -> pipe). true->0, false->1, `sh -c "exit 42"`->42.
+- **`/proc/<pid>/cmdline` is NUL-separated argv.** `strstr` over it
+  only ever matches within the first argument; `stop`'s "is this our
+  QEMU" check looked at argv[0] alone and every stop looked stale.
+  Map NULs to spaces before scanning.
+- **`config.args[256]` was a time bomb**: any real `sh -c` script
+  overflowed it, and the old join even wrote out of bounds past the
+  buffer. The new overflow guard turned silent corruption into
+  truncation, which surfaced the limit; buffers are now 4096 host and
+  guest, and overflow is a hard error.
+- **`pkill -f <pattern>` kills the shell running it** when the pattern
+  appears in your own command line (the `pgrep -f` lesson, now with a
+  dead shell). Anchor on the binary path.
+- **A pipeline's `$?` is the last command's** -- a `podvm stop ... |
+  head` "success" was head's exit code, and a real failure read as a
+  flake until a debug fprintf ended the speculation.
+- **A missing installed initramfs looks like a guest bug**: QEMU exits
+  with zero serial output. `start_qemu` now validates kernel+initramfs
+  up front; `build` gained `-r`/`-k` pass-through.
+- **The vsock CID is hardcoded to 3**, so only ONE vsock VM can exist
+  at a time -- an orphaned QEMU from a debug session made the next
+  VM's `vhost-vsock` attach fail. Newly visible now that background
+  VMs exist.
+- **cp -a chown on unmapped uids fails with EINVAL** (root-owned files
+  are nobody inside the build userns); `--no-preserve=ownership`
+  matches the pull path, which never had CAP_CHOWN either.
+
+#### Process
+
+- **The fork/wait exit-code change touched every run**, so the
+  behavior-sensitive e2es (boot, interactive, net) were re-run before
+  committing, not just the new one.
+- Designing build's `ENV` is what surfaced the comma bug; designing
+  its failure path is what surfaced the exit-code gap. Features that
+  stress shared plumbing find its oldest wounds -- write the
+  stress-ful test first.
+
+### What We Decided
+
+- Build output lives in the same cache as pulls, at the path a run
+  would look up -- "if you can build it, you can run it by its tag."
+  Untagged `-t` names land in the docker.io namespace (v1
+  compromise; podman's `localhost/` could come later).
+- v1 build scope: one stage, shell-form RUN, no ADD/VOLUME/ARG;
+  EXPOSE/LABEL accepted and ignored; native image format only (no OCI
+  blob export, so `podman load` compat is future work).
+- Detached runs reject `--rm` (no supervisor to clean up) and `-i`
+  (no owner for stdin); a >2KB config warns (kernel cmdline limit,
+  no vsock channel).
+- `stop` verifies identity via /proc cmdline before signalling, and
+  treats the name lock -- not the pidfile -- as the truth about
+  whether the upper is free.
+
+### Rules Added
+
+- **Assertions must not match the code under test's own output**;
+  prefer markers whose on-wire form differs from any debug echo.
+- **Escape delimiter-bearing fields where they are built**, never in
+  the encoder -- the encoder cannot tell separators from data.
+- **An exit code needs an explicit channel**; never assume a VMM's
+  status reflects the guest command's.
+- **`/proc/<pid>/cmdline` is NUL-separated**: map to spaces before
+  substring matching.
+- **Anchor `pkill -f`/`pgrep -f`** on the binary path (self-match is
+  fatal).
+- **Read the status you mean**: a pipeline reports its last command.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/image.c`/`.h` | Cache list/path/lock; repo flattening (`+`) |
+| `src/build.c`/`.h` | Dockerfile parser, COPY, env-set |
+| `src/main.c` | `images`/`rmi`/`build`/`stop`/`logs`, `--hostname`, `-d`, exit helper, csv_encode contract, early kernel/initramfs validation |
+| `src/container.c`/`.h` | `container_build_dir`, `container_lock_unlink` |
+| `guest/init.c` | fork/wait entrypoint + vsock exit report; bigger arg/env buffers |
+| `src/imgcfg.c` | Escaping at fold time; escape-aware user-args split |
+| `tests/test_build.c`, `tests/test_imgcfg.c` | Parser + escaping cases |
+| `tests/e2e_images.sh`, `e2e_build.sh`, `e2e_detach.sh` | New e2es (3 VM-heavy suites) |
+| `tests/run_tests.sh`, `tests/Makefile`, `CMakeLists.txt`, `README.md` | Wiring + docs |
+
+### Test Results
+
+```
+Build parser                  PASS   (new)
+E2E run flags (podman parity) PASS   (+ --hostname)
+E2E build (Dockerfile)        PASS   (new)
+E2E detach (-d/stop/logs)     PASS   (new)
+E2E images/rmi (cache)        PASS   (new)
+...
+PASS: 33   WARN: 1   FAIL: 0
+```
+
+### Next Steps
+
+1. **Unique vsock CIDs per VM** (hardcoded 3 = one vsock VM at a
+   time; an orphan blocks the next boot). Now the top correctness
+   item.
+2. **OCI blob export from build** (`podman load` compat) and a build
+   cache (reuse committed layers across builds; multi-stage).
+3. ADR-023 cleanup: per-container slirp constants via a token.
+4. Stale debt: `test_host_args.c` mocks a drifted CLI;
+   `e2e_imgcfg.sh` header predates ADR-025.
+5. Detach polish: `logs -f`/`--tail`, restart policies.
+6. Big rocks: layer compaction, the performance phase (ADR-019/009),
+   FreeBSD (ADR-021).
+
+---
