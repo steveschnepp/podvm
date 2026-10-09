@@ -143,6 +143,11 @@ podvm rm build
 # Build a Dockerfile into a runnable image (RUN steps boot real VMs)
 podvm build -t myapp:1 ./myapp-dir
 podvm myapp:1
+
+# Run a service in the background, then read its log and stop it
+podvm -d -n web -p 18080:80 alpine /bin/sh -c '...'
+podvm logs web
+podvm stop web
 ```
 
 Named containers keep their writable layer in
@@ -161,6 +166,8 @@ Usage: podvm [options] <image|rootfs-dir> [command] [args...]
 Options:
   -i, --interactive   Give the guest stdin exclusively
                       (default: QEMU monitor shares it; Ctrl-A C)
+  -d, --detach        Run in the background (requires --name; serial
+                      goes to <state>/log; stop with `podvm stop`)
   -e, --env <K=V>     Set an environment variable (repeatable;
                       overrides the image's value for the key)
       --env-file <f>  Read KEY=VALUE lines from a file
@@ -188,6 +195,8 @@ Options:
 
 Subcommands:
   rm <name>...        Delete named containers' persistent state
+  stop <name>...      Stop detached containers
+  logs <name>         Print a detached container's serial log
   images              List cached images
   rmi <image>...      Remove cached images (refused while in use)
   build               Build a Dockerfile into a cached image

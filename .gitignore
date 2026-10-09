@@ -21,6 +21,7 @@ tests/test_sha256
 tests/test_imgcfg
 tests/test_userdb
 tests/test_container
+tests/test_build
 
 # Debug/build logs (output capture)
 out/
