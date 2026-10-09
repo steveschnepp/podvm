@@ -41,7 +41,7 @@
 #define MAX_VOLUMES   8    /* -v bind mounts + --tmpfs targets */
 #define PATH_SIZE     1024
 #define CMDLINE_SIZE  4096
-#define MAX_ARG_VAL   256   /* matches the host's args[] buffer */
+#define MAX_ARG_VAL   4096  /* matches the host's args[] buffer */
 #define MAX_ENV_VAL   1100  /* matches the host's env[] buffer (1024) */
 
 /* vsock config channel (must match host) */

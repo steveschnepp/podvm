@@ -143,6 +143,32 @@ int main(void) {
         CHECK(strcmp(out.env, "FOO=bar,HOME=/root") == 0);
     }
 
+    /* 9. Escaping: image Cmd words with spaces/commas become escaped
+     * csv fields; env values with commas survive (the fold is the last
+     * place that knows which commas separate fields). */
+    {
+        const char *cmd[] = {"sh", "-c", "echo hi,there", NULL};
+        const char *env[] = {"MSG=a,b", NULL};
+        mk_icfg(&ic, NULL, cmd, env, NULL, NULL);
+        memset(&base, 0, sizeof(base));
+        imgcfg_fold(&ic, &base, &out);
+        CHECK(strcmp(out.entrypoint, "sh") == 0);
+        CHECK(strcmp(out.args, "-c,echo\\ hi\\,there") == 0);
+        CHECK(strcmp(out.env, "MSG=a\\,b,HOME=/root") == 0);
+    }
+
+    /* 10. The user's own args arrive pre-escaped and must not be
+     * double-escaped; their commas are separators, not data. */
+    {
+        mk_icfg(&ic, NULL, NULL, NULL, NULL, NULL);
+        memset(&base, 0, sizeof(base));
+        snprintf(base.entrypoint, sizeof(base.entrypoint), "%s", "/bin/echo");
+        snprintf(base.args, sizeof(base.args), "%s", "a\\,b,c");
+        imgcfg_fold(&ic, &base, &out);
+        CHECK(strcmp(out.entrypoint, "/bin/echo") == 0);
+        CHECK(strcmp(out.args, "a\\,b,c") == 0);
+    }
+
     /* 8. cwd/user: image supplies when base has none. */
     {
         mk_icfg(&ic, NULL, NULL, NULL, "/app", "1000:1000");

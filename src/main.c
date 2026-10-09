@@ -48,7 +48,7 @@ static struct {
     char initramfs[MAX_PATH];
     char rootfs_dir[MAX_PATH];
     char entrypoint[MAX_PATH];
-    char args[256];
+    char args[4096];       /* csv of escaped argv elements (guest tok[] matches) */
     char env[1024];
     char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
@@ -361,30 +361,32 @@ static void escape_value(char *dst, size_t dstsz, const char *src) {
 }
 
 /*
- * Escape a comma-joined list element-wise. The separators are real
- * commas; each element is escaped so any comma or space *inside* an
- * element survives. Escaping the whole string at once would also escape
- * the separators and collapse the list into one field on the guest.
+ * Encode a csv list for the wire. FIELDS MUST ARRIVE ALREADY ESCAPED
+ * (kv_escape): this only splits on *unescaped* commas and rejoins with
+ * raw commas, so a comma inside a field survives the trip.
+ *
+ * It deliberately does not escape. Escaping happens where fields are
+ * built (the argv join, env_add, imgcfg, -v/--tmpfs lists) -- the only
+ * places that know which commas are separators and which are data.
+ * Escaping here, after a raw join, could not tell them apart: that is
+ * exactly how 'podvm -e X=a,b' lost the ',b' (the guest saw two
+ * fields). The guest's csv_parse already splits on unescaped commas
+ * and unescapes fields, so the wire format is unchanged for values
+ * without special characters.
  */
-static void escape_csv(char *dst, size_t dstsz, const char *raw) {
+static void csv_encode(char *dst, size_t dstsz, const char *raw) {
     size_t off = 0;
     dst[0] = '\0';
-    if (!raw || !raw[0]) return;
-
     const char *p = raw;
-    while (*p) {
-        char elem[512];
-        size_t n = 0;
-        while (*p && *p != ',' && n + 1 < sizeof(elem)) elem[n++] = *p++;
-        elem[n] = '\0';
-        if (*p == ',') p++;
-
-        char esc[sizeof(elem) * 2];
-        escape_value(esc, sizeof(esc), elem);
-        int w = snprintf(dst + off, dstsz - off, "%s%s", off ? "," : "", esc);
-        if (w < 0 || (size_t)w >= dstsz - off) break;
-        off += (size_t)w;
+    while (*p && off + 1 < dstsz) {
+        if (*p == '\\' && p[1] && off + 2 < dstsz) {
+            dst[off++] = *p++;          /* escaped pair: verbatim */
+            dst[off++] = *p++;
+            continue;
+        }
+        dst[off++] = *p++;              /* field char or separator */
     }
+    dst[off] = '\0';
 }
 
 /*
@@ -394,13 +396,22 @@ static void escape_csv(char *dst, size_t dstsz, const char *raw) {
  * Returns -1 (with a message) on malformed input or overflow.
  */
 static int env_add(const char *kv) {
-    if (!strchr(kv, '=')) {
+    const char *eq = strchr(kv, '=');
+    if (!eq) {
         fprintf(stderr, "podvm: env entry must be KEY=VALUE: '%s'\n", kv);
         return -1;
     }
+    /* Escape the VALUE now: this is the last place that knows which
+     * commas in the entry are data (csv_encode will not re-escape). */
+    char esc[2048];
+    if (kv_escape(esc, sizeof(esc), eq + 1) == (size_t)-1) {
+        fprintf(stderr, "podvm: env value too long: '%s'\n", kv);
+        return -1;
+    }
+    size_t klen = (size_t)(eq - kv);        /* key, without '=' */
     size_t have = strlen(config.env);
     int w = snprintf(config.env + have, sizeof(config.env) - have,
-                     "%s%s", have ? "," : "", kv);
+                     "%s%.*s=%s", have ? "," : "", (int)klen, kv, esc);
     if (w < 0 || (size_t)w >= sizeof(config.env) - have) {
         fprintf(stderr, "podvm: too many/large -e values (env list is %zu bytes)\n",
                 sizeof(config.env));
@@ -445,7 +456,11 @@ static void build_config_tokens(char *buf, size_t len) {
     char cwd[MAX_PATH * 2], user[sizeof(config.user) * 2];
 
     escape_value(entry, sizeof(entry), config.entrypoint);
-    escape_csv(args, sizeof(args), config.args[0] ? config.args : "-");
+    {
+        /* args/env csv fields are pre-escaped by their builders (argv
+         * join, env_add, imgcfg); csv_encode only preserves them. */
+        csv_encode(args, sizeof(args), config.args[0] ? config.args : "-");
+    }
 
     /* HOME is ensured for images by imgcfg_fold(); do the same here so
      * the bare-rootfs path (and -e with no image) also always has one,
@@ -456,7 +471,7 @@ static void build_config_tokens(char *buf, size_t len) {
                  strstr(config.env, "HOME=") ? "" : ",HOME=/root");
     else
         snprintf(envraw, sizeof(envraw), "HOME=/root");
-    escape_csv(env, sizeof(env), envraw);
+    csv_encode(env, sizeof(env), envraw);
     escape_value(cwd, sizeof(cwd), config.cwd[0] ? config.cwd : "/");
     escape_value(user, sizeof(user), config.user[0] ? config.user : "-");
 
@@ -483,13 +498,16 @@ static void build_config_tokens(char *buf, size_t len) {
         size_t voff = 0;
         volraw[0] = '\0';
         for (int i = 0; i < nvolumes; i++) {
+            char elem[2048], escelem[4096];
+            snprintf(elem, sizeof(elem), "vol%d:%s:%s", i,
+                     volumes[i].target, volumes[i].ro ? "ro" : "-");
+            escape_value(escelem, sizeof(escelem), elem);
             int w = snprintf(volraw + voff, sizeof(volraw) - voff,
-                             "%svol%d:%s:%s", i ? "," : "", i,
-                             volumes[i].target, volumes[i].ro ? "ro" : "-");
+                             "%s%s", i ? "," : "", escelem);
             if (w < 0 || (size_t)w >= sizeof(volraw) - voff) break;
             voff += (size_t)w;
         }
-        escape_csv(volesc, sizeof(volesc), volraw);
+        csv_encode(volesc, sizeof(volesc), volraw);
         size_t used = strlen(buf);
         snprintf(buf + used, len - used, " podvm.vol=%s", volesc);
     }
@@ -498,12 +516,14 @@ static void build_config_tokens(char *buf, size_t len) {
         size_t toff = 0;
         traw[0] = '\0';
         for (int i = 0; i < ntmpfs; i++) {
+            char escelem[4096];
+            escape_value(escelem, sizeof(escelem), tmpfs_targets[i]);
             int w = snprintf(traw + toff, sizeof(traw) - toff,
-                             "%s%s", i ? "," : "", tmpfs_targets[i]);
+                             "%s%s", i ? "," : "", escelem);
             if (w < 0 || (size_t)w >= sizeof(traw) - toff) break;
             toff += (size_t)w;
         }
-        escape_csv(tesc, sizeof(tesc), traw);
+        csv_encode(tesc, sizeof(tesc), traw);
         size_t used = strlen(buf);
         snprintf(buf + used, len - used, " podvm.tmpfs=%s", tesc);
     }
@@ -1243,12 +1263,22 @@ int main(int argc, char **argv) {
         strncpy(config.entrypoint, argv[optind], MAX_PATH - 1);
         optind++;
 
-        /* Build args string */
+        /* Build args string. Each argv element is escaped HERE -- the
+         * last place that knows which commas are separators -- so an
+         * argument containing a comma reaches the guest intact
+         * (csv_encode will not re-escape). */
         char *p = config.args;
         char *end = config.args + sizeof(config.args) - 1;
         for (int j = optind; j < argc && p < end; j++) {
             if (j > optind) *p++ = ',';
-            int n = snprintf(p, end - p, "%s", argv[j]);
+            char esc[4096];
+            if (kv_escape(esc, sizeof(esc), argv[j]) == (size_t)-1)
+                snprintf(esc, sizeof(esc), "");
+            int n = snprintf(p, (size_t)(end - p), "%s", esc);
+            if (n < 0 || p + n >= end) {
+                fprintf(stderr, "podvm: command too long for the config channel\n");
+                return 1;
+            }
             p += n;
         }
         *p = '\0';

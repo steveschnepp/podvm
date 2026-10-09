@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg test_userdb test_container
+TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg test_userdb test_container test_build
 
 .PHONY: all test clean
 
@@ -41,8 +41,8 @@ test_sha256: test_sha256.c ../src/sha256.c ../src/sha256.h
 	$(CC) $(CFLAGS) -o $@ test_sha256.c ../src/sha256.c -I../src
 
 # Image-config fold tests (pure logic, no deps)
-test_imgcfg: test_imgcfg.c ../src/imgcfg.c ../src/imgcfg.h ../src/image.h
-	$(CC) $(CFLAGS) -o $@ test_imgcfg.c ../src/imgcfg.c -I../src
+test_imgcfg: test_imgcfg.c ../src/imgcfg.c ../src/imgcfg.h ../src/image.h ../src/strparse.c ../src/strparse.h
+	$(CC) $(CFLAGS) -o $@ test_imgcfg.c ../src/imgcfg.c ../src/strparse.c -I../src
 
 # User resolution tests (pure logic, no deps)
 test_userdb: test_userdb.c ../src/userdb.c ../src/userdb.h
@@ -51,6 +51,10 @@ test_userdb: test_userdb.c ../src/userdb.c ../src/userdb.h
 # Container state tests (name validation, state dir, rm -rf; no deps)
 test_container: test_container.c ../src/container.c ../src/container.h
 	$(CC) $(CFLAGS) -o $@ test_container.c ../src/container.c -I../src
+
+# Build parser tests (pure logic, no deps)
+test_build: test_build.c ../src/build.c ../src/build.h
+	$(CC) $(CFLAGS) -o $@ test_build.c ../src/build.c -I../src
 
 # Run all tests
 test: $(TESTS)
@@ -82,6 +86,9 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== Container State Tests ==="
 	./test_container || true
+	@echo ""
+	@echo "=== Build Parser Tests ==="
+	./test_build || true
 	@echo ""
 	@echo "All tests complete!"
 
