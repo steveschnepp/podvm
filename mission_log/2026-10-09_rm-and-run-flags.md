@@ -154,3 +154,115 @@ PASS: 28   WARN: 1   FAIL: 0
    performance phase (ADR-019/009), FreeBSD (ADR-021).
 
 ---
+
+## Session 2: Tier-1 Podman Flag Parity (2026-10-09)
+
+Implemented the three flags whose plumbing already existed: `-e/--env`
+(+`--env-file`), `-u/--user`, `-w/--workdir`. One commit per flag, each
+with its own e2e rows, so all three bisect cleanly.
+
+### What We Did
+
+1. **`-e/--env` + `--env-file` (`9f182d7`).** `config.env` and the
+   escape channel (ADR-025) already existed, but nothing fed them from
+   the CLI and `imgcfg_fold()` silently dropped `base.env` (it was
+   always zeroed -- the field had no writer). Fixed the plumbing, and
+   **flipped the fold's env order**: image vars first, then CLI vars.
+   The guest `setenv`s in list order (later wins), so the old
+   "base first" order would have made the image *beat* `-e` on a
+   duplicated key -- exactly backwards from docker. Also started
+   ensuring `HOME` in `build_config_tokens()` so the bare-rootfs path
+   (where the fold never runs) matches the image path.
+2. **`-u/--user` (`91222ed`).** Pure flag: `userdb.c` had resolved
+   names against the container's `/etc/passwd` after chroot since the
+   previous session; the CLI just could not ask for it. e2e proves
+   numeric, named (`nobody`), CLI-over-image-`USER`, and
+   image-`USER`-without-`-u` in both directions.
+3. **`-w/--workdir` (`8d9b421`).** Flag plus one guest behavior change:
+   docker creates a missing WORKDIR, so guest init now `mkdir_p`s the
+   cwd and only warns (continuing in `/`) if that cannot work (e.g.
+   read-only rootfs). Previously a nonexistent cwd silently landed the
+   command in `/`.
+4. **Drive-by fix (`e0df1fe`):** the guest's `resolv.conf` write passed
+   a hardcoded 22 for a 21-byte literal (1-byte overread, flagged by
+   the compiler once `init.c` was rebuilt). `sizeof - 1` now.
+
+One e2e script grew with the session: `tests/e2e_runflags.sh`, wired
+into `run_tests.sh` as "E2E run flags (-e/-u/-w)".
+
+### What We Learned
+
+#### Technical
+
+- **A precedence rule no caller exercises is untested.**
+  `imgcfg_fold()`'s `base.env` branch was dead code (nothing set
+  `base.env`), and its order was wrong for the CLI case. The 12 table
+  cases all passed while the rule they were written to protect would
+  have failed the moment `-e` existed. Wire the input, then trust the
+  order.
+- **The guest's env application order is the real override mechanism.**
+  `setenv(k, v, 1)` in list order means "last entry wins"; host-side
+  ordering is therefore a semantic decision, not a cosmetic one.
+- **Nothing tests the short-flag matrix of the real binary.**
+  `test_host_args.c` parses a mock copy; the e2e scripts never pass
+  `-m/-c/-k/-r`. Dropping `m:` from the optstring while adding `e:`
+  would have shipped unnoticed -- caught only by re-reading the diff.
+
+#### Process
+
+- **The mission-log linter is stricter than the earlier logs assumed**
+  (same-day `- Previous:` chains, required "What We'd Do Differently",
+  frontmatter on every log). Because it judges the whole directory, one
+  new log surfaced findings in five old ones; fixed retroactively in
+  the same docs commit (additive one-line links + the missing 2024
+  frontmatter). Run the linter on the directory, not the file.
+
+### What We Decided
+
+- CLI env is appended after image env in the fold (docker override
+  semantics), with duplicate keys resolved by the guest's later-wins
+  `setenv` -- rather than adding key-level deduplication, which can
+  wait for a real need.
+- `-w` requires an absolute path (rejecting relative early) and creates
+  missing directories, matching docker's WORKDIR behavior.
+- `--env-file` rejects lines without `=` (no host-env-inheritance
+  shorthand yet; docker's bare-KEY form can come later).
+- Short-flag regressions get a manual parse sanity run:
+  `podvm -m -c -k -r -i -n -e -u -w <bogus image>` must fail at image
+  resolution, never at getopt.
+
+### Rules Added
+
+- **When adding a flag, re-read the optstring diff by eye.** getopt
+  short-option strings are untested surface in this repo; a dropped
+  letter is invisible to the e2e suite.
+- **Dead precedence branches are latent bugs:** if a fold/test case
+  guards an ordering rule, ensure some caller exercises both sides.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/main.c` | `-e`/`--env-file`/`-u`/`-w` flags, `env_add`/`env_add_file`, HOME ensure in `build_config_tokens()` |
+| `src/imgcfg.c` | Env order flipped: image first, CLI last |
+| `guest/init.c` | cwd mkdir-if-missing + warn; resolv.conf overread fix |
+| `tests/test_imgcfg.c` | Two new env-order cases (7b, 7c) |
+| `tests/e2e_runflags.sh` | New: 10 boots covering all three flags |
+| `tests/run_tests.sh`, `README.md` | Wiring + docs |
+
+### Test Results
+
+Per-flag e2e green at each commit (`E2E-RUNFLAGS PASS` after 10 VM
+boots: env values with spaces/commas, PATH override, env-file,
+numeric/named/override users, existing/created workdir, plus two
+host-side rejections). Full-suite re-run queued after tier 2.
+
+### Next Steps
+
+1. Tier 2: `-p/--publish`, `--network=none`, `--read-only`,
+   `-v/--volume` (+`--tmpfs`).
+2. `flock` on the state dir (still the only correctness hole).
+3. `podvm images`/`rmi`/cache GC, layer compaction, `podvm build`,
+   performance phase, FreeBSD.
+
+---
