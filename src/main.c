@@ -238,6 +238,54 @@ static void escape_csv(char *dst, size_t dstsz, const char *raw) {
 }
 
 /*
+ * Append one KEY=VALUE to the CLI env list. config.env is the raw
+ * comma-joined list; build_config_tokens() escapes each element on the
+ * way out, so values may contain commas, spaces, and '='.
+ * Returns -1 (with a message) on malformed input or overflow.
+ */
+static int env_add(const char *kv) {
+    if (!strchr(kv, '=')) {
+        fprintf(stderr, "podvm: env entry must be KEY=VALUE: '%s'\n", kv);
+        return -1;
+    }
+    size_t have = strlen(config.env);
+    int w = snprintf(config.env + have, sizeof(config.env) - have,
+                     "%s%s", have ? "," : "", kv);
+    if (w < 0 || (size_t)w >= sizeof(config.env) - have) {
+        fprintf(stderr, "podvm: too many/large -e values (env list is %zu bytes)\n",
+                sizeof(config.env));
+        return -1;
+    }
+    return 0;
+}
+
+/* --env-file: KEY=VALUE per line; blank lines and #-comments skipped.
+ * Each line is one env element, so a value may contain anything but a
+ * newline (the encoder escapes the rest). */
+static int env_add_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "podvm: cannot open env file %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    char line[1024];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        if (env_add(line) < 0) {
+            fprintf(stderr, "podvm: %s:%d: bad env entry\n", path, lineno);
+            fclose(f);
+            return -1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+/*
  * Build the podvm.*= token string, escaping every value so spaces and
  * commas survive the channel. Shared by the kernel cmdline and the vsock
  * payload so the two can never diverge on encoding.
@@ -248,7 +296,17 @@ static void build_config_tokens(char *buf, size_t len) {
 
     escape_value(entry, sizeof(entry), config.entrypoint);
     escape_csv(args, sizeof(args), config.args[0] ? config.args : "-");
-    escape_csv(env, sizeof(env), config.env[0] ? config.env : "HOME=/root");
+
+    /* HOME is ensured for images by imgcfg_fold(); do the same here so
+     * the bare-rootfs path (and -e with no image) also always has one,
+     * as docker guarantees. */
+    char envraw[MAX_CMDLINE];
+    if (config.env[0])
+        snprintf(envraw, sizeof(envraw), "%s%s", config.env,
+                 strstr(config.env, "HOME=") ? "" : ",HOME=/root");
+    else
+        snprintf(envraw, sizeof(envraw), "HOME=/root");
+    escape_csv(env, sizeof(env), envraw);
     escape_value(cwd, sizeof(cwd), config.cwd[0] ? config.cwd : "/");
     escape_value(user, sizeof(user), config.user[0] ? config.user : "-");
 
@@ -284,6 +342,7 @@ static void apply_image_config(const ImageConfig *ic) {
     memset(&base, 0, sizeof(base));
     snprintf(base.entrypoint, sizeof(base.entrypoint), "%s", config.entrypoint);
     snprintf(base.args, sizeof(base.args), "%s", config.args);
+    snprintf(base.env, sizeof(base.env), "%s", config.env);
     snprintf(base.cwd, sizeof(base.cwd), "%s", config.cwd);
     snprintf(base.user, sizeof(base.user), "%s", config.user);
 
@@ -607,7 +666,7 @@ static int cmd_rm(int argc, char **argv) {
 }
 
 /* Long-only options: --rm has no short form (-r is taken by --initramfs). */
-enum { OPT_RM = 1000 };
+enum { OPT_RM = 1000, OPT_ENVFILE = 1001 };
 
 /* Print usage */
 static void usage(const char *prog) {
@@ -616,6 +675,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
+    fprintf(stderr, "  -e, --env <K=V>     Set an environment variable (repeatable;\n");
+    fprintf(stderr, "                      overrides the image's value for the key)\n");
+    fprintf(stderr, "      --env-file <f>  Read KEY=VALUE lines from a file\n");
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
@@ -653,6 +715,8 @@ int main(int argc, char **argv) {
         {"kernel",      required_argument, 0, 'k'},
         {"initramfs",   required_argument, 0, 'r'},
         {"name",        required_argument, 0, 'n'},
+        {"env",         required_argument, 0, 'e'},
+        {"env-file",    required_argument, 0, OPT_ENVFILE},
         {"rm",          no_argument,       0, OPT_RM},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -661,10 +725,16 @@ int main(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:im:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:ie:m:c:k:r:n:h", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
+            break;
+        case 'e':
+            if (env_add(optarg) < 0) return 1;
+            break;
+        case OPT_ENVFILE:
+            if (env_add_file(optarg) < 0) return 1;
             break;
         case 'm':
             config.memory = atoi(optarg);

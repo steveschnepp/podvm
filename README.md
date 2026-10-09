@@ -131,6 +131,9 @@ podvm -m 256 -c 2 /path/to/rootfs /bin/sh
 # Named container: the writable layer survives the run (write-back)
 podvm -n build alpine /bin/sh
 
+# Pass config into the container (CLI -e beats the image's Env)
+podvm -e DEBUG=1 --env-file ./.env alpine /bin/sh
+
 # Discard that state when the run exits
 podvm --rm -n build alpine /bin/sh
 
@@ -153,6 +156,9 @@ Usage: podvm [options] <image|rootfs-dir> [command] [args...]
 Options:
   -i, --interactive   Give the guest stdin exclusively
                       (default: QEMU monitor shares it; Ctrl-A C)
+  -e, --env <K=V>     Set an environment variable (repeatable;
+                      overrides the image's value for the key)
+      --env-file <f>  Read KEY=VALUE lines from a file
   -m, --memory <MB>   Memory in MB (default: 128)
   -c, --cpus <cpus>   CPUs (default: 1)
   -k, --kernel <path> Kernel path

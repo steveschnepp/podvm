@@ -122,6 +122,27 @@ int main(void) {
         CHECK(strcmp(out.env, "HOME=/root") == 0);
     }
 
+    /* 7b. Env: base (CLI -e) is appended AFTER the image's vars, so the
+     * guest's later setenv makes the CLI win on a duplicated key. */
+    {
+        const char *env[] = {"PATH=/bin", "FOO=img", NULL};
+        mk_icfg(&ic, NULL, NULL, env, NULL, NULL);
+        memset(&base, 0, sizeof(base));
+        snprintf(base.env, sizeof(base.env), "FOO=cli,BAR=1");
+        imgcfg_fold(&ic, &base, &out);
+        CHECK(strcmp(out.env,
+                     "PATH=/bin,FOO=img,FOO=cli,BAR=1,HOME=/root") == 0);
+    }
+
+    /* 7c. Env: base env with no image env still gets HOME. */
+    {
+        mk_icfg(&ic, NULL, NULL, NULL, NULL, NULL);
+        memset(&base, 0, sizeof(base));
+        snprintf(base.env, sizeof(base.env), "FOO=bar");
+        imgcfg_fold(&ic, &base, &out);
+        CHECK(strcmp(out.env, "FOO=bar,HOME=/root") == 0);
+    }
+
     /* 8. cwd/user: image supplies when base has none. */
     {
         mk_icfg(&ic, NULL, NULL, NULL, "/app", "1000:1000");

@@ -66,16 +66,25 @@ void imgcfg_fold(const ImageConfig *ic, const RunSpec *base, RunSpec *out) {
         snprintf(out->args, sizeof(out->args), "%s", argbuf);
     }
 
-    /* Env: base env, then the image's vars, then HOME ensured (docker
-     * always provides one; the image may not). */
-    if (base && base->env[0])
-        snprintf(out->env, sizeof(out->env), "%s", base->env);
+    /* Env: the image's vars first, then the base (the user's CLI -e),
+     * so a CLI key overrides the image's value for the same key (docker
+     * semantics). The guest setenv's in list order, later wins, which is
+     * what makes "image first, CLI last" the override. HOME is ensured
+     * last: docker always provides one; the image may not. */
     if (ic) {
         for (int i = 0; i < ic->nenv; i++) {
             size_t have = strlen(out->env);
             int w = snprintf(out->env + have, sizeof(out->env) - have,
                              "%s%s", have ? "," : "", ic->env[i]);
             if (w < 0 || (size_t)w >= sizeof(out->env) - have) break;
+        }
+    }
+    if (base && base->env[0]) {
+        size_t have = strlen(out->env);
+        int w = snprintf(out->env + have, sizeof(out->env) - have,
+                         "%s%s", have ? "," : "", base->env);
+        if (w < 0 || (size_t)w >= sizeof(out->env) - have) {
+            /* keep what fits; the tail is truncated */
         }
     }
     if (!strstr(out->env, "HOME=")) {
