@@ -42,4 +42,34 @@ int container_state_dir(const char *name, char *out, size_t n);
  */
 int container_rm_rf(const char *path);
 
+/*
+ * Serialize live runs per container name. overlayfs cannot serve two
+ * writers on one upper, so a named run must hold an exclusive,
+ * non-blocking flock while its VM is up.
+ *
+ * The lock file lives at <base>/locks/<name> -- a sibling of
+ * <base>/containers/, NOT inside the state dir -- and is never deleted:
+ * its inode is the name's identity, so `rm`/`--rm` removing the state
+ * dir can never race a starting run into locking a fresh file.
+ *
+ * The returned fd must stay open and must NOT be made CLOEXEC: the
+ * QEMU child inherits it, so the lock lives exactly as long as the VM
+ * even if the launcher dies first.
+ *
+ * Returns the fd (>= 0) on success, -1 on failure; errno is
+ * EWOULDBLOCK when another run (or a concurrent `rm`) holds the lock,
+ * EINVAL for an invalid name.
+ */
+int container_lock(const char *name);
+
+/*
+ * Non-creating probe: is anything holding this name's lock?
+ *
+ * Returns 1 if the lock is held (the container is live), 0 if it is
+ * free (including when no lock file exists -- a state dir from before
+ * the guard existed still counts as not-running), -1 on other errors
+ * (e.g. invalid name).
+ */
+int container_locked(const char *name);
+
 #endif /* CONTAINER_H */

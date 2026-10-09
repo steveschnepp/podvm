@@ -117,12 +117,59 @@ static void test_rm_rf(void) {
     printf("PASS: rm -rf (nested tree, mode-000 dir, symlink not followed, ENOENT)\n");
 }
 
+/* The live-run guard. flock locks are per open-file-description, so a
+ * second container_lock() in the same process conflicts exactly like a
+ * second podvm run would. */
+static void test_lock(void) {
+    char tmpl[] = "/tmp/podvm-test-lock.XXXXXX";
+    char *base = mkdtemp(tmpl);
+    assert(base != NULL);
+    setenv("XDG_STATE_HOME", base, 1);
+
+    char dir[CONTAINER_PATH_MAX], lp[CONTAINER_PATH_MAX], expect[CONTAINER_PATH_MAX];
+
+    /* State dir and lock dir are siblings under the same base. */
+    snprintf(expect, sizeof(expect), "%s/podvm/containers/web", base);
+    assert(container_state_dir("web", dir, sizeof(dir)) == 0);
+    assert(strcmp(dir, expect) == 0);
+    snprintf(lp, sizeof(lp), "%s/podvm/locks/web", base);
+
+    /* Never ran: probe says free, and probing must not create a file. */
+    assert(container_locked("web") == 0);
+    assert(access(lp, F_OK) != 0);
+
+    /* Take the lock (creates the file); a probe now sees it held. */
+    int fd = container_lock("web");
+    assert(fd >= 0);
+    assert(access(lp, F_OK) == 0);
+    assert(container_locked("web") == 1);
+
+    /* A second take conflicts: this is the two-runs-one-name case. */
+    int fd2 = container_lock("web");
+    assert(fd2 == -1 && errno == EWOULDBLOCK);
+
+    /* Release -> free again; the file stays (its inode is the name's
+     * identity, so state-dir deletion cannot invalidate a lock). */
+    close(fd);
+    assert(container_locked("web") == 0);
+    assert(access(lp, F_OK) == 0);
+
+    /* Invalid names are EINVAL, never a lock on something else. */
+    assert(container_lock("..") == -1 && errno == EINVAL);
+    assert(container_lock("a/b") == -1 && errno == EINVAL);
+    assert(container_locked("-x") == -1 && errno == EINVAL);
+
+    unsetenv("XDG_STATE_HOME");
+    printf("PASS: live-run lock (free/held/conflict/EINVAL, file location)\n");
+}
+
 int main(void) {
     printf("Running container state tests...\n\n");
 
     test_name_valid();
     test_state_dir();
     test_rm_rf();
+    test_lock();
 
     printf("\nAll tests passed!\n");
     return 0;
