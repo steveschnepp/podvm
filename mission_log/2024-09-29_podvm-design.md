@@ -1,3 +1,9 @@
+---
+name: podvm-design
+description: initial design session -- VM-based container runtime replacing Linux namespaces with full VMs on OCI images
+project: podvm
+---
+
 # Mission Log: podvm Design Session
 
 **Date:** 2024-09-29

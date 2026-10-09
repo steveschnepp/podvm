@@ -4,6 +4,8 @@ description: fix the never-tested native registry pull (bearer token truncation)
 project: podvm
 ---
 
+- Previous: `2026-10-08_podman-storage.md`
+
 # Mission Log: Achieving Pull (Native Client + Guest Networking)
 
 ---

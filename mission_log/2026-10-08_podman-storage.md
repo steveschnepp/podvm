@@ -4,6 +4,8 @@ description: consume podman's rootless storage directly (layers in place) -- QEM
 project: podvm
 ---
 
+- Previous: `2026-10-08_pivot-to-9p.md`
+
 # Mission Log: Podman Storage as the Image Backend
 
 ---
