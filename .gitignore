@@ -10,18 +10,9 @@ kernel/*.cpio
 kernel/*.cpio.gz
 kernel/bzImage
 
-# Test binaries
-tests/test_config
-tests/test_host_args
-tests/test_vsock
-tests/test_kernel_config
-tests/test_integration
-tests/test_image
-tests/test_sha256
-tests/test_imgcfg
-tests/test_userdb
-tests/test_container
-tests/test_build
+# Test binaries (all tests/test_* except the .c sources)
+tests/test_*
+!tests/test_*.c
 
 # Debug/build logs (output capture)
 out/
