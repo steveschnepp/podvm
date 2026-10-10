@@ -68,6 +68,8 @@ run_test "Build parser" "./tests/test_build"
 run_test "JSON parser" "./tests/test_json"
 run_test "Podman store" "./tests/test_store"
 run_test "Vsock alloc" "./tests/test_vsockalloc"
+run_test "Tar write" "./tests/test_tarwrite"
+run_test "Native store" "./tests/test_store_native"
 
 echo ""
 echo "Running integration tests..."

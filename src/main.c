@@ -32,6 +32,7 @@
 
 #include "image.h"
 #include "store.h"
+#include "store_native.h"
 #include "strparse.h"
 #include "imgcfg.h"
 #include "container.h"
@@ -2205,12 +2206,14 @@ int main(int argc, char **argv) {
     /* Resolve rootfs/image */
     char resolved_rootfs[MAX_PATH];
     int used_podman = 0;
+    int used_native = 0;
 
     /*
      * Resolution order:
      *   1. directory path -> use as-is
-     *   2. podman storage -> layers in place (pull via podman if missing)
-     *   3. podvm's own registry pull -> cache
+     *   2. podvm's native layered store (ADR-027) -> layers in place
+     *   3. podman storage -> layers in place (pull via podman if missing)
+     *   4. podvm's own registry pull -> cache
      *
      * PODVM_RESOLVE overrides the storage choice for an image ref:
      *   podvm   -> podman storage only (fail if absent)
@@ -2237,8 +2240,29 @@ int main(int argc, char **argv) {
         char top[STORE_PATH_MAX];
         int resolved = 0;
 
-        /* 2. podman storage (skipped when the user forced native). */
-        if (!want_native &&
+        /* 2. podvm's native layered store (ADR-027); skipped when the
+         * user forced podman. */
+        if (!want_podman && native_has(config.rootfs_dir) == 0) {
+            NativeLayer nl[MAX_CHAIN];
+            int nn = native_chain(config.rootfs_dir, nl, MAX_CHAIN);
+            if (nn <= 0) {
+                fprintf(stderr, "podvm: no native layer chain for %s\n",
+                        config.rootfs_dir);
+                return 1;
+            }
+            store_nlayers = 0;
+            for (int i = 0; i < nn && store_nlayers < MAX_CHAIN; i++)
+                snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                         "%s", nl[i].diff);
+            printf("podvm: using native store: %s (%d layers)\n",
+                   config.rootfs_dir, store_nlayers);
+            used_native = 1;
+            resolved = 1;
+            snprintf(resolved_rootfs, sizeof(resolved_rootfs),
+                     "/tmp/podvm-rootfs.%d", getpid());
+        }
+        /* 3. podman storage (skipped when the user forced native). */
+        else if (!want_native &&
             store_resolve(config.rootfs_dir, top, sizeof(top), 1) == 0) {
             store_nlayers = store_chain(top, store_layers, MAX_CHAIN);
             if (store_nlayers <= 0) {
@@ -2258,7 +2282,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* 3. podvm's own registry pull (skipped when the user forced
+        /* 4. podvm's own registry pull (skipped when the user forced
          * podman, which already failed above). */
         if (!resolved && !want_podman &&
             image_resolve(config.rootfs_dir, resolved_rootfs,
@@ -2282,7 +2306,9 @@ int main(int argc, char **argv) {
     if (!image_is_path(image_ref)) {
         ImageConfig ic;
         image_config_init(&ic);
-        int got = used_podman
+        int got = used_native
+                ? native_config(image_ref, &ic)
+                : used_podman
                 ? store_image_config(image_ref, &ic)
                 : image_config_load(image_ref, &ic);
         if (got == 0)

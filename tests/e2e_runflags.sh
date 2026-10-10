@@ -32,9 +32,12 @@ fail() {
 
 command -v podman > /dev/null 2>&1 || { echo "E2E-RUNFLAGS SKIP: no podman"; exit 0; }
 [ -e /dev/kvm ] || { echo "E2E-RUNFLAGS SKIP: no /dev/kvm"; exit 0; }
+# The -p test serves HTTP from the guest with busybox `nc`, which alpine
+# has and debian does not -- so the image must be alpine (debian can be
+# listed first in `podman images` and would silently break the -p check).
 IMG=$(podman images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null \
-      | grep -iE "alpine|debian" | head -1)
-[ -n "$IMG" ] || { echo "E2E-RUNFLAGS SKIP: no alpine/debian image"; exit 0; }
+      | grep -iE "alpine" | head -1)
+[ -n "$IMG" ] || { echo "E2E-RUNFLAGS SKIP: no alpine image"; exit 0; }
 
 # Build guest init + initramfs
 make -s -C guest || fail "guest build"

@@ -32,6 +32,7 @@
 #include "image.h"
 #include "json.h"
 #include "sha256.h"
+#include "tar.h"
 
 /* Default cache directory */
 #define DEFAULT_CACHE_DIR "/tmp/podvm/images"
@@ -161,178 +162,6 @@ static int zstd_decompress_mem(const char *in, size_t inlen, Buf *out) {
             return -1;
         if (buf_reserve(out, 65536) < 0) return -1;
     }
-}
-
-/* ───────────────────────── tar extraction ───────────────────────── */
-
-static unsigned long long tar_octal(const char *s, size_t n) {
-    unsigned long long v = 0;
-    for (size_t i = 0; i < n && s[i]; i++) {
-        if (s[i] < '0' || s[i] > '7') break;
-        v = (v << 3) + (unsigned long long)(s[i] - '0');
-    }
-    return v;
-}
-
-/* Join destroot + entry name, rejecting absolute paths and "..". */
-static int safe_path(char *out, size_t outsz, const char *root, const char *name) {
-    while (*name == '/') name++;
-    if (strstr(name, "../") != NULL) return -1;
-    if (strcmp(name, "..") == 0) return -1;
-    if (snprintf(out, outsz, "%s/%s", root, name) >= (int)outsz) return -1;
-    return 0;
-}
-
-static void apply_whiteout(const char *root, const char *dirname, const char *base) {
-    /* base is ".wh.<name>" or ".wh..wh..opq" */
-    if (strcmp(base, ".wh..wh..opq") == 0) {
-        /* Opaque dir: remove everything already present in dirname */
-        char dirpath[PATH_SIZE];
-        if (safe_path(dirpath, sizeof(dirpath), root, dirname) < 0) return;
-        DIR *d = opendir(dirpath);
-        if (!d) return;
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            char child[PATH_SIZE];
-            if (snprintf(child, sizeof(child), "%s/%s", dirpath, de->d_name) < (int)sizeof(child))
-                remove(child);
-        }
-        closedir(d);
-        return;
-    }
-    /* Regular whiteout: delete "<dirname>/<name-after-.wh.>" */
-    const char *target = base + 4; /* skip ".wh." */
-    char path[PATH_SIZE];
-    char dirbuf[PATH_SIZE];
-    if (dirname[0])
-        snprintf(dirbuf, sizeof(dirbuf), "%s/%s", dirname, target);
-    else
-        snprintf(dirbuf, sizeof(dirbuf), "%s", target);
-    if (safe_path(path, sizeof(path), root, dirbuf) == 0)
-        remove(path);
-}
-
-static int untar_mem(const char *tar, size_t tarlen, const char *root) {
-    size_t off = 0;
-    char longname[PATH_SIZE] = "";
-
-    while (off + 512 <= tarlen) {
-        const char *h = tar + off;
-        int empty = 1;
-        for (int i = 0; i < 512; i++) if (h[i]) { empty = 0; break; }
-        if (empty) break; /* end-of-archive marker */
-
-        char name[PATH_SIZE];
-        char prefix[160];
-        memcpy(name, h + 0, 100);
-        name[100] = '\0';
-        unsigned long long size = tar_octal(h + 124, 12);
-        char typeflag = h[156];
-        memcpy(prefix, h + 345, 155);
-        prefix[155] = '\0';
-
-        off += 512;
-
-        if (longname[0]) {
-            /* Previous header was GNU 'L' — its data is the real name */
-            snprintf(name, sizeof(name), "%s", longname);
-            longname[0] = '\0';
-            if (typeflag == 'L' || typeflag == 'K') { /* nested longname: skip data */ }
-        }
-
-        size_t data_blocks = (size_t)((size + 511) / 512) * 512;
-        const char *data = tar + off;
-
-        if (typeflag == 'L') {
-            /* GNU long name for the NEXT header */
-            size_t cp = size < sizeof(longname) - 1 ? size : sizeof(longname) - 1;
-            memcpy(longname, data, cp);
-            longname[cp] = '\0';
-            /* strip trailing NULs */
-            for (size_t k = cp; k > 0 && longname[k - 1] == '\0'; k--) longname[k - 1] = '\0';
-            off += data_blocks;
-            continue;
-        }
-        if (typeflag == 'K' || typeflag == 'x' || typeflag == 'g') {
-            /* longlink / pax extended headers: skip */
-            off += data_blocks;
-            continue;
-        }
-
-        /* Build full name from prefix + name */
-        char full[PATH_SIZE];
-        if (prefix[0])
-            snprintf(full, sizeof(full), "%s/%s", prefix, name);
-        else
-            snprintf(full, sizeof(full), "%s", name);
-
-        char base[PATH_SIZE];
-        { const char *sl = strrchr(full, '/'); snprintf(base, sizeof(base), "%s", sl ? sl + 1 : full); }
-
-        /* Whiteout handling */
-        if (!strncmp(base, ".wh.", 4)) {
-            char dir[PATH_SIZE];
-            const char *slash = strrchr(full, '/');
-            if (slash) { size_t dl = (size_t)(slash - full); if (dl >= sizeof(dir)) dl = sizeof(dir) - 1; memcpy(dir, full, dl); dir[dl] = '\0'; }
-            else dir[0] = '\0';
-            apply_whiteout(root, dir, base);
-            off += data_blocks;
-            continue;
-        }
-
-        char path[PATH_SIZE];
-        if (safe_path(path, sizeof(path), root, full) < 0) {
-            off += data_blocks;
-            continue;
-        }
-
-        if (typeflag == '5') { /* directory */
-            mkdir_p(path, 0755);
-        } else if (typeflag == '2') { /* symlink */
-            char target[PATH_SIZE];
-            memcpy(target, h + 157, 100);
-            target[100] = '\0';
-            char parent[PATH_SIZE];
-            snprintf(parent, sizeof(parent), "%s", path);
-            char *slash = strrchr(parent, '/');
-            if (slash) *slash = '\0';
-            mkdir_p(parent, 0755);
-            remove(path);
-            symlink(target, path);
-        } else if (typeflag == '1') { /* hardlink: treat as symlink-ish copy target */
-            char target[PATH_SIZE];
-            memcpy(target, h + 157, 100);
-            target[100] = '\0';
-            char linkpath[PATH_SIZE];
-            char parent[PATH_SIZE];
-            snprintf(parent, sizeof(parent), "%s", path);
-            char *slash = strrchr(parent, '/');
-            if (slash) *slash = '\0';
-            if (safe_path(linkpath, sizeof(linkpath), root, target) == 0) {
-                mkdir_p(parent, 0755);
-                remove(path);
-                link(linkpath, path);
-            }
-        } else { /* regular file ('0' or '\0') */
-            char parent[PATH_SIZE];
-            snprintf(parent, sizeof(parent), "%s", path);
-            char *slash = strrchr(parent, '/');
-            if (slash) *slash = '\0';
-            mkdir_p(parent, 0755);
-
-            unsigned mode = (unsigned)tar_octal(h + 100, 8);
-            if (!mode) mode = 0644;
-            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)mode);
-            if (fd >= 0) {
-                if (size) { ssize_t w = write(fd, data, (size_t)size); (void)w; }
-                close(fd);
-            }
-        }
-
-        off += data_blocks;
-    }
-    return 0;
 }
 
 /* ───────────────────────── digest verification ───────────────────────── */
@@ -807,7 +636,7 @@ int image_pull(const char *image_name, const char *tag) {
             bres.body.data = NULL; /* prevent double free */
         }
 
-        if (rc == 0 && untar_mem(tar.data ? tar.data : "", tar.len, root) < 0) {
+        if (rc == 0 && tar_extract_mem(tar.data ? tar.data : "", tar.len, root) < 0) {
             fprintf(stderr, "podvm: untar failed for layer %s\n", digest);
             rc = -1;
         }

@@ -18,7 +18,7 @@ CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 all: $(BUILD_DIR)/podvm
 
 # Build with CMake
-$(BUILD_DIR)/podvm: src/main.c src/strparse.c src/image.c src/strparse.h src/image.h src/container.c src/container.h src/vsockalloc.c src/vsockalloc.h
+$(BUILD_DIR)/podvm: src/main.c src/strparse.c src/image.c src/strparse.h src/image.h src/container.c src/container.h src/vsockalloc.c src/vsockalloc.h src/tar.c src/tar.h
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && cmake .. $(CMAKE_FLAGS) && make -j$(shell nproc)
 

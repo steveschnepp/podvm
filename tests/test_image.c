@@ -160,7 +160,7 @@ static void test_untar(void) {
     char *dir = mkdtemp(tmpl);
     CHECK(dir != NULL);
 
-    CHECK(untar_mem(tar, tarlen, dir) == 0);
+    CHECK(tar_extract_mem(tar, tarlen, dir) == 0);
 
     char path[512];
     snprintf(path, sizeof(path), "%s/etc/motd", dir);
