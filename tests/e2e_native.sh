@@ -47,8 +47,12 @@ make -s -C guest || fail "guest build"
 guest/build-initramfs.sh "$WORK/initramfs.cpio" > /dev/null || fail "initramfs"
 
 # Clear podvm's native cache for this image so the run does a real pull.
-# busybox:latest -> <cache>/docker.io/library/busybox/latest
-rm -rf /tmp/podvm/images/docker.io/library/busybox
+# The cache layout is FLAT since image 87a370a: repos are mangled with
+# '+' and tags are subdirs, so busybox:latest lives at
+# <cache>/docker.io/library+busybox/latest. Clearing the old nested
+# path is a no-op, and the run then resolves from cache -- no pull, and
+# busybox's own default Cmd (sh) sits at a prompt until the timeout.
+rm -rf /tmp/podvm/images/docker.io/library+busybox
 
 # Run with the native backend forced. No command given: the image's own
 # Cmd must be used, which also proves the config blob was cached.

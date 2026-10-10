@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_host_args test_vsock test_kernel_config test_integration test_image test_sha256 test_imgcfg test_userdb test_container test_build
+TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_build test_json test_store
 
 .PHONY: all test clean
 
@@ -16,20 +16,12 @@ all: $(TESTS)
 test_config: test_config.c ../src/strparse.c
 	$(CC) $(CFLAGS) -o $@ $< ../src/strparse.c -I../src
 
-# Host argument tests
-test_host_args: test_host_args.c
-	$(CC) $(CFLAGS) -o $@ $< -I../src
-
 # Vsock tests
 test_vsock: test_vsock.c
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
 # Kernel config tests
 test_kernel_config: test_kernel_config.c
-	$(CC) $(CFLAGS) -o $@ $<
-
-# Integration tests
-test_integration: test_integration.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # Image pipeline tests (includes src/image.c; needs curl + zlib + zstd)
@@ -56,6 +48,15 @@ test_container: test_container.c ../src/container.c ../src/container.h
 test_build: test_build.c ../src/build.c ../src/build.h
 	$(CC) $(CFLAGS) -o $@ test_build.c ../src/build.c -I../src
 
+# JSON parser tests (no deps)
+test_json: test_json.c ../src/json.c ../src/json.h
+	$(CC) $(CFLAGS) -o $@ test_json.c ../src/json.c -I../src
+
+# Podman storage reader tests (fixture tree via XDG_DATA_HOME; image.c
+# pulls in curl+zlib+zstd)
+test_store: test_store.c ../src/store.c ../src/store.h ../src/image.c ../src/image.h ../src/json.c ../src/sha256.c
+	$(CC) $(CFLAGS) -o $@ test_store.c ../src/store.c ../src/image.c ../src/json.c ../src/sha256.c -I../src -lcurl -lz -lzstd
+
 # Run all tests
 test: $(TESTS)
 	@echo "Running tests..."
@@ -63,14 +64,8 @@ test: $(TESTS)
 	@echo "=== Config Tests ==="
 	./test_config || true
 	@echo ""
-	@echo "=== Host Args Tests ==="
-	./test_host_args || true
-	@echo ""
 	@echo "=== Vsock Tests ==="
 	./test_vsock || true
-	@echo ""
-	@echo "=== Integration Tests ==="
-	./test_integration || true
 	@echo ""
 	@echo "=== Image Tests ==="
 	./test_image || true
@@ -89,6 +84,12 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== Build Parser Tests ==="
 	./test_build || true
+	@echo ""
+	@echo "=== JSON Parser Tests ==="
+	./test_json || true
+	@echo ""
+	@echo "=== Store Tests ==="
+	./test_store || true
 	@echo ""
 	@echo "All tests complete!"
 

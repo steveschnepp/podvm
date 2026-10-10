@@ -28,23 +28,20 @@ run_test() {
     output=$(eval "$cmd" 2>&1)
     status=$?
     
-    # An explicit WARN in the output always wins, even on exit 0
-    # (e.g. `which X || echo WARN` reports success when X is missing).
-    if echo "$output" | grep -qi "WARN"; then
+    # Exit status decides PASS vs FAIL. A WARN token in otherwise
+    # successful output downgrades PASS -> WARN (e.g. `which X || echo
+    # WARN`). A failed test is NEVER a WARN: the old "No such file =>
+    # WARN" downgrade let real failures hide as warnings.
+    if [ $status -ne 0 ]; then
+        echo "${RED}FAIL${NC}"
+        echo "$output" | head -5
+        FAIL=$((FAIL + 1))
+    elif echo "$output" | grep -qi "WARN"; then
         echo "${YELLOW}WARN${NC}"
         WARN=$((WARN + 1))
-    elif [ $status -eq 0 ]; then
+    else
         echo "${GREEN}PASS${NC}"
         PASS=$((PASS + 1))
-    else
-        if echo "$output" | grep -qi "No such file\|not found\|Permission denied"; then
-            echo "${YELLOW}WARN${NC}"
-            WARN=$((WARN + 1))
-        else
-            echo "${RED}FAIL${NC}"
-            echo "$output" | head -5
-            FAIL=$((FAIL + 1))
-        fi
     fi
 }
 
@@ -61,7 +58,6 @@ echo ""
 
 # Unit tests
 run_test "Config parsing" "./tests/test_config"
-run_test "Host args" "./tests/test_host_args"
 run_test "Vsock basics" "./tests/test_vsock"
 run_test "Image pipeline" "./tests/test_image"
 run_test "SHA-256" "./tests/test_sha256"
@@ -69,6 +65,8 @@ run_test "Image config fold" "./tests/test_imgcfg"
 run_test "User resolution" "./tests/test_userdb"
 run_test "Container state" "./tests/test_container"
 run_test "Build parser" "./tests/test_build"
+run_test "JSON parser" "./tests/test_json"
+run_test "Podman store" "./tests/test_store"
 
 echo ""
 echo "Running integration tests..."
@@ -76,6 +74,9 @@ echo ""
 
 # Integration tests
 run_test "Host build" "mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Debug > /dev/null 2>&1 && make > /dev/null 2>&1"
+# CLI matrix: drives the real binary's getopt surface (no VM). Needs
+# build/podvm, so it runs right after the host build.
+run_test "CLI matrix (real binary)" "sh tests/cli_matrix.sh"
 run_test "Guest build" "cd guest && make -s 2>&1"
 run_test "Initramfs build" "cd guest && chmod +x build-initramfs.sh && ./build-initramfs.sh 2>&1"
 
@@ -94,16 +95,21 @@ echo "Checking kernel config..."
 echo ""
 
 # Kernel config checks
-run_test "Vsock enabled" "grep -q 'CONFIG_VSOCK=y' kernel/config"
-run_test "9p enabled" "grep -q 'CONFIG_NET_9P_VIRTIO=y' kernel/config && grep -q 'CONFIG_9P_FS=y' kernel/config"
-run_test "Balloon enabled" "grep -q 'CONFIG_VIRTIO_BALLOON=y' kernel/config"
-run_test "Uncompressed kernel" "grep -q 'CONFIG_KERNEL_UNCOMPRESSED=y' kernel/config"
-run_test "No BPF" "grep -q 'CONFIG_BPF=y' kernel/config && exit 1 || true"
-run_test "No modules" "grep -q 'CONFIG_MODULES=y' kernel/config && exit 1 || true"
+run_test "Kernel config" "./tests/test_kernel_config"
 
 echo ""
 echo "Running end-to-end test..."
 echo ""
+
+# Orphan guard: the vsock CID is hardcoded to 3, so ONE leaked QEMU
+# breaks every later VM boot in a confusing way. Surface it loudly
+# instead of letting e2es fail as mysterious flakes.
+LEAKED=$(ps -eo cmd | grep -c '^qemu-system-x86_64')
+if [ "$LEAKED" -gt 0 ]; then
+    echo "WARNING: $LEAKED qemu-system process(es) already running --"
+    echo "         e2e results below may be misleading (vsock CID is unique)"
+    echo ""
+fi
 
 # Real VM boot (needs KVM): 9p mount -> chroot -> exec -> clean exit.
 # Not a WARN-if-missing check: skip silently on KVM-less hosts.
@@ -142,7 +148,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E build (Dockerfile)" "sh tests/e2e_build.sh"
     # Detached lifecycle: -d + logs + stop.
     run_test "E2E detach (-d/stop/logs)" "sh tests/e2e_detach.sh"
-    # images/rmi e2e: deletes cached alpine on purpose -- must be last.
+    # images/rmi e2e: deletes the cached alpine image on purpose and must
+    # stay the LAST e2e -- earlier e2es depend on that image existing.
     run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
