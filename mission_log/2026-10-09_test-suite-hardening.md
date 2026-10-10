@@ -213,3 +213,95 @@ PASS: 30   WARN: 1   FAIL: 0
    still breaks all later boots), OCI blob export from build,
    multi-stage builds, `logs -f`, the performance phase (ADR-019/009),
    FreeBSD (ADR-021).
+
+---
+
+## Session 2: Clearing the musl WARN (2026-10-09)
+
+Session 1 ended at 30 PASS / 1 WARN, the WARN being the pre-existing
+`musl-gcc available` row. Closed it, and in doing so gave the guest
+its first musl build.
+
+### What We Did
+
+1. **Installed musl-tools** (1.2.5-3.1~deb13u1, user-approved per the
+   no-install rule). The guest Makefile picks up `musl-gcc`
+   automatically (`guest/Makefile:4-5`).
+2. **The musl build then failed on `linux/vm_sockets.h`.** musl-gcc
+   deliberately omits `/usr/include` from its search path so glibc
+   headers cannot contaminate a musl static build -- which also hides
+   the kernel UAPI headers. Verified by printing the search path:
+   only `/usr/include/x86_64-linux-musl` and gcc's own dir.
+3. **Fixed with `-idirafter /usr/include`** (guarded on musl being
+   present). `-idirafter` appends AFTER all standard search dirs, so
+   musl's own headers still win and only what musl lacks -- the UAPI
+   headers under `linux/`, `asm/` -- comes from `/usr/include`. This is
+   the standard musl-plus-kernel-headers idiom; `-I/usr/include` would
+   have been wrong (it searches early and pulls in glibc).
+4. **Full suite re-run on the musl-built guest**: 31 PASS / 0 WARN /
+   0 FAIL. The guest `init` is now statically linked + stripped,
+   51365 bytes of text vs ~64KB for the glibc-static build.
+5. **`.gitignore` tidy**: the test-binary list still named the two
+   files deleted in session 1 and missed `test_json`/`test_store`.
+   Collapsed to `tests/test_*` + `!tests/test_*.c`, verified with
+   `git check-ignore`.
+
+Commits: `9edb0a3` (guest musl build + .gitignore).
+
+### What We Learned
+
+#### Technical
+
+- **musl-gcc's missing `/usr/include` is a feature, not a bug** -- the
+  fix is `-idirafter`, never `-I`. The include-order difference is the
+  whole point of musl's isolated search path.
+- **A WARN-free suite is not the same as a tested suite.** The musl
+  row read WARN for sessions because the guest had literally never
+  been compiled with the compiler its Makefile prefers. Installing the
+  tool and fixing the build tested a path no test had exercised.
+- **`-idirafter` cost nothing at runtime**: the smaller musl binary
+  booted in all twelve VM e2e paths unchanged -- the guest ABI the
+  host depends on is the vsock/9p protocol, not the libc.
+
+#### Process
+
+- **Environment warnings deserve a real fix, not suppression.** The
+  WARN row had been on the board for the whole project; the honest
+  fix was installing the tool (with approval) and repairing what its
+  absence had been masking -- not downgrading the check.
+
+### What We Decided
+
+- musl remains the guest's preferred compiler with a gcc fallback;
+  the UAPI include is conditional on musl so the fallback path is
+  untouched.
+- `.gitignore` uses a pattern, not a hand-maintained list -- same
+  reasoning as the mission-log README's "no index" rule.
+
+### Rules Added
+
+- **Adding a compiler to the host means rebuilding every artifact it
+  can affect**, not just the one that triggered the change: the guest
+  binary is part of the test surface for all e2e.
+- **`-idirafter` for UAPI headers under musl**, never `-I/usr/include`.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `guest/Makefile` | `MUSL_UAPI = -idirafter /usr/include` when musl-gcc present |
+| `.gitignore` | Test binaries as a pattern; sources negated |
+
+### Test Results
+
+```
+musl-gcc available            PASS   (was WARN)
+...
+PASS: 31   WARN: 0   FAIL: 0
+```
+
+### Next Steps
+
+1. Session 1's list unchanged: build-driver unit tests, gcov target,
+   unique vsock CIDs, OCI blob export, performance phase, FreeBSD.
+
