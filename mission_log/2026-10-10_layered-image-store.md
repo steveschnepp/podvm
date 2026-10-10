@@ -153,3 +153,85 @@ PASS: 35   WARN: 0   FAIL: 0
 2. Phase 3: build commits each RUN as a layer (drop the final merge).
 3. Phase 4: `podvm save`/`load` (OCI/docker archive interop with podman).
 4. Phase 5 (optional): GC / `podvm system prune`.
+
+---
+
+## Phase 2: Pull keeps layers (2026-10-10)
+
+The native-client pull now stores layers instead of flattening. A pulled
+image lands as content-addressed blobs + unpacked diffs + a manifest, and
+the run path, `podvm build`'s FROM, and `podvm images`/`rmi` all follow it
+into the layered store. Commit `aad323d`.
+
+### What We Did
+
+1. **`image_pull` -> layered store.** Each layer blob is downloaded,
+   decompressed, its diff_id (uncompressed sha256) computed, and stored
+   via `native_put_layer` (blob + unpack, dedup by digest); the config
+   blob is stored and a manifest written (bottom-first digests). The old
+   flattened cache dir is gone on this path.
+2. **`image_resolve` sentinel.** Returns `IMAGE_RESOLVED_NATIVE` when the
+   image is a chain (rootfs_path not set); the legacy flattened-dir check
+   stays for pre-ADR-027 entries. The run path and build's FROM stack the
+   chain on that sentinel (`fill_native_chain`).
+3. **Ref normalization.** `alpine`, `docker.io/library/alpine`, and
+   `alpine:latest` now map to ONE manifest (canonical name drops the hub
+   registry + `library/`), so run/images/rmi agree on the storage key.
+   Without it, a full-name pull + short-name `rmi` missed each other.
+4. **`podvm images`/`rmi` follow.** `images` lists native images with a
+   LAYERS column; `rmi` removes from both the native store and the legacy
+   cache (an image can live in either), reusing the shared image lock for
+   the in-use guard.
+
+### What We Learned
+
+- **A ref->path store key must normalize, or the write and read disagree.**
+  `image_pull("docker.io/library/alpine")` wrote the manifest under the
+  full name, but `rmi alpine` looked it up as `alpine` -- missed. The
+  canonical-name normalization (same rule the old cache listing used)
+  fixes the storage key, not just the display name.
+- **Moving an image's home breaks every surface that points at the old
+  one.** `podvm images`/`rmi` still targeted the legacy cache; `e2e_images`
+  caught it immediately. "Pull keeps layers" was really "pull + images +
+  rmi move to the layered store."
+- **A missing Makefile prereq silently skips recompiles.** `store_native.c`
+  wasn't in the root Makefile's `$(BUILD_DIR)/podvm` prereq list, so
+  `make` considered build/podvm up-to-date and never recompiled my
+  normalize change -- the binary stayed stale through two e2e runs. The
+  cmake build tracks it internally, but the outer make target gated on an
+  incomplete list. Symptom: source changed, behavior didn't.
+- **The default native store accumulates stale state across runs.**
+  Pre-normalize manifests in `~/.local/share/podvm/store` (from earlier
+  suite runs) listed as `docker.io/library/alpine` and defeated `rmi
+  alpine`. Isolated `PODVM_STORE_DIR` per e2e (as `e2e_native` already
+  did) makes them hermetic; `e2e_images` now isolates too.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/image.c` / `.h` | pull -> layered store; `IMAGE_RESOLVED_NATIVE` sentinel |
+| `src/store_native.c` / `.h` | `native_put_layer`, `native_list`, `native_rmi`, ref normalization |
+| `src/main.c` | `fill_native_chain`; sentinel in run + build FROM; native images/rmi |
+| `Makefile` | add `store_native.c` to the podvm prereq list |
+| `tests/e2e_native.sh`, `tests/e2e_images.sh` | isolate `PODVM_STORE_DIR`; native-store assertions |
+| `tests/test_store_native.c` | `native_put_layer` + `native_list` cases |
+| `tests/Makefile` | link `store_native.c` into `test_image`/`test_store` |
+
+### Test Results
+
+```
+Native store                  PASS   (+ put_layer, list)
+E2E native pull               PASS   (lands as a manifest, boots via chain)
+E2E images/rmi (cache)        PASS   (lists layers, rmi removes, in-use guard)
+...
+PASS: 35   WARN: 0   FAIL: 0
+```
+
+### Next Steps
+
+1. Phase 3: build commits each RUN as a layer (drop the final merge).
+2. Phase 4: `podvm save`/`load` (OCI/docker archive interop with podman).
+3. Phase 5 (optional): GC / `podvm system prune` (native `rmi` currently
+   leaves orphan blobs).
+4. Retire the legacy flattened cache once build output moves (Phase 3).
