@@ -26,6 +26,13 @@ typedef struct {
     char diff[NATIVE_PATH_MAX];       /* S/layers/<hex>/diff (overlay lowerdir) */
 } NativeLayer;
 
+typedef struct {
+    char   name[MAX_IMAGE_NAME];      /* original repo name (unmangled) */
+    char   tag[MAX_IMAGE_NAME];
+    int    nlayers;
+    unsigned long long size;          /* total layer-blob bytes */
+} NativeImage;
+
 /* Store root: honors PODVM_STORE_DIR, else $XDG_DATA_HOME/podvm/store. */
 const char *native_store_dir(void);
 
@@ -49,6 +56,18 @@ int native_commit_diff(const char *diff_dir, char *out_digest, size_t n);
 /* Store raw bytes (e.g. a config JSON) as a blob; write its digest. Used
  * by pull (Phase 2) and tests to plant a config. 0 on success. */
 int native_blob_put(const char *data, size_t len, char *out_digest, size_t n);
+
+/* Store an uncompressed layer tar (already in memory, e.g. a registry
+ * blob) as a layer: blob + unpack to layers/<hex>/diff (dedup by digest).
+ * The pull-side counterpart to native_commit_diff. Writes the digest. */
+int native_put_layer(const char *tardata, size_t len, char *out_digest, size_t n);
+
+/* Enumerate manifests for `podvm images`. Returns the count filled. */
+int native_list(NativeImage *ents, int max);
+
+/* Remove an image's manifest (the image is then absent; its layer blobs
+ * remain until GC). Returns 0 on success, -1 if absent/error. */
+int native_rmi(const char *image_str);
 
 /* Create/replace ref's manifest: config digest + ordered layer digests
  * (bottom-first) + optional history lines. 0 on success. */

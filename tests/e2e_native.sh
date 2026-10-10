@@ -9,9 +9,9 @@
 #
 # Proves the whole native pipeline against a live registry: manifest fetch
 # -> bearer auth -> platform manifest -> blob download -> sha256 digest
-# verification -> gunzip -> untar -> 9p serve -> guest mount -> chroot ->
-# exec. Also checks the image's own Cmd (from the config blob) runs with
-# no command typed.
+# verification -> gunzip -> store layer (blob + unpack) -> manifest -> 9p
+# serve the overlay chain -> guest mount -> chroot -> exec. Also checks the
+# image's own Cmd (from the config blob) runs with no command typed.
 #
 # Requires: KVM + network. Skips cleanly if the registry is unreachable.
 #
@@ -26,6 +26,11 @@ cd "$SCRIPT_DIR/.."
 TIMEOUT_SECS="${PODVM_E2E_NATIVE_TIMEOUT:-180}"
 WORK=$(mktemp -d /tmp/podvm-e2e-native.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
+
+# Isolate podvm's layered store (ADR-027) so the pull lands in a fresh,
+# empty store -- forcing a real pull and keeping the test off the user's
+# real store.
+export PODVM_STORE_DIR="$WORK/store"
 
 # Small image, and one the native client resolves as docker.io/library/.
 IMG="${PODVM_E2E_NATIVE_IMG:-busybox:latest}"
@@ -46,12 +51,8 @@ fi
 make -s -C guest || fail "guest build"
 guest/build-initramfs.sh "$WORK/initramfs.cpio" > /dev/null || fail "initramfs"
 
-# Clear podvm's native cache for this image so the run does a real pull.
-# The cache layout is FLAT since image 87a370a: repos are mangled with
-# '+' and tags are subdirs, so busybox:latest lives at
-# <cache>/docker.io/library+busybox/latest. Clearing the old nested
-# path is a no-op, and the run then resolves from cache -- no pull, and
-# busybox's own default Cmd (sh) sits at a prompt until the timeout.
+# Also clear the legacy flattened cache so image_resolve's pre-ADR-027
+# check cannot short-circuit to an old merged dir instead of pulling.
 rm -rf /tmp/podvm/images/docker.io/library+busybox
 
 # Run with the native backend forced. No command given: the image's own
@@ -63,11 +64,17 @@ RC=$?
 grep -q "podvm: using podman storage" "$WORK/serial.log" \
     && fail "native pull not engaged (fell through to podman storage)"
 
-grep -qE "podvm: image .* ready at /tmp/podvm/images" "$WORK/serial.log" \
+grep -qE "podvm: image .* ready \([0-9]+ layers\)" "$WORK/serial.log" \
     || fail "native pull did not complete (rc=$RC)"
-grep -qiE "digest mismatch|manifest fetch failed|gunzip failed|untar failed|failed to resolve" \
+grep -q "using native store" "$WORK/serial.log" \
+    || fail "run did not stack the native layer chain (rc=$RC)"
+grep -qiE "digest mismatch|manifest fetch failed|gunzip failed|store layer failed|failed to resolve|not in the store after pull" \
     "$WORK/serial.log" \
     && fail "native pull reported an error (rc=$RC)"
+
+# The pull wrote a manifest into the layered store (layers are kept).
+[ -f "$WORK/store/manifests/busybox/latest" ] \
+    || fail "no native manifest written for busybox:latest"
 
 # The image ran in the VM. busybox with no args prints usage and exits
 # non-zero, but it must at least have exec'd -- look for the init trace.

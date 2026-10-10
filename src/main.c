@@ -232,6 +232,21 @@ static int reap_exit_helper(void) {
 static StoreLayer store_layers[MAX_CHAIN];
 static int store_nlayers = 0;
 
+/* Fill store_layers from the native store's chain (top-first, overlayfs
+ * lowerdir order) and print the diagnostic. Returns the layer count, or
+ * -1 on error. */
+static int fill_native_chain(const char *img) {
+    NativeLayer nl[MAX_CHAIN];
+    int nn = native_chain(img, nl, MAX_CHAIN);
+    if (nn <= 0) return -1;
+    store_nlayers = 0;
+    for (int i = 0; i < nn && store_nlayers < MAX_CHAIN; i++)
+        snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
+                 "%s", nl[i].diff);
+    printf("podvm: using native store: %s (%d layers)\n", img, store_nlayers);
+    return store_nlayers;
+}
+
 /* -p/--publish entries (tcp only; validated in publish_add). */
 static struct {
     char hostip[64];
@@ -1141,18 +1156,27 @@ static int cmd_images(void) {
         fprintf(stderr, "podvm: cannot list the image cache\n");
         return 1;
     }
-    if (n == 0) {
-        printf("no images in the podvm cache (%s)\n", image_cache_dir());
+    static NativeImage nents[MAX_IMGS];
+    int nn = native_list(nents, MAX_IMGS);
+    if (n == 0 && nn == 0) {
+        printf("no images (native store %s)\n", native_store_dir());
         return 0;
     }
     qsort(ents, (size_t)n, sizeof(ents[0]), cmp_imgent);
 
-    printf("%-48s %-12s %-10s %s\n", "NAME", "TAG", "IMAGE ID", "SIZE");
+    printf("%-48s %-12s %-10s %-7s %s\n", "NAME", "TAG", "IMAGE ID", "LAYERS", "SIZE");
     for (int i = 0; i < n; i++) {
         char sz[32];
         human_size(ents[i].size, sz, sizeof(sz));
-        printf("%-48s %-12s %-10s %s\n",
-               ents[i].name, ents[i].tag, ents[i].id, sz);
+        printf("%-48s %-12s %-10s %-7s %s\n",
+               ents[i].name, ents[i].tag, ents[i].id, "-", sz);
+    }
+    for (int i = 0; i < nn; i++) {
+        char sz[32], lay[16];
+        human_size(nents[i].size, sz, sizeof(sz));
+        snprintf(lay, sizeof(lay), "%d", nents[i].nlayers);
+        printf("%-48s %-12s %-10s %-7s %s\n",
+               nents[i].name, nents[i].tag, "-", lay, sz);
     }
     return 0;
 }
@@ -1177,12 +1201,17 @@ static int cmd_rmi(int argc, char **argv) {
         char dir[STORE_PATH_MAX];
         struct stat st;
 
-        if (image_is_path(ref) || image_cache_path(ref, dir, sizeof(dir)) < 0) {
+        if (image_is_path(ref)) {
             fprintf(stderr, "podvm: not an image reference: %s\n", ref);
             rc = 1;
             continue;
         }
-        if (stat(dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        int is_native = (native_has(ref) == 0);
+        int is_old = 0;
+        if (image_cache_path(ref, dir, sizeof(dir)) == 0 &&
+            stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
+            is_old = 1;
+        if (!is_native && !is_old) {
             fprintf(stderr, "podvm: no such image: %s\n", ref);
             rc = 1;
             continue;
@@ -1200,12 +1229,16 @@ static int cmd_rmi(int argc, char **argv) {
             continue;
         }
 
-        int rmc = container_rm_rf(dir);
-        int rme = errno;
+        /* An image can live in the native store, the legacy cache, or
+         * both -- remove from each it occupies. */
+        int ok = 1;
+        int rme = 0;
+        if (is_native && native_rmi(ref) < 0) { ok = 0; rme = errno; }
+        if (is_old && container_rm_rf(dir) < 0) { ok = 0; rme = errno; }
         close(lockfd);
-        if (rmc < 0) {
+        if (!ok) {
             fprintf(stderr, "podvm: cannot remove %s: %s\n",
-                    dir, strerror(rme));
+                    ref, strerror(rme));
             rc = 1;
             continue;
         }
@@ -1437,20 +1470,35 @@ static int cmd_build(int argc, char **argv) {
             from_podman = 1;
         } else {
             char root[STORE_PATH_MAX];
-            if (image_resolve(from, root, sizeof(root)) < 0) {
+            int r = image_resolve(from, root, sizeof(root));
+            if (r == IMAGE_RESOLVED_NATIVE) {
+                /* Base lives in the layered store: use its chain. */
+                NativeLayer nl[MAX_CHAIN];
+                int c = native_chain(from, nl, MAX_CHAIN);
+                if (c <= 0) {
+                    fprintf(stderr, "podvm build: no native chain for %s\n", from);
+                    rc = 1;
+                    goto out;
+                }
+                for (int l = 0; l < c && l < MAX_CHAIN; l++)
+                    snprintf(base_diffs[l], MAX_PATH, "%s", nl[l].diff);
+                nbase = c;
+                native_config(from, &ic);
+            } else if (r == 0) {
+                snprintf(base_diffs[0], MAX_PATH, "%s", root);
+                nbase = 1;
+                image_config_load(from, &ic);
+                /* The base rootfs is served to every step VM: hold a
+                 * shared lock so rmi cannot delete it mid-build. */
+                from_lock = image_lock(from, 0);
+                if (from_lock < 0) {
+                    fprintf(stderr, "podvm build: cannot lock base image %s: %s\n",
+                            from, strerror(errno));
+                    rc = 1;
+                    goto out;
+                }
+            } else {
                 fprintf(stderr, "podvm build: cannot resolve FROM image %s\n", from);
-                rc = 1;
-                goto out;
-            }
-            snprintf(base_diffs[0], MAX_PATH, "%s", root);
-            nbase = 1;
-            image_config_load(from, &ic);
-            /* The base rootfs is served to every step VM: hold a
-             * shared lock so rmi cannot delete it mid-build. */
-            from_lock = image_lock(from, 0);
-            if (from_lock < 0) {
-                fprintf(stderr, "podvm build: cannot lock base image %s: %s\n",
-                        from, strerror(errno));
                 rc = 1;
                 goto out;
             }
@@ -2243,19 +2291,11 @@ int main(int argc, char **argv) {
         /* 2. podvm's native layered store (ADR-027); skipped when the
          * user forced podman. */
         if (!want_podman && native_has(config.rootfs_dir) == 0) {
-            NativeLayer nl[MAX_CHAIN];
-            int nn = native_chain(config.rootfs_dir, nl, MAX_CHAIN);
-            if (nn <= 0) {
+            if (fill_native_chain(config.rootfs_dir) <= 0) {
                 fprintf(stderr, "podvm: no native layer chain for %s\n",
                         config.rootfs_dir);
                 return 1;
             }
-            store_nlayers = 0;
-            for (int i = 0; i < nn && store_nlayers < MAX_CHAIN; i++)
-                snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
-                         "%s", nl[i].diff);
-            printf("podvm: using native store: %s (%d layers)\n",
-                   config.rootfs_dir, store_nlayers);
             used_native = 1;
             resolved = 1;
             snprintf(resolved_rootfs, sizeof(resolved_rootfs),
@@ -2283,13 +2323,25 @@ int main(int argc, char **argv) {
         }
 
         /* 4. podvm's own registry pull (skipped when the user forced
-         * podman, which already failed above). */
-        if (!resolved && !want_podman &&
-            image_resolve(config.rootfs_dir, resolved_rootfs,
-                          sizeof(resolved_rootfs)) < 0) {
-            fprintf(stderr, "podvm: failed to resolve image/path: %s\n",
-                    config.rootfs_dir);
-            return 1;
+         * podman, which already failed above). A pull now lands in the
+         * layered store, so a native resolution stacks the chain. */
+        if (!resolved && !want_podman) {
+            int r = image_resolve(config.rootfs_dir, resolved_rootfs,
+                                  sizeof(resolved_rootfs));
+            if (r == IMAGE_RESOLVED_NATIVE) {
+                if (fill_native_chain(config.rootfs_dir) <= 0) {
+                    fprintf(stderr, "podvm: no native layer chain for %s\n",
+                            config.rootfs_dir);
+                    return 1;
+                }
+                used_native = 1;
+                snprintf(resolved_rootfs, sizeof(resolved_rootfs),
+                         "/tmp/podvm-rootfs.%d", getpid());
+            } else if (r < 0) {
+                fprintf(stderr, "podvm: failed to resolve image/path: %s\n",
+                        config.rootfs_dir);
+                return 1;
+            }
         }
     }
     

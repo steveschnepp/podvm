@@ -78,8 +78,12 @@ int image_is_path(const char *str);
  * Resolve image to rootfs directory.
  * If image is a path, use directly.
  * If image is a name, look in cache or pull.
- * Returns 0 on success.
+ * Returns 0 on success (rootfs_path holds a single merged dir),
+ * IMAGE_RESOLVED_NATIVE when the image lives in podvm's layered store
+ * (rootfs_path is NOT set; the caller stacks the chain via the native
+ * store), or -1 on error.
  */
+#define IMAGE_RESOLVED_NATIVE 1
 int image_resolve(const char *image_str, char *rootfs_path, size_t path_size);
 
 /*

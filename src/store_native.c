@@ -8,6 +8,7 @@
 #include "sha256.h"
 #include "json.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -45,16 +46,49 @@ const char *native_store_dir(void) {
     return buf;
 }
 
-/* Manifest path: <store>/manifests/<name with '/'->'+'>/<tag>. The ref is
- * used verbatim (writer and reader agree); full registry normalization is
- * a later concern. */
+/* Canonical storage/display name: drop the docker hub registry (and its
+ * aliases) and the implied "library/" prefix, like docker; a non-hub
+ * registry is kept. So "docker.io/library/alpine", "alpine", and
+ * "alpine:latest" all map to one manifest. */
+static void normalize_ref_name(const char *name, char *out, size_t n) {
+    const char *slash = strchr(name, '/');
+    const char *repo = name;
+    char registry[128];
+    registry[0] = '\0';
+    int hub = 1;
+    if (slash) {
+        size_t rl = (size_t)(slash - name);
+        if (rl >= sizeof(registry)) rl = sizeof(registry) - 1;
+        memcpy(registry, name, rl);
+        registry[rl] = '\0';
+        if (strchr(registry, '.') || strchr(registry, ':') ||
+            !strcmp(registry, "localhost")) {
+            repo = slash + 1;
+            hub = !strcmp(registry, "docker.io") ||
+                  !strcmp(registry, "registry-1.docker.io") ||
+                  !strcmp(registry, "index.docker.io");
+        }
+    }
+    if (hub) {
+        if (!strncmp(repo, "library/", 8)) repo += 8;
+        snprintf(out, n, "%s", repo);
+    } else {
+        snprintf(out, n, "%s/%s", registry, repo);
+    }
+}
+
+/* Manifest path: <store>/manifests/<normalized-name with '/'->'+'>/<tag>.
+ * Normalization makes "alpine" and "docker.io/library/alpine:latest" the
+ * same image. */
 static int ref_path(const char *image_str, char *out, size_t n) {
     ImageRef ref;
     if (image_parse(image_str, &ref) < 0) return -1;
+    char norm[MAX_IMAGE_NAME];
+    normalize_ref_name(ref.name, norm, sizeof(norm));
     char mangled[MAX_IMAGE_NAME];
     size_t i = 0;
-    for (; ref.name[i] && i + 1 < sizeof(mangled); i++)
-        mangled[i] = (ref.name[i] == '/') ? '+' : ref.name[i];
+    for (; norm[i] && i + 1 < sizeof(mangled); i++)
+        mangled[i] = (norm[i] == '/') ? '+' : norm[i];
     mangled[i] = '\0';
     if (snprintf(out, n, "%s/manifests/%s/%s", native_store_dir(), mangled, ref.tag)
         >= (int)n)
@@ -111,6 +145,21 @@ int native_blob_put(const char *data, size_t len, char *out_digest, size_t n) {
     return 0;
 }
 
+/* Store layer bytes as a blob + unpack to layers/<hex>/diff (dedup by
+ * digest). out_digest = "sha256:<hex>". Shared by commit and pull. */
+static int store_layer_bytes(const char *data, size_t len, char *out_digest, size_t n) {
+    if (native_blob_put(data, len, out_digest, n) < 0) return -1;
+    const char *hex = out_digest + 7;   /* skip "sha256:" */
+    char diff[NATIVE_PATH_MAX];
+    layer_diff_path(hex, diff, sizeof(diff));
+    struct stat st;
+    if (stat(diff, &st) != 0) {
+        if (mkdir_p(diff, 0755) < 0) return -1;
+        if (tar_extract_mem(data, len, diff) < 0) return -1;
+    }
+    return 0;
+}
+
 int native_commit_diff(const char *diff_dir, char *out_digest, size_t n) {
     char tmpdir[NATIVE_PATH_MAX], tmptar[NATIVE_PATH_MAX];
     snprintf(tmpdir, sizeof(tmpdir), "%s/tmp", native_store_dir());
@@ -123,19 +172,13 @@ int native_commit_diff(const char *diff_dir, char *out_digest, size_t n) {
     if (read_file(tmptar, &data, &len) < 0) { unlink(tmptar); return -1; }
     unlink(tmptar);
 
-    if (native_blob_put(data, len, out_digest, n) < 0) { free(data); return -1; }
-
-    /* Unpack to layers/<hex>/diff unless already present (dedup). */
-    const char *hex = out_digest + 7;   /* skip "sha256:" */
-    char diff[NATIVE_PATH_MAX];
-    layer_diff_path(hex, diff, sizeof(diff));
-    struct stat st;
-    if (stat(diff, &st) != 0) {
-        if (mkdir_p(diff, 0755) < 0) { free(data); return -1; }
-        if (tar_extract_mem(data, len, diff) < 0) { free(data); return -1; }
-    }
+    int rc = store_layer_bytes(data, len, out_digest, n);
     free(data);
-    return 0;
+    return rc;
+}
+
+int native_put_layer(const char *tardata, size_t len, char *out_digest, size_t n) {
+    return store_layer_bytes(tardata, len, out_digest, n);
 }
 
 int native_has(const char *image_str) {
@@ -210,11 +253,13 @@ int native_manifest_put(const char *image_str, const char *config_digest,
 
     ImageRef ref;
     if (image_parse(image_str, &ref) < 0) return -1;
+    char norm[MAX_IMAGE_NAME];
+    normalize_ref_name(ref.name, norm, sizeof(norm));
 
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fprintf(f, "{\"schemaVersion\":1,\"name\":\"%s\",\"tag\":\"%s\",",
-            ref.name, ref.tag);
+            norm, ref.tag);
     fprintf(f, "\"config\":\"%s\",", config_digest ? config_digest : "");
     fprintf(f, "\"layers\":[");
     for (int i = 0; i < nlayers; i++)
@@ -228,5 +273,63 @@ int native_manifest_put(const char *image_str, const char *config_digest,
     }
     fprintf(f, "}\n");
     fclose(f);
+    return 0;
+}
+
+int native_list(NativeImage *ents, int max) {
+    char mroot[NATIVE_PATH_MAX];
+    snprintf(mroot, sizeof(mroot), "%s/manifests", native_store_dir());
+    DIR *d = opendir(mroot);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *nd;
+    while ((nd = readdir(d)) != NULL && count < max) {
+        if (nd->d_name[0] == '.') continue;
+        char namedir[NATIVE_PATH_MAX];
+        snprintf(namedir, sizeof(namedir), "%s/%s", mroot, nd->d_name);
+        struct stat dst;
+        if (stat(namedir, &dst) != 0 || !S_ISDIR(dst.st_mode)) continue;
+        DIR *d2 = opendir(namedir);
+        if (!d2) continue;
+        struct dirent *te;
+        while ((te = readdir(d2)) != NULL && count < max) {
+            if (te->d_name[0] == '.') continue;
+            char mpath[NATIVE_PATH_MAX];
+            snprintf(mpath, sizeof(mpath), "%s/%s", namedir, te->d_name);
+            char *text = NULL;
+            if (read_file(mpath, &text, NULL) < 0) continue;
+            JNode *m = json_parse(text);
+            free(text);
+            if (!m) continue;
+            const char *nm = json_str(json_get(m, "name"));
+            const char *tg = json_str(json_get(m, "tag"));
+            snprintf(ents[count].name, sizeof(ents[count].name), "%s", nm ? nm : "");
+            snprintf(ents[count].tag, sizeof(ents[count].tag), "%s", tg ? tg : "");
+            JNode *arr = json_get(m, "layers");
+            int nl = (arr && arr->type == JARR) ? (int)arr->n : 0;
+            ents[count].nlayers = nl;
+            unsigned long long sz = 0;
+            for (int i = 0; i < nl; i++) {
+                const char *dg = json_str(json_at(arr, (size_t)i));
+                if (!dg || strncmp(dg, "sha256:", 7) != 0) continue;
+                char bp[NATIVE_PATH_MAX];
+                blob_path(dg + 7, bp, sizeof(bp));
+                struct stat bs;
+                if (stat(bp, &bs) == 0) sz += (unsigned long long)bs.st_size;
+            }
+            ents[count].size = sz;
+            json_free(m);
+            count++;
+        }
+        closedir(d2);
+    }
+    closedir(d);
+    return count;
+}
+
+int native_rmi(const char *image_str) {
+    char path[NATIVE_PATH_MAX];
+    if (ref_path(image_str, path, sizeof(path)) < 0) return -1;
+    if (unlink(path) < 0) return -1;
     return 0;
 }

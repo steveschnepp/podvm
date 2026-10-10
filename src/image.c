@@ -33,10 +33,12 @@
 #include "json.h"
 #include "sha256.h"
 #include "tar.h"
+#include "store_native.h"
 
 /* Default cache directory */
 #define DEFAULT_CACHE_DIR "/tmp/podvm/images"
 #define PATH_SIZE 2048
+#define MAX_PULL_LAYERS 128
 
 static char cache_dir[PATH_SIZE] = DEFAULT_CACHE_DIR;
 
@@ -547,33 +549,23 @@ int image_pull(const char *image_name, const char *tag) {
         if (!mani) return -1;
     }
 
-    /* 3. Download + extract layers */
-    char root[PATH_SIZE];
-    {
-        char repo[256];
-        mangle_repo(rr.repo, repo, sizeof(repo));
-        if (snprintf(root, sizeof(root), "%s/%s/%s/%s",
-                     cache_dir, rr.registry, repo, rr.tag) >= (int)sizeof(root)) {
-            json_free(mani);
-            return -1;
-        }
-    }
-    if (mkdir_p(root, 0755) < 0) {
-        fprintf(stderr, "podvm: cannot create rootfs dir %s: %s\n", root, strerror(errno));
-        json_free(mani);
-        return -1;
-    }
-
+    /* 3. Download layers into the native layered store (ADR-027): each
+     * uncompressed layer tar becomes a content-addressed blob + unpacked
+     * diff; the manifest records the ordered digests. No flattening. */
     JNode *layers = json_get(mani, "layers");
     if (!layers || layers->type != JARR) {
         fprintf(stderr, "podvm: manifest has no layers\n");
         json_free(mani);
         return -1;
     }
+    if (layers->n > MAX_PULL_LAYERS) layers->n = MAX_PULL_LAYERS;
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     int rc = 0;
+    char digests[MAX_PULL_LAYERS][NATIVE_DIGEST_MAX];
+    const char *dptrs[MAX_PULL_LAYERS];
+    int ndig = 0;
     for (size_t i = 0; i < layers->n && rc == 0; i++) {
         JNode *L = json_at(layers, i);
         const char *digest = json_str(json_get(L, "digest"));
@@ -636,9 +628,14 @@ int image_pull(const char *image_name, const char *tag) {
             bres.body.data = NULL; /* prevent double free */
         }
 
-        if (rc == 0 && tar_extract_mem(tar.data ? tar.data : "", tar.len, root) < 0) {
-            fprintf(stderr, "podvm: untar failed for layer %s\n", digest);
+        if (rc == 0 &&
+            native_put_layer(tar.data ? tar.data : "", tar.len,
+                             digests[ndig], sizeof(digests[ndig])) < 0) {
+            fprintf(stderr, "podvm: store layer failed for %s\n", digest);
             rc = -1;
+        } else if (rc == 0) {
+            dptrs[ndig] = digests[ndig];
+            ndig++;
         }
 
         if (decompressed) buf_free(&tar);
@@ -652,6 +649,8 @@ int image_pull(const char *image_name, const char *tag) {
      * still carries the image's default command. Best-effort: a missing
      * config blob just means the image carries no defaults.
      */
+    char config_digest[NATIVE_DIGEST_MAX];
+    config_digest[0] = '\0';
     if (rc == 0) {
         const char *cfgdigest = json_str(json_get(json_get(mani, "config"), "digest"));
         if (cfgdigest) {
@@ -662,16 +661,22 @@ int image_pull(const char *image_name, const char *tag) {
             buf_init(&cres.headers);
             if (registry_get(cfgurl, NULL, scope, &cres) == 0 && cres.body.data &&
                 digest_matches(cres.body.data, cres.body.len, cfgdigest)) {
-                char cfgpath[PATH_SIZE];
-                snprintf(cfgpath, sizeof(cfgpath), "%s/.podvm-config.json", root);
-                FILE *cf = fopen(cfgpath, "wb");
-                if (cf) {
-                    fwrite(cres.body.data, 1, cres.body.len, cf);
-                    fclose(cf);
-                }
+                native_blob_put(cres.body.data, cres.body.len,
+                                config_digest, sizeof(config_digest));
             }
             buf_free(&cres.body);
             buf_free(&cres.headers);
+        }
+    }
+
+    /* Write the manifest: bottom-first layer digests + config digest. */
+    if (rc == 0) {
+        char ref_str[MAX_IMAGE_NAME * 2 + 2];
+        snprintf(ref_str, sizeof(ref_str), "%s:%s", image_name, tag);
+        if (native_manifest_put(ref_str, config_digest,
+                                (const char *const *)dptrs, ndig, NULL, 0) < 0) {
+            fprintf(stderr, "podvm: cannot write native manifest for %s\n", ref_str);
+            rc = -1;
         }
     }
 
@@ -679,7 +684,7 @@ int image_pull(const char *image_name, const char *tag) {
     curl_global_cleanup();
 
     if (rc == 0)
-        printf("podvm: image %s:%s ready at %s\n", image_name, rr.tag, root);
+        printf("podvm: image %s:%s ready (%d layers)\n", image_name, tag, ndig);
     return rc;
 }
 
@@ -710,11 +715,15 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
         return -1;
     }
 
-    /* Check cache: <cache>/<registry>/<mangled-repo>/<tag> */
+    /* Podvm's layered store (ADR-027) holds a pulled/built image as a
+     * chain, not a merged dir. Signal the caller to stack it. */
+    if (native_has(image_str) == 0)
+        return IMAGE_RESOLVED_NATIVE;
+
+    /* Legacy flattened cache dir (pre-ADR-027 entries). */
     char image_dir[PATH_SIZE];
     if (image_cache_path(image_str, image_dir, sizeof(image_dir)) < 0)
         return -1;
-
     struct stat st;
     if (stat(image_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         strncpy(rootfs_path, image_dir, path_size - 1);
@@ -723,17 +732,14 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
         return 0;
     }
 
+    /* Pull (writes to the layered store), then signal the chain. */
     if (image_pull(ref.name, ref.tag) < 0)
         return -1;
+    if (native_has(image_str) == 0)
+        return IMAGE_RESOLVED_NATIVE;
 
-    if (stat(image_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "podvm: image dir missing after pull: %s\n", image_dir);
-        return -1;
-    }
-
-    strncpy(rootfs_path, image_dir, path_size - 1);
-    rootfs_path[path_size - 1] = '\0';
-    return 0;
+    fprintf(stderr, "podvm: image %s not in the store after pull\n", image_str);
+    return -1;
 }
 
 /*

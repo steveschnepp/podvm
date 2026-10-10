@@ -21,6 +21,7 @@
 
 #include "store_native.h"
 #include "image.h"
+#include "tar.h"
 
 static void mk(const char *p) { assert(mkdir(p, 0755) == 0); }
 static void wf(const char *p, const char *content) {
@@ -28,6 +29,19 @@ static void wf(const char *p, const char *content) {
     assert(f);
     fputs(content, f);
     fclose(f);
+}
+static char *read_file_all(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    assert(f);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    char *b = malloc((size_t)n);
+    assert(b);
+    size_t got = fread(b, 1, (size_t)n, f);
+    fclose(f);
+    if (len) *len = got;
+    return b;
 }
 
 int main(void) {
@@ -93,6 +107,35 @@ int main(void) {
     assert(strcmp(c.cwd, "/w") == 0);
     image_config_free(&c);
 
-    printf("PASS: native store (commit, dedup, manifest, chain order, config)\n");
+    /* native_put_layer: a layer tar (as the registry sends) becomes a
+     * layer; the same tar yields the same digest (dedup). */
+    char srcdir[512], tartar[512], pp[512];
+    snprintf(srcdir, sizeof(srcdir), "%s/src", T);
+    mk(srcdir);
+    snprintf(pp, sizeof(pp), "%s/c.txt", srcdir);
+    wf(pp, "C\n");
+    snprintf(tartar, sizeof(tartar), "%s/lay.tar", T);
+    assert(tar_pack_dir(srcdir, tartar) == 0);
+    size_t tlen = 0;
+    char *tdata = read_file_all(tartar, &tlen);
+    char pdig[NATIVE_DIGEST_MAX], pdig2[NATIVE_DIGEST_MAX];
+    assert(native_put_layer(tdata, tlen, pdig, sizeof(pdig)) == 0);
+    assert(native_put_layer(tdata, tlen, pdig2, sizeof(pdig2)) == 0);
+    assert(strcmp(pdig, pdig2) == 0);
+    free(tdata);
+
+    /* native_list finds the planted image with its layer count. */
+    NativeImage ni[16];
+    int nlist = native_list(ni, 16);
+    int found = 0;
+    for (int i = 0; i < nlist; i++) {
+        if (!strcmp(ni[i].name, "test/img") && !strcmp(ni[i].tag, "latest")) {
+            found = 1;
+            assert(ni[i].nlayers == 2);
+        }
+    }
+    assert(found);
+
+    printf("PASS: native store (commit, dedup, manifest, chain order, config, put_layer, list)\n");
     return 0;
 }
