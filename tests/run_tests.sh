@@ -67,6 +67,7 @@ run_test "Container state" "./tests/test_container"
 run_test "Build parser" "./tests/test_build"
 run_test "JSON parser" "./tests/test_json"
 run_test "Podman store" "./tests/test_store"
+run_test "Vsock alloc" "./tests/test_vsockalloc"
 
 echo ""
 echo "Running integration tests..."
@@ -142,6 +143,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
     # rm/--rm e2e: state removal on demand and on exit.
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
+    # Concurrency e2e: overlapping runs get distinct vsock CID + exit port.
+    run_test "E2E concurrency (distinct CID+port)" "timeout 150 sh tests/e2e_concurrency.sh"
     # Run-flag parity e2e: podman-parity run flags reach the guest.
     run_test "E2E run flags (podman parity)" "sh tests/e2e_runflags.sh"
     # Build e2e: Dockerfile -> runnable cached image (RUN = real VMs).

@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_build test_json test_store
+TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_build test_json test_store test_vsockalloc
 
 .PHONY: all test clean
 
@@ -57,6 +57,10 @@ test_json: test_json.c ../src/json.c ../src/json.h
 test_store: test_store.c ../src/store.c ../src/store.h ../src/image.c ../src/image.h ../src/json.c ../src/sha256.c
 	$(CC) $(CFLAGS) -o $@ test_store.c ../src/store.c ../src/image.c ../src/json.c ../src/sha256.c -I../src -lcurl -lz -lzstd
 
+# Vsock CID/port allocation tests (flock reservation; no deps)
+test_vsockalloc: test_vsockalloc.c ../src/vsockalloc.c ../src/vsockalloc.h
+	$(CC) $(CFLAGS) -o $@ test_vsockalloc.c ../src/vsockalloc.c -I../src
+
 # Run all tests
 test: $(TESTS)
 	@echo "Running tests..."
@@ -90,6 +94,9 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== Store Tests ==="
 	./test_store || true
+	@echo ""
+	@echo "=== Vsock Alloc Tests ==="
+	./test_vsockalloc || true
 	@echo ""
 	@echo "All tests complete!"
 

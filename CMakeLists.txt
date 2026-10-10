@@ -8,7 +8,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -O2)
 
 # Main executable
-add_executable(podvm src/main.c src/strparse.c src/image.c src/json.c src/store.c src/sha256.c src/imgcfg.c src/container.c src/build.c)
+add_executable(podvm src/main.c src/strparse.c src/image.c src/json.c src/store.c src/sha256.c src/imgcfg.c src/container.c src/build.c src/vsockalloc.c)
 
 # Find libcurl (registry), zlib (gzip) and libzstd (zstd layers)
 find_package(CURL)

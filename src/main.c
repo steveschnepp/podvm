@@ -36,6 +36,7 @@
 #include "imgcfg.h"
 #include "container.h"
 #include "build.h"
+#include "vsockalloc.h"
 
 #define MAX_PATH    1024
 #define MAX_CMDLINE 4096
@@ -123,32 +124,49 @@ static void handle_signal(int sig) {
 
 /* vsock port (must match guest listener) */
 #define VSOCK_PORT  5000
-/* Guest CID (must match -device vhost-vsock-pci,guest-cid=) */
-#define GUEST_CID_STR "3"
-#define GUEST_CID     3
 /* Guest address under slirp (must match the guest's static config) */
 #define GUEST_IP_STR "10.0.2.15"
 
 /* vsock availability on the host (auto-detected) */
 static int vsock_available = 0;
+/* Guest CID and exit-report port, allocated per VM by vsockalloc.c so
+ * concurrent runs do not collide (the kernel rejects a duplicate
+ * guest-cid, and two listeners cannot share a host vsock port). -1 until
+ * allocated; vsock_exit_port is set lazily by start_exit_helper, which
+ * only runs when a helper is actually started (i.e. not --detach). */
+static int vsock_cid = -1;
+static int vsock_exit_port = -1;
 
 /*
  * Exit-code reporting. The guest runs the entrypoint as a child and,
- * when it finishes, connects to the HOST (cid 2, port 5001) and writes
+ * when it finishes, connects to the HOST (cid 2, a per-run port) and
+ * writes
  * the exit code. QEMU's own exit status is meaningless for this (a
  * guest panic carries no command status), so without this channel
  * 'podvm run cmd' could never tell a script that cmd failed -- and
  * podvm build could not detect a failed RUN.
  *
  * The listener runs in a helper process so the QEMU wait is never
- * blocked; the code comes back over a pipe. One-shot per run/step.
+ * blocked; the code comes back over a pipe. One-shot per run/step. The
+ * port is allocated by vsockalloc.c (see vsock_exit_port) so concurrent
+ * runs' helpers do not collide on the host-global vsock port namespace.
  */
-#define VSOCK_EXIT_PORT 5001
 static pid_t exit_helper_pid = -1;
 static int exit_pipe[2] = { -1, -1 };
 
 static void start_exit_helper(void) {
     if (!vsock_available || exit_helper_pid > 0) return;
+    /* Claim a unique exit port. Allocated once and reused for every
+     * step of a build. */
+    if (vsock_exit_port <= 0) {
+        vsock_exit_port = vsock_alloc_port();
+        if (vsock_exit_port <= 0) {
+            fprintf(stderr, "podvm: no free vsock exit port (%s); "
+                            "this run's exit code will not be reported\n",
+                    vsock_lockdir());
+            return;
+        }
+    }
     if (pipe(exit_pipe) < 0) return;
 
     exit_helper_pid = fork();
@@ -160,7 +178,7 @@ static void start_exit_helper(void) {
         memset(&addr, 0, sizeof(addr));
         addr.svm_family = AF_VSOCK;
         addr.svm_cid = VMADDR_CID_ANY;
-        addr.svm_port = VSOCK_EXIT_PORT;
+        addr.svm_port = vsock_exit_port;
         if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
             listen(lfd, 1) < 0) {
             close(lfd);
@@ -354,18 +372,30 @@ static int tmpfs_add(const char *spec) {
     return 0;
 }
 
-/* Detect host vsock support via /dev/vhost-vsock */
+/* Detect host vsock support via /dev/vhost-vsock, and claim a unique
+ * guest CID for this VM. Without a free CID the vhost-vsock device
+ * cannot be created, so we degrade to cmdline-only config (the same
+ * no-vsock path) rather than boot a VM whose config channel and exit
+ * report would silently vanish. */
 static void detect_vsock(void) {
     struct stat st;
     vsock_available = (stat("/dev/vhost-vsock", &st) == 0);
     if (!vsock_available) {
         fprintf(stderr, "podvm: /dev/vhost-vsock not present; "
                         "falling back to cmdline config only\n");
+        return;
+    }
+    vsock_cid = vsock_alloc_cid();
+    if (vsock_cid < 0) {
+        fprintf(stderr, "podvm: no free vsock CID (%s); "
+                        "falling back to cmdline config only\n",
+                vsock_lockdir());
+        vsock_available = 0;
     }
 }
 
 /* Send config to guest via vsock.
- * The guest listens on GUEST_CID:VSOCK_PORT and reads a single line of
+ * The guest listens on <vsock_cid>:VSOCK_PORT and reads a single line of
  * space-separated podvm.*=... tokens (same format as the kernel cmdline).
  * Returns 0 on success, -1 on failure (caller falls back to cmdline). */
 static int send_config_vsock(const char *config_str) {
@@ -375,7 +405,7 @@ static int send_config_vsock(const char *config_str) {
 
     memset(&addr, 0, sizeof(addr));
     addr.svm_family = AF_VSOCK;
-    addr.svm_cid = GUEST_CID;   /* connect to the guest, not CID_ANY */
+    addr.svm_cid = vsock_cid;   /* connect to the guest, not CID_ANY */
     addr.svm_port = VSOCK_PORT;
 
     /* Retry until the guest listener comes up (guest boots async).
@@ -407,7 +437,7 @@ static int send_config_vsock(const char *config_str) {
 
     if (!connected) {
         fprintf(stderr, "podvm: vsock connect to cid %d port %d failed: %s\n",
-                GUEST_CID, VSOCK_PORT, strerror(errno));
+                vsock_cid, VSOCK_PORT, strerror(errno));
         if (fd >= 0) close(fd);
         return -1;
     }
@@ -611,6 +641,13 @@ static void build_config_tokens(char *buf, size_t len) {
         size_t used = strlen(buf);
         snprintf(buf + used, len - used, " podvm.hostname=%s", hostesc);
     }
+    /* The exit-report port this run's helper listens on. Sent only when
+     * one was allocated (not --detach), so the guest dials the port the
+     * host actually bound instead of the old hardcoded 5001. */
+    if (vsock_exit_port > 0) {
+        size_t used = strlen(buf);
+        snprintf(buf + used, len - used, " podvm.exitport=%d", vsock_exit_port);
+    }
 }
 
 /* Build kernel cmdline */
@@ -790,6 +827,7 @@ static int start_qemu(void) {
     char cpu_str[32];
     char fsdev_str[MAX_PATH + 64];
     char vsock_cid_str[32];
+    char vsock_dev[64];
     char netdev_str[512];
 
     /* Fail early with a diagnosis instead of a silent QEMU exit and no
@@ -824,7 +862,7 @@ static int start_qemu(void) {
     snprintf(fsdev_str, sizeof(fsdev_str),
              "local,id=fsdev0,path=%s,security_model=none%s",
              config.rootfs_dir, config.read_only ? ",readonly=on" : "");
-    snprintf(vsock_cid_str, sizeof(vsock_cid_str), "%d", GUEST_CID);
+    snprintf(vsock_cid_str, sizeof(vsock_cid_str), "%d", vsock_cid);
 
     printf("podvm: starting QEMU\n");
     printf("podvm:   kernel:    %s\n", config.kernel);
@@ -841,6 +879,9 @@ static int start_qemu(void) {
                publishes[i].hostip, publishes[i].hostport,
                publishes[i].containerport);
     printf("podvm:   cmdline:   %s\n", cmdline);
+    /* Diagnostics must reach a redirected log before QEMU's serial
+     * output interleaves; stdout is block-buffered to a file. */
+    fflush(stdout);
 
     /* Machine / resources */
     qargs[qi++] = "qemu-system-x86_64";
@@ -887,10 +928,13 @@ static int start_qemu(void) {
         qargs[qi++] = "-netdev";  qargs[qi++] = netdev_str;
         qargs[qi++] = "-device";  qargs[qi++] = "virtio-net-pci,netdev=net0";
     }
-    /* vsock (only when the host supports it) */
+    /* vsock (only when the host supports it); the CID is this VM's
+     * allocated one, so concurrent VMs never share a guest-cid. */
     if (vsock_available) {
+        snprintf(vsock_dev, sizeof(vsock_dev),
+                 "vhost-vsock-pci,id=vsock0,guest-cid=%d", vsock_cid);
         qargs[qi++] = "-device";
-        qargs[qi++] = "vhost-vsock-pci,id=vsock0,guest-cid=" GUEST_CID_STR;
+        qargs[qi++] = vsock_dev;
     }
     /* Kernel + initrd + cmdline */
     qargs[qi++] = "-kernel";  qargs[qi++] = config.kernel;

@@ -48,7 +48,9 @@
 #define VSOCK_PORT       5000
 #define VSOCK_TIMEOUT_MS 3000
 /* Exit-report channel: the guest connects to the HOST (cid 2) after the
- * entrypoint finishes and writes its exit code. (must match host) */
+ * entrypoint finishes and writes its exit code. This is the DEFAULT port;
+ * the host may allocate a different one per VM (concurrent runs do not
+ * share a port) and tell the guest via podvm.exitport=. */
 #define VSOCK_EXIT_PORT  5001
 
 /* Configuration from kernel cmdline / host vsock */
@@ -70,6 +72,8 @@ typedef struct {
     int  nvol;
     char *tmpfs[MAX_VOLUMES]; /* target dirs from podvm.tmpfs= */
     int  ntmpfs;
+    int  exit_port;         /* exit-report port; host may override via
+                             * podvm.exitport= (default VSOCK_EXIT_PORT) */
 } Config;
 
 /* Read /proc/cmdline */
@@ -171,6 +175,19 @@ static void parse_config(Config *cfg, const char *text) {
         csv_free(cfg->tmpfs, cfg->ntmpfs);
         cfg->ntmpfs = (strcmp(tok, "-") == 0)
                     ? 0 : csv_parse(tok, cfg->tmpfs, MAX_VOLUMES);
+    }
+
+    /* podvm.exitport=: the host-allocated port for the exit-report
+     * channel (so concurrent VMs do not share one). Defaults to
+     * VSOCK_EXIT_PORT when absent (older host, or cmdline-only config). */
+    val = kv_find(text, "podvm.exitport=");
+    if (val) {
+        char tok[32];
+        kv_copy_value(tok, sizeof(tok), val);
+        kv_unescape(tok);
+        int p = atoi(tok);
+        if (p > 0)
+            cfg->exit_port = p;
     }
 }
 
@@ -400,7 +417,7 @@ static int mount_rootfs(const Config *cfg) {
  * or vsock is unavailable, we just go on -- the host falls back to its
  * historical behavior instead of hanging.
  */
-static void report_exit(int code) {
+static void report_exit(int code, int port) {
     struct sockaddr_vm addr;
     int fd = -1;
 
@@ -410,7 +427,7 @@ static void report_exit(int code) {
         memset(&addr, 0, sizeof(addr));
         addr.svm_family = AF_VSOCK;
         addr.svm_cid = VMADDR_CID_HOST;
-        addr.svm_port = VSOCK_EXIT_PORT;
+        addr.svm_port = port;
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
         close(fd);
         fd = -1;
@@ -440,6 +457,7 @@ int main(void) {
 
     /* Step 2: Baseline config from kernel cmdline */
     memset(&cfg, 0, sizeof(cfg));
+    cfg.exit_port = VSOCK_EXIT_PORT;   /* default; podvm.exitport= overrides */
     if (read_cmdline(cmdline, sizeof(cmdline)) < 0) {
         fprintf(stderr, "podvm-init: cannot read /proc/cmdline\n");
         return 1;
@@ -615,6 +633,6 @@ int main(void) {
     waitpid(pid, &status, 0);
     int code = WIFEXITED(status) ? WEXITSTATUS(status)
             : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
-    report_exit(code);
+    report_exit(code, cfg.exit_port);
     return code;
 }
