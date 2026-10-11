@@ -1439,8 +1439,12 @@ static int cmd_build(int argc, char **argv) {
     ImageConfig ic;
     image_config_init(&ic);
     int from_podman = 0, from_lock = -1;
-    char layer_chain[MAX_CHAIN][MAX_PATH];
+    char layer_chain[MAX_CHAIN][MAX_PATH];   /* committed step native diff dirs, top-first */
     int nlayers = 0;
+    char step_dig[MAX_CHAIN][NATIVE_DIGEST_MAX];  /* step digests, build order */
+    int nstepdig = 0;
+    char base_dig_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* base digests, bottom-first */
+    int nbase_dig = 0;
     char envlist[4096] = "";
     char cwd[MAX_PATH] = "", user[128] = "";
     char cmdcsv[4096] = "", entrycsv[4096] = "";
@@ -1466,6 +1470,17 @@ static int cmd_build(int argc, char **argv) {
             for (int l = 0; l < c && l < MAX_CHAIN; l++)
                 snprintf(base_diffs[l], MAX_PATH, "%s", lay[l].diff);
             nbase = c;
+            /* Commit each base layer into the native store (bottom-first
+             * for the manifest). Copy-to-native, simple; optimize later. */
+            nbase_dig = c;
+            for (int l = 0; l < c && l < MAX_CHAIN; l++) {
+                if (native_commit_diff(lay[l].diff, base_dig_bottom[c - 1 - l],
+                                       sizeof(base_dig_bottom[0])) < 0) {
+                    fprintf(stderr, "podvm build: cannot commit base layer\n");
+                    rc = 1;
+                    goto out;
+                }
+            }
             store_image_config(from, &ic);
             from_podman = 1;
         } else {
@@ -1483,10 +1498,22 @@ static int cmd_build(int argc, char **argv) {
                 for (int l = 0; l < c && l < MAX_CHAIN; l++)
                     snprintf(base_diffs[l], MAX_PATH, "%s", nl[l].diff);
                 nbase = c;
+                /* Reuse the base's existing digests (bottom-first). */
+                nbase_dig = c;
+                for (int l = 0; l < c && l < MAX_CHAIN; l++)
+                    snprintf(base_dig_bottom[c - 1 - l],
+                             sizeof(base_dig_bottom[0]), "%s", nl[l].digest);
                 native_config(from, &ic);
             } else if (r == 0) {
                 snprintf(base_diffs[0], MAX_PATH, "%s", root);
                 nbase = 1;
+                nbase_dig = 1;
+                if (native_commit_diff(root, base_dig_bottom[0],
+                                       sizeof(base_dig_bottom[0])) < 0) {
+                    fprintf(stderr, "podvm build: cannot commit base layer\n");
+                    rc = 1;
+                    goto out;
+                }
                 image_config_load(from, &ic);
                 /* The base rootfs is served to every step VM: hold a
                  * shared lock so rmi cannot delete it mid-build. */
@@ -1631,12 +1658,23 @@ static int cmd_build(int argc, char **argv) {
                 goto out;
             }
             printf("podvm: step %d: COPY %s %s\n", i, op->a, op->b);
-            chain_insert_front(layer_chain, &nlayers, ldir);
+            {
+                char dig[NATIVE_DIGEST_MAX], ndir[MAX_PATH];
+                if (native_commit_diff(ldir, dig, sizeof(dig)) < 0) {
+                    fprintf(stderr, "podvm build: cannot commit COPY layer\n");
+                    rc = 1;
+                    goto out;
+                }
+                native_diff_path(dig, ndir, sizeof(ndir));
+                chain_insert_front(layer_chain, &nlayers, ndir);
+                snprintf(step_dig[nstepdig], sizeof(step_dig[0]), "%s", dig);
+                nstepdig++;
+            }
             break;
         }
         case BRUN: {
             char stepname[64], sdir[CONTAINER_PATH_MAX];
-            char upath[MAX_PATH], spath[MAX_PATH], ldir[MAX_PATH];
+            char upath[MAX_PATH], spath[MAX_PATH];
             snprintf(stepname, sizeof(stepname), "pb%dp%d-s%d",
                      (int)getpid(), (int)getppid(), i);
 
@@ -1719,19 +1757,24 @@ static int cmd_build(int argc, char **argv) {
                 goto out;
             }
 
-            /* Commit: the upper IS the new layer. */
-            snprintf(ldir, sizeof(ldir), "%s/l%03d", layersdir, i);
-            if (rename(upath, ldir) < 0) {
-                fprintf(stderr, "podvm build: cannot commit the step layer: %s\n",
-                        strerror(errno));
-                container_rm_rf(sdir);
-                container_lock_unlink(stepname);
-                rc = 1;
-                goto out;
+            /* Commit: the step upper becomes a native layer (whiteouts
+             * preserved as char 0:0 by the userns unpack). */
+            {
+                char dig[NATIVE_DIGEST_MAX], ndir[MAX_PATH];
+                if (native_commit_diff(upath, dig, sizeof(dig)) < 0) {
+                    fprintf(stderr, "podvm build: cannot commit the step layer\n");
+                    container_rm_rf(sdir);
+                    container_lock_unlink(stepname);
+                    rc = 1;
+                    goto out;
+                }
+                native_diff_path(dig, ndir, sizeof(ndir));
+                chain_insert_front(layer_chain, &nlayers, ndir);
+                snprintf(step_dig[nstepdig], sizeof(step_dig[0]), "%s", dig);
+                nstepdig++;
             }
             container_rm_rf(sdir);
             container_lock_unlink(stepname);
-            chain_insert_front(layer_chain, &nlayers, ldir);
             break;
         }
         default:
@@ -1739,77 +1782,23 @@ static int cmd_build(int argc, char **argv) {
         }
     }
 
-    /* ── assemble the merged view into the cache ── */
+    /* ── write the image manifest + config to the native store ── */
     {
-        char final[STORE_PATH_MAX];
-        if (image_cache_path(tag, final, sizeof(final)) < 0) {
-            fprintf(stderr, "podvm build: cannot place image %s in the cache\n", tag);
-            rc = 1;
-            goto out;
-        }
-        if (container_rm_rf(final) < 0 && errno != ENOENT) {
-            fprintf(stderr, "podvm build: cannot replace %s: %s\n",
-                    final, strerror(errno));
-            rc = 1;
-            goto out;
-        }
-        if (mkdir_p(final, 0755) < 0) {
-            fprintf(stderr, "podvm build: cannot create %s: %s\n",
-                    final, strerror(errno));
-            rc = 1;
-            goto out;
-        }
-
-        store_nlayers = 0;
-        for (int l = 0; l < nlayers && store_nlayers < MAX_CHAIN; l++)
-            snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
-                     "%s", layer_chain[l]);
-        for (int b = 0; b < nbase && store_nlayers < MAX_CHAIN; b++)
-            snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
-                     "%s", base_diffs[b]);
-
-        pid_t apid = fork();
-        if (apid == 0) {
-            /* Child: userns overlay over the full chain (the kernel
-             * assembles whiteouts/opaque dirs), then cp the merged
-             * view into the cache dir. */
-            snprintf(config.rootfs_dir, sizeof(config.rootfs_dir),
-                     "/tmp/podvm-build-merge.%d", (int)getpid());
-            config.name[0] = '\0';
-            config.read_only = 0;
-            if (setup_userns_overlay() < 0) _exit(1);
-            pid_t cpid = fork();
-            if (cpid == 0) {
-                char srcdot[MAX_PATH + 4], dst[MAX_PATH + 4];
-                snprintf(srcdot, sizeof(srcdot), "%s/.", config.rootfs_dir);
-                snprintf(dst, sizeof(dst), "%s/", final);
-                /* --no-preserve=ownership: root-owned files are not
-                 * mapped into our userns (chown -> EINVAL), and the
-                 * pull path's untar never preserved ownership either.
-                 * Everything lands owned by the invoking user. */
-                execlp("cp", "cp", "-a", "--no-preserve=ownership",
-                       srcdot, dst, (char *)NULL);
-                _exit(127);
-            }
-            int st = 0;
-            waitpid(cpid, &st, 0);
-            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
-        }
-        int ast = 0;
-        waitpid(apid, &ast, 0);
-        if (!WIFEXITED(ast) || WEXITSTATUS(ast) != 0) {
-            fprintf(stderr, "podvm build: assembling the image failed\n");
-            rc = 1;
-            goto out;
-        }
+        /* Manifest layers, bottom-first: base (bottom) then steps in
+         * build order (top). */
+        const char *aptr[MAX_CHAIN * 2];
+        int nall = 0;
+        for (int b = 0; b < nbase_dig; b++)
+            aptr[nall++] = base_dig_bottom[b];
+        for (int s = 0; s < nstepdig; s++)
+            aptr[nall++] = step_dig[s];
 
         /* The OCI-shaped config blob the run path already reads. */
-        char cfgpath[MAX_PATH + 32];
-        snprintf(cfgpath, sizeof(cfgpath), "%s/.podvm-config.json", final);
-        FILE *cf = fopen(cfgpath, "w");
+        char *cfgjson = NULL;
+        size_t cfglen = 0;
+        FILE *cf = open_memstream(&cfgjson, &cfglen);
         if (!cf) {
-            fprintf(stderr, "podvm build: cannot write %s: %s\n",
-                    cfgpath, strerror(errno));
+            fprintf(stderr, "podvm build: cannot build the config\n");
             rc = 1;
             goto out;
         }
@@ -1822,12 +1811,25 @@ static int cmd_build(int argc, char **argv) {
         json_csv_array(cf, "Entrypoint", entrycsv);
         fprintf(cf, ",");
         json_csv_array(cf, "Cmd", cmdcsv);
-        fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}}\n",
-                escwd, escuser);
-        fclose(cf);
+        fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}}", escwd, escuser);
+        fclose(cf);   /* flushes cfgjson/cfglen */
 
-        printf("podvm: built %s (%d layer%s) at %s\n",
-               tag, nlayers + nbase, (nlayers + nbase) == 1 ? "" : "s", final);
+        char cfg_digest[NATIVE_DIGEST_MAX];
+        if (native_blob_put(cfgjson, cfglen, cfg_digest, sizeof(cfg_digest)) < 0) {
+            fprintf(stderr, "podvm build: cannot store the config blob\n");
+            free(cfgjson);
+            rc = 1;
+            goto out;
+        }
+        free(cfgjson);
+
+        if (native_manifest_put(tag, cfg_digest, aptr, nall, NULL, 0) < 0) {
+            fprintf(stderr, "podvm build: cannot write the manifest for %s\n", tag);
+            rc = 1;
+            goto out;
+        }
+
+        printf("podvm: built %s (%d layers)\n", tag, nall);
     }
 
 out:

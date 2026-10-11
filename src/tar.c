@@ -84,7 +84,20 @@ static void apply_whiteout(const char *root, const char *dirname, const char *ba
         remove(path);
 }
 
+static int extract(const char *tar, size_t tarlen, const char *root, int preserve);
+
 int tar_extract_mem(const char *tar, size_t tarlen, const char *root) {
+    return extract(tar, tarlen, root, 0);
+}
+
+/* Layer unpack (native store): whiteouts become char 0:0 devices so
+ * overlayfs stacking honors cross-layer deletions. Must run inside a
+ * userns (mknod of a char device needs CAP_MKNOD there). */
+int tar_extract_layer(const char *tar, size_t tarlen, const char *root) {
+    return extract(tar, tarlen, root, 1);
+}
+
+static int extract(const char *tar, size_t tarlen, const char *root, int preserve) {
     size_t off = 0;
     char longname[PATH_SIZE] = "";
 
@@ -147,7 +160,25 @@ int tar_extract_mem(const char *tar, size_t tarlen, const char *root) {
             const char *slash = strrchr(full, '/');
             if (slash) { size_t dl = (size_t)(slash - full); if (dl >= sizeof(dir)) dl = sizeof(dir) - 1; memcpy(dir, full, dl); dir[dl] = '\0'; }
             else dir[0] = '\0';
-            apply_whiteout(root, dir, base);
+            if (preserve && strcmp(base, ".wh..wh..opq") != 0) {
+                /* Materialize as a char 0:0 whiteout device (userns
+                 * required). Opaque dirs (.wh..wh..opq) are not yet
+                 * materialized -- a known limitation. */
+                char wpath[PATH_SIZE], fpath[PATH_SIZE], parent[PATH_SIZE];
+                if (dir[0])
+                    snprintf(wpath, sizeof(wpath), "%s/%s", dir, base + 4);
+                else
+                    snprintf(wpath, sizeof(wpath), "%s", base + 4);
+                if (safe_path(fpath, sizeof(fpath), root, wpath) == 0) {
+                    snprintf(parent, sizeof(parent), "%s", fpath);
+                    char *sl = strrchr(parent, '/');
+                    if (sl) *sl = '\0';
+                    mkdir_p(parent, 0755);
+                    mknod(fpath, S_IFCHR | 0000, makedev(0, 0));
+                }
+            } else if (!preserve) {
+                apply_whiteout(root, dir, base);   /* legacy flatten */
+            }
             off += data_blocks;
             continue;
         }

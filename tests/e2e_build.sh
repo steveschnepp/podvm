@@ -24,6 +24,9 @@ WORK=$(mktemp -d /tmp/podvm-e2e-build.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 export XDG_STATE_HOME="$WORK/state"
+# Isolate the native layered store (the build now writes there) so the
+# test is hermetic and does not touch the user's real store.
+export PODVM_STORE_DIR="$WORK/store"
 PODVM=build/podvm
 IMGREF="podvm-e2e-build:test"
 

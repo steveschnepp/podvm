@@ -11,10 +11,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int mkdir_p(const char *path, int mode) {
@@ -145,6 +147,34 @@ int native_blob_put(const char *data, size_t len, char *out_digest, size_t n) {
     return 0;
 }
 
+/* Unpack a layer tar into root inside a short-lived user+mount ns, where
+ * we are uid 0 so mknod(char 0:0) whiteouts succeed -- the same trick
+ * rootless podman uses. The tar data pointer is inherited across fork. */
+static int unpack_layer_in_userns(const char *data, size_t len, const char *root) {
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) _exit(1);
+        int fd = open("/proc/self/setgroups", O_WRONLY);
+        if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "0 %u 1", (unsigned)uid);
+        fd = open("/proc/self/uid_map", O_WRONLY);
+        if (fd < 0 || write(fd, buf, (size_t)n) != n) _exit(1);
+        close(fd);
+        n = snprintf(buf, sizeof(buf), "0 %u 1", (unsigned)gid);
+        fd = open("/proc/self/gid_map", O_WRONLY);
+        if (fd < 0 || write(fd, buf, (size_t)n) != n) _exit(1);
+        close(fd);
+        _exit(tar_extract_layer(data, len, root) == 0 ? 0 : 1);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+}
+
 /* Store layer bytes as a blob + unpack to layers/<hex>/diff (dedup by
  * digest). out_digest = "sha256:<hex>". Shared by commit and pull. */
 static int store_layer_bytes(const char *data, size_t len, char *out_digest, size_t n) {
@@ -155,7 +185,7 @@ static int store_layer_bytes(const char *data, size_t len, char *out_digest, siz
     struct stat st;
     if (stat(diff, &st) != 0) {
         if (mkdir_p(diff, 0755) < 0) return -1;
-        if (tar_extract_mem(data, len, diff) < 0) return -1;
+        if (unpack_layer_in_userns(data, len, diff) < 0) return -1;
     }
     return 0;
 }
@@ -179,6 +209,11 @@ int native_commit_diff(const char *diff_dir, char *out_digest, size_t n) {
 
 int native_put_layer(const char *tardata, size_t len, char *out_digest, size_t n) {
     return store_layer_bytes(tardata, len, out_digest, n);
+}
+
+void native_diff_path(const char *digest, char *out, size_t n) {
+    const char *hex = (digest && !strncmp(digest, "sha256:", 7)) ? digest + 7 : "";
+    layer_diff_path(hex, out, n);
 }
 
 int native_has(const char *image_str) {

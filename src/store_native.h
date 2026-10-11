@@ -57,6 +57,9 @@ int native_commit_diff(const char *diff_dir, char *out_digest, size_t n);
  * by pull (Phase 2) and tests to plant a config. 0 on success. */
 int native_blob_put(const char *data, size_t len, char *out_digest, size_t n);
 
+/* Overlay lowerdir path for a layer digest (S/layers/<hex>/diff). */
+void native_diff_path(const char *digest, char *out, size_t n);
+
 /* Store an uncompressed layer tar (already in memory, e.g. a registry
  * blob) as a layer: blob + unpack to layers/<hex>/diff (dedup by digest).
  * The pull-side counterpart to native_commit_diff. Writes the digest. */

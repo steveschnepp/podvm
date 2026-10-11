@@ -16,6 +16,11 @@
  * whiteouts (.wh.<name>, .wh..wh..opq). Returns 0 on success. */
 int tar_extract_mem(const char *tar, size_t len, const char *root);
 
+/* Layer unpack for the native store: whiteouts become char 0:0 devices
+ * (overlayfs honors them when layers are stacked as lowerdirs). Must run
+ * inside a userns so mknod of a char device succeeds. */
+int tar_extract_layer(const char *tar, size_t len, const char *root);
+
 /* Recursively pack the directory tree at root into a ustar tar written to
  * out_path. Emits directories, regular files, and symlinks; an overlay
  * whiteout (char 0:0 device) becomes a portable .wh.<name> entry. Names
