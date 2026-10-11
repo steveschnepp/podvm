@@ -665,3 +665,23 @@ int native_gc(int *freed) {
     if (freed) *freed = nfreed;
     return 0;
 }
+
+int native_lock_path(const char *image_str, char *out, size_t n) {
+    ImageRef ref;
+    if (image_parse(image_str, &ref) < 0) return -1;
+    char norm[MAX_IMAGE_NAME];
+    normalize_ref_name(ref.name, norm, sizeof(norm));
+    char flat[MAX_IMAGE_NAME * 2 + 2];
+    size_t i = 0, j = 0;
+    for (; norm[i] && j + 1 < sizeof(flat); i++)
+        flat[j++] = (norm[i] == '/') ? '+' : norm[i];
+    flat[j++] = '+';
+    for (i = 0; ref.tag[i] && j + 1 < sizeof(flat); i++)
+        flat[j++] = (ref.tag[i] == '/') ? '+' : ref.tag[i];
+    flat[j] = '\0';
+    char dir[NATIVE_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/locks", native_store_dir());
+    if (mkdir_p(dir, 0755) < 0) return -1;
+    if (snprintf(out, n, "%s/%s", dir, flat) >= (int)n) return -1;
+    return 0;
+}

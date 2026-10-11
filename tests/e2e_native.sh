@@ -51,10 +51,6 @@ fi
 make -s -C guest || fail "guest build"
 guest/build-initramfs.sh "$WORK/initramfs.cpio" > /dev/null || fail "initramfs"
 
-# Also clear the legacy flattened cache so image_resolve's pre-ADR-027
-# check cannot short-circuit to an old merged dir instead of pulling.
-rm -rf /tmp/podvm/images/docker.io/library+busybox
-
 # Run with the native backend forced. No command given: the image's own
 # Cmd must be used, which also proves the config blob was cached.
 PODVM_RESOLVE=native timeout "$TIMEOUT_SECS" \

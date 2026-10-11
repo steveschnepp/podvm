@@ -116,7 +116,7 @@ fi
 "$PODVM" rmi podvm-e2e-build:test > "$WORK/rmi.log" 2>&1 \
     || { cp "$WORK/rmi.log" "$WORK/last.log"; fail "rmi of the built image failed"; }
 "$PODVM" images > "$WORK/i3.log" 2>&1
-grep -q "podvm-e2e-build" "$WORK/i3.log" && fail "built image still listed after rmi"
+grep -Eq '^podvm-e2e-build +test' "$WORK/i3.log" && fail "built image still listed after rmi"
 
 echo "E2E-BUILD PASS: Dockerfile -> runnable image; whiteouts, COPY, config, rmi all hold"
 exit 0

@@ -86,6 +86,10 @@ int native_load(const char *tar_path);
  * *freed (optional) to the number of entries removed. */
 int native_gc(int *freed);
 
+/* Deterministic lock path for an image ref (<store>/locks/<mangled-ref>),
+ * for the run-vs-rmi in-use guard. The file is never deleted. */
+int native_lock_path(const char *image_str, char *out, size_t n);
+
 /* Create/replace ref's manifest: config digest + ordered layer digests
  * (bottom-first) + optional history lines. 0 on success. */
 int native_manifest_put(const char *image_str, const char *config_digest,

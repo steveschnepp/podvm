@@ -41,10 +41,8 @@ make -s -C guest || fail "guest build"
 guest/build-initramfs.sh "$WORK/initramfs.cpio" > /dev/null || fail "initramfs"
 
 # Isolate the native layered store so the test is hermetic (and does not
-# touch the user's real store); clear any legacy flattened-cache alpine so
-# the listing/rmi assertions start from a known state.
+# touch the user's real store).
 export PODVM_STORE_DIR="$WORK/store"
-rm -rf /tmp/podvm/images/docker.io/library+alpine
 
 # Warm the native cache through podvm's own pull path (skipped when the
 # cache already has it).

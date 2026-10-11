@@ -1128,11 +1128,10 @@ enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002,
        OPT_READONLY = 1003, OPT_TMPFS = 1004, OPT_HOSTNAME = 1005 };
 
 /*
- * `podvm images` -- list the image cache (native pulls AND podvm build
- * output; the two share one layout, so run/images/rmi see one cache).
+ * `podvm images` -- list the podvm store (pulls and build output).
  */
-static int cmp_imgent(const void *a, const void *b) {
-    const ImageCacheEntry *x = a, *y = b;
+static int cmp_natimg(const void *a, const void *b) {
+    const NativeImage *x = a, *y = b;
     int c = strcmp(x->name, y->name);
     return c ? c : strcmp(x->tag, y->tag);
 }
@@ -1150,33 +1149,19 @@ static void human_size(unsigned long long b, char *out, size_t n) {
 
 static int cmd_images(void) {
     enum { MAX_IMGS = 512 };
-    static ImageCacheEntry ents[MAX_IMGS];
-    int n = image_cache_list(ents, MAX_IMGS);
-    if (n < 0) {
-        fprintf(stderr, "podvm: cannot list the image cache\n");
-        return 1;
-    }
     static NativeImage nents[MAX_IMGS];
     int nn = native_list(nents, MAX_IMGS);
-    if (n == 0 && nn == 0) {
+    if (nn == 0) {
         printf("no images (native store %s)\n", native_store_dir());
         return 0;
     }
-    qsort(ents, (size_t)n, sizeof(ents[0]), cmp_imgent);
-
-    printf("%-48s %-12s %-10s %-7s %s\n", "NAME", "TAG", "IMAGE ID", "LAYERS", "SIZE");
-    for (int i = 0; i < n; i++) {
-        char sz[32];
-        human_size(ents[i].size, sz, sizeof(sz));
-        printf("%-48s %-12s %-10s %-7s %s\n",
-               ents[i].name, ents[i].tag, ents[i].id, "-", sz);
-    }
+    qsort(nents, (size_t)nn, sizeof(nents[0]), cmp_natimg);
+    printf("%-48s %-12s %-7s %s\n", "NAME", "TAG", "LAYERS", "SIZE");
     for (int i = 0; i < nn; i++) {
         char sz[32], lay[16];
         human_size(nents[i].size, sz, sizeof(sz));
         snprintf(lay, sizeof(lay), "%d", nents[i].nlayers);
-        printf("%-48s %-12s %-10s %-7s %s\n",
-               nents[i].name, nents[i].tag, "-", lay, sz);
+        printf("%-48s %-12s %-7s %s\n", nents[i].name, nents[i].tag, lay, sz);
     }
     return 0;
 }
@@ -1198,20 +1183,12 @@ static int cmd_rmi(int argc, char **argv) {
     int rc = 0;
     for (int i = 2; i < argc; i++) {
         const char *ref = argv[i];
-        char dir[STORE_PATH_MAX];
-        struct stat st;
-
         if (image_is_path(ref)) {
             fprintf(stderr, "podvm: not an image reference: %s\n", ref);
             rc = 1;
             continue;
         }
-        int is_native = (native_has(ref) == 0);
-        int is_old = 0;
-        if (image_cache_path(ref, dir, sizeof(dir)) == 0 &&
-            stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
-            is_old = 1;
-        if (!is_native && !is_old) {
+        if (native_has(ref) != 0) {
             fprintf(stderr, "podvm: no such image: %s\n", ref);
             rc = 1;
             continue;
@@ -1229,16 +1206,11 @@ static int cmd_rmi(int argc, char **argv) {
             continue;
         }
 
-        /* An image can live in the native store, the legacy cache, or
-         * both -- remove from each it occupies. */
-        int ok = 1;
-        int rme = 0;
-        if (is_native && native_rmi(ref) < 0) { ok = 0; rme = errno; }
-        if (is_old && container_rm_rf(dir) < 0) { ok = 0; rme = errno; }
+        int rmc = native_rmi(ref);
+        int rme = errno;
         close(lockfd);
-        if (!ok) {
-            fprintf(stderr, "podvm: cannot remove %s: %s\n",
-                    ref, strerror(rme));
+        if (rmc < 0) {
+            fprintf(stderr, "podvm: cannot remove %s: %s\n", ref, strerror(rme));
             rc = 1;
             continue;
         }
@@ -1606,26 +1578,6 @@ static int cmd_build(int argc, char **argv) {
                     snprintf(base_dig_bottom[c - 1 - l],
                              sizeof(base_dig_bottom[0]), "%s", nl[l].digest);
                 native_config(from, &ic);
-            } else if (r == 0) {
-                snprintf(base_diffs[0], MAX_PATH, "%s", root);
-                nbase = 1;
-                nbase_dig = 1;
-                if (native_commit_diff(root, base_dig_bottom[0],
-                                       sizeof(base_dig_bottom[0])) < 0) {
-                    fprintf(stderr, "podvm build: cannot commit base layer\n");
-                    rc = 1;
-                    goto out;
-                }
-                image_config_load(from, &ic);
-                /* The base rootfs is served to every step VM: hold a
-                 * shared lock so rmi cannot delete it mid-build. */
-                from_lock = image_lock(from, 0);
-                if (from_lock < 0) {
-                    fprintf(stderr, "podvm build: cannot lock base image %s: %s\n",
-                            from, strerror(errno));
-                    rc = 1;
-                    goto out;
-                }
             } else {
                 fprintf(stderr, "podvm build: cannot resolve FROM image %s\n", from);
                 rc = 1;
@@ -2483,9 +2435,7 @@ int main(int argc, char **argv) {
         image_config_init(&ic);
         int got = used_native
                 ? native_config(image_ref, &ic)
-                : used_podman
-                ? store_image_config(image_ref, &ic)
-                : image_config_load(image_ref, &ic);
+                : store_image_config(image_ref, &ic);
         if (got == 0)
             apply_image_config(&ic);
         image_config_free(&ic);

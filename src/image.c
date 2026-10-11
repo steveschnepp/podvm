@@ -35,45 +35,10 @@
 #include "tar.h"
 #include "store_native.h"
 
-/* Default cache directory */
-#define DEFAULT_CACHE_DIR "/tmp/podvm/images"
 #define PATH_SIZE 2048
 #define MAX_PULL_LAYERS 128
 
-static char cache_dir[PATH_SIZE] = DEFAULT_CACHE_DIR;
-
 /* ───────────────────────── small helpers ───────────────────────── */
-
-/*
- * Cache layout: <cache>/<registry>/<repo with '/' mangled to '+'>/<tag>.
- * Flattening the repo keeps the walk unambiguous -- exactly three
- * levels, and a repo dir can never be mistaken for a tag dir (which a
- * nested "library/alpine" layout made impossible to tell apart from
- * "library" + tag "alpine").
- */
-static void mangle_repo(const char *repo, char *out, size_t n) {
-    size_t i = 0;
-    for (; repo[i] && i + 1 < n; i++)
-        out[i] = (repo[i] == '/') ? '+' : repo[i];
-    out[i] = '\0';
-}
-
-static int mkdir_p(const char *path, int mode) {
-    char tmp[PATH_SIZE];
-    char *p;
-
-    if (strlen(path) >= sizeof(tmp)) return -1;
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
-    return 0;
-}
 
 /* Growable byte buffer */
 typedef struct { char *data; size_t len; size_t cap; } Buf;
@@ -483,10 +448,6 @@ int image_is_path(const char *str) {
     return 0;
 }
 
-const char *image_cache_dir(void) {
-    return cache_dir;
-}
-
 int image_pull(const char *image_name, const char *tag) {
     RegRef rr;
     if (reg_parse(image_name, tag, &rr) < 0) {
@@ -709,28 +670,10 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
         return -1;
     }
 
-    RegRef rr;
-    if (reg_parse(ref.name, ref.tag, &rr) < 0) {
-        fprintf(stderr, "podvm: cannot parse image reference: %s\n", ref.name);
-        return -1;
-    }
-
     /* Podvm's layered store (ADR-027) holds a pulled/built image as a
      * chain, not a merged dir. Signal the caller to stack it. */
     if (native_has(image_str) == 0)
         return IMAGE_RESOLVED_NATIVE;
-
-    /* Legacy flattened cache dir (pre-ADR-027 entries). */
-    char image_dir[PATH_SIZE];
-    if (image_cache_path(image_str, image_dir, sizeof(image_dir)) < 0)
-        return -1;
-    struct stat st;
-    if (stat(image_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        strncpy(rootfs_path, image_dir, path_size - 1);
-        rootfs_path[path_size - 1] = '\0';
-        printf("podvm: using cached image %s:%s\n", ref.name, ref.tag);
-        return 0;
-    }
 
     /* Pull (writes to the layered store), then signal the chain. */
     if (image_pull(ref.name, ref.tag) < 0)
@@ -742,186 +685,17 @@ int image_resolve(const char *image_str, char *rootfs_path, size_t path_size) {
     return -1;
 }
 
-/*
- * Load a cached image's config blob (Env/Entrypoint/Cmd/WorkingDir/User).
- *
- * image_pull() drops the config blob next to the unpacked rootfs as
- * <dir>/.podvm-config.json; this reads it back so a cache hit still
- * carries the image's default command. Returns 0 on success, -1 if the
- * cached config is absent or unparseable (caller treats that as "image
- * carries no defaults" and requires an explicit command).
- */
-int image_config_load(const char *image_str, ImageConfig *c) {
-    if (!image_str || !c || image_is_path(image_str)) return -1;
-
-    ImageRef ref;
-    if (image_parse(image_str, &ref) < 0) return -1;
-
-    RegRef rr;
-    if (reg_parse(ref.name, ref.tag, &rr) < 0) return -1;
-
-    char cfgpath[PATH_SIZE];
-    if (image_cache_path(image_str, cfgpath, sizeof(cfgpath)) < 0)
-        return -1;
-    size_t cfglen = strlen(cfgpath);
-    if (cfglen + 20 >= sizeof(cfgpath)) return -1;
-    snprintf(cfgpath + cfglen, sizeof(cfgpath) - cfglen, "/.podvm-config.json");
-
-    FILE *f = fopen(cfgpath, "rb");
-    if (!f) return -1;
-    if (fseek(f, 0, SEEK_END) < 0) { fclose(f); return -1; }
-    long len = ftell(f);
-    if (len < 0) { fclose(f); return -1; }
-    rewind(f);
-    char *buf = malloc((size_t)len + 1);
-    if (!buf) { fclose(f); return -1; }
-    size_t got = fread(buf, 1, (size_t)len, f);
-    buf[got] = '\0';
-    fclose(f);
-
-    int rc = image_config_parse(buf, c);
-    free(buf);
-    return rc;
-}
 
 /* ───────────────────────── cache listing & locking ─────────────────────── */
 
-int image_cache_path(const char *image_str, char *out, size_t n) {
-    if (!image_str || image_is_path(image_str)) return -1;
-
-    ImageRef ref;
-    if (image_parse(image_str, &ref) < 0) return -1;
-    RegRef rr;
-    if (reg_parse(ref.name, ref.tag, &rr) < 0) return -1;
-
-    char repo[256];
-    mangle_repo(rr.repo, repo, sizeof(repo));
-    if (snprintf(out, n, "%s/%s/%s/%s", cache_dir, rr.registry, repo, rr.tag)
-        >= (int)n)
-        return -1;
-    return 0;
-}
-
-/* Recursive byte usage of a tree (symlinks count their own inode). */
-static unsigned long long dir_size(const char *path) {
-    unsigned long long sum = 0;
-    DIR *d = opendir(path);
-    if (!d) return 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char p[PATH_SIZE];
-        if (snprintf(p, sizeof(p), "%s/%s", path, de->d_name) >= (int)sizeof(p))
-            continue;
-        struct stat st;
-        if (lstat(p, &st) < 0) continue;
-        if (S_ISDIR(st.st_mode))
-            sum += dir_size(p);
-        else
-            sum += (unsigned long long)st.st_size;
-    }
-    closedir(d);
-    return sum;
-}
-
-int image_cache_list(ImageCacheEntry *ents, int max) {
-    int n = 0;
-    DIR *rd = opendir(cache_dir);
-    if (!rd) return 0;              /* no cache yet = no images */
-
-    struct dirent *reg;
-    while ((reg = readdir(rd)) != NULL && n < max) {
-        if (reg->d_name[0] == '.') continue;
-        char regpath[PATH_SIZE];
-        if (snprintf(regpath, sizeof(regpath), "%s/%s", cache_dir, reg->d_name)
-            >= (int)sizeof(regpath))
-            continue;
-        DIR *rd2 = opendir(regpath);
-        if (!rd2) continue;
-
-        struct dirent *repo;
-        while ((repo = readdir(rd2)) != NULL && n < max) {
-            if (repo->d_name[0] == '.') continue;
-            char repopath[PATH_SIZE];
-            if (snprintf(repopath, sizeof(repopath), "%s/%s", regpath, repo->d_name)
-                >= (int)sizeof(repopath))
-                continue;
-            DIR *rd3 = opendir(repopath);
-            if (!rd3) continue;
-
-            struct dirent *tag;
-            while ((tag = readdir(rd3)) != NULL && n < max) {
-                if (tag->d_name[0] == '.') continue;
-                ImageCacheEntry *e = &ents[n];
-                if (snprintf(e->path, sizeof(e->path), "%s/%s/%s/%s",
-                             cache_dir, reg->d_name, repo->d_name, tag->d_name)
-                    >= (int)sizeof(e->path))
-                    continue;
-                struct stat st;
-                if (stat(e->path, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
-
-                /* Display name, normalized: docker.io (and its aliases)
-                 * and the implied library/ are dropped, like docker;
-                 * mangled repo slashes come back as '/'. */
-                int hub = !strcmp(reg->d_name, "docker.io") ||
-                          !strcmp(reg->d_name, "registry-1.docker.io") ||
-                          !strcmp(reg->d_name, "index.docker.io");
-                char repo_disp[256];
-                size_t ri = 0;
-                for (; repo->d_name[ri] && ri + 1 < sizeof(repo_disp); ri++)
-                    repo_disp[ri] = (repo->d_name[ri] == '+') ? '/'
-                                                             : repo->d_name[ri];
-                repo_disp[ri] = '\0';
-                if (hub) {
-                    const char *r = repo_disp;
-                    if (!strncmp(r, "library/", 8)) r += 8;
-                    snprintf(e->name, sizeof(e->name), "%s", r);
-                } else {
-                    snprintf(e->name, sizeof(e->name), "%s/%s",
-                             reg->d_name, repo_disp);
-                }
-                snprintf(e->tag, sizeof(e->tag), "%s", tag->d_name);
-
-                /* A stable cosmetic id derived from the cache path. */
-                char hex[65];
-                sha256_hex(e->path, strlen(e->path), hex);
-                snprintf(e->id, sizeof(e->id), "%.12s", hex);
-
-                e->size = dir_size(e->path);
-                n++;
-            }
-            closedir(rd3);
-        }
-        closedir(rd2);
-    }
-    closedir(rd);
-    return n;
-}
 
 /*
- * Lock file for an image: <cache>-locks/<mangled registry_repo_tag>.
- * Sibling of the cache, never inside a deletable image dir (same
- * inode-is-identity rule as the container locks); '/' mangles to '+'
- * so refs map to unique flat filenames.
+ * Lock file for an image: <native store>/locks/<mangled ref>, a sibling
+ * of the manifests (never deleted; inode = identity), for the
+ * run-vs-rmi in-use guard.
  */
 static int image_lock_path(const char *image_str, char *out, size_t n) {
-    char entry[PATH_SIZE];
-    if (image_cache_path(image_str, entry, sizeof(entry)) < 0) return -1;
-
-    char dir[PATH_SIZE];
-    if (snprintf(dir, sizeof(dir), "%s-locks", cache_dir) >= (int)sizeof(dir))
-        return -1;
-    if (mkdir_p(dir, 0755) < 0) return -1;
-
-    const char *rel = entry + strlen(cache_dir) + 1;   /* strip the cache prefix */
-    char mangled[PATH_SIZE];
-    size_t i = 0;
-    for (; rel[i] && i + 1 < sizeof(mangled); i++)
-        mangled[i] = (rel[i] == '/') ? '+' : rel[i];
-    mangled[i] = '\0';
-
-    if (snprintf(out, n, "%s/%s", dir, mangled) >= (int)n) return -1;
-    return 0;
+    return native_lock_path(image_str, out, n);
 }
 
 int image_lock(const char *image_str, int exclusive) {
