@@ -156,6 +156,8 @@ if [ -e /dev/kvm ]; then
     # images/rmi e2e: deletes the cached alpine image on purpose and must
     # stay the LAST e2e -- earlier e2es depend on that image existing.
     run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
+    # Save/load interop e2e: podvm<->podman archives + system prune.
+    run_test "E2E save/load (podman interop)" "timeout 200 sh tests/e2e_saveload.sh"
 else
     echo "E2E boot (9p + vsock)         SKIPPED (no /dev/kvm)"
 fi

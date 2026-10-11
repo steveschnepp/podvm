@@ -72,6 +72,20 @@ int native_list(NativeImage *ents, int max);
  * remain until GC). Returns 0 on success, -1 if absent/error. */
 int native_rmi(const char *image_str);
 
+/* Save ref as a docker-archive tar at out_path (loadable by podman/docker
+ * load). format: 0 = docker-archive (only format supported for now).
+ * Returns 0 on success. */
+int native_save(const char *image_str, const char *out_path, int format);
+
+/* Load a docker-archive tar into the store (the podman/docker-save
+ * counterpart). Returns 0 on success. */
+int native_load(const char *tar_path);
+
+/* Garbage-collect: remove blobs + layer dirs not referenced by any
+ * manifest (native rmi and failed builds leave orphans). Returns 0; sets
+ * *freed (optional) to the number of entries removed. */
+int native_gc(int *freed);
+
 /* Create/replace ref's manifest: config digest + ordered layer digests
  * (bottom-first) + optional history lines. 0 on success. */
 int native_manifest_put(const char *image_str, const char *config_digest,

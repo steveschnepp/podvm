@@ -136,6 +136,27 @@ int main(void) {
     }
     assert(found);
 
-    printf("PASS: native store (commit, dedup, manifest, chain order, config, put_layer, list)\n");
+    /* GC: a removed image's blobs/layers are dropped; a live one's stay. */
+    {
+        char gdir[512], gp[512];
+        snprintf(gdir, sizeof(gdir), "%s/gc", T);
+        mk(gdir);
+        snprintf(gp, sizeof(gp), "%s/x.txt", gdir);
+        wf(gp, "X\n");
+        char gdig[NATIVE_DIGEST_MAX];
+        assert(native_commit_diff(gdir, gdig, sizeof(gdig)) == 0);
+        const char *gl[1] = { gdig };
+        assert(native_manifest_put("test/gc:1", cfgd, gl, 1, NULL, 0) == 0);
+        assert(native_rmi("test/gc:1") == 0);
+        int freed = 0;
+        assert(native_gc(&freed) == 0);
+        char gdiff[512];
+        struct stat gst;
+        native_diff_path(gdig, gdiff, sizeof(gdiff));
+        assert(stat(gdiff, &gst) != 0);        /* gc'd layer removed */
+        assert(stat(L[0].diff, &gst) == 0);    /* live image's layer survives */
+    }
+
+    printf("PASS: native store (commit, dedup, manifest, chain order, config, put_layer, list, gc)\n");
     return 0;
 }

@@ -1247,6 +1247,108 @@ static int cmd_rmi(int argc, char **argv) {
     return rc;
 }
 
+/* ───────────────────── podvm save / load ───────────────────── */
+
+/*
+ * `podvm save [-o FILE] IMAGE` -- write IMAGE as a docker-archive tar
+ * (the `podman save` counterpart; loadable by podman/docker load).
+ * stdout when -o is omitted.
+ */
+static int cmd_save(int argc, char **argv) {
+    const char *out = NULL, *image = NULL;
+    int format = 0;   /* docker-archive */
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--output") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--format") && i + 1 < argc) {
+            const char *f = argv[++i];
+            if (strcmp(f, "docker-archive") != 0 && strcmp(f, "v2s2") != 0) {
+                fprintf(stderr, "podvm save: unsupported format '%s'\n", f);
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            fprintf(stderr, "Usage: podvm save [-o FILE] IMAGE\n");
+            fprintf(stderr, "Save an image as a docker-archive tar "
+                            "(podman/docker load compatible).\n");
+            return 0;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "podvm save: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!image) image = argv[i];
+        else { fprintf(stderr, "podvm save: unexpected argument '%s'\n", argv[i]); return 2; }
+    }
+    if (!image) { fprintf(stderr, "podvm save: an image is required\n"); return 2; }
+
+    if (out) return native_save(image, out, format) < 0 ? 1 : 0;
+    /* stdout: save to a temp file, then copy out. */
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "/tmp/podvm-save-%d.tar", (int)getpid());
+    if (native_save(image, tmp, format) < 0) return 1;
+    FILE *f = fopen(tmp, "rb");
+    if (!f) { unlink(tmp); return 1; }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
+    fclose(f);
+    unlink(tmp);
+    return 0;
+}
+
+/*
+ * `podvm load [-i FILE]` -- ingest a docker-archive tar (the `podman
+ * load` counterpart). Reads stdin when -i is omitted.
+ */
+static int cmd_load(int argc, char **argv) {
+    const char *in = NULL;
+    char tmp[64];
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-i") && i + 1 < argc) in = argv[++i];
+        else if (!strcmp(argv[i], "--input") && i + 1 < argc) in = argv[++i];
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            fprintf(stderr, "Usage: podvm load [-i FILE]\n");
+            fprintf(stderr, "Load a docker-archive tar into the podvm store.\n");
+            return 0;
+        } else {
+            fprintf(stderr, "podvm load: unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    int owned = 0;
+    if (!in) {
+        /* stdin -> temp file */
+        snprintf(tmp, sizeof(tmp), "/tmp/podvm-load-%d.tar", (int)getpid());
+        FILE *f = fopen(tmp, "wb");
+        if (!f) { fprintf(stderr, "podvm load: cannot write temp\n"); return 1; }
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) fwrite(buf, 1, n, f);
+        fclose(f);
+        in = tmp;
+        owned = 1;
+    }
+    int rc = native_load(in);
+    if (owned) unlink(tmp);
+    return rc < 0 ? 1 : 0;
+}
+
+/*
+ * `podvm system prune` -- garbage-collect the native store: drop blobs
+ * and layer dirs no manifest references (the `podman system prune`
+ * counterpart, scoped to images).
+ */
+static int cmd_system(int argc, char **argv) {
+    if (argc < 3 || strcmp(argv[2], "prune") != 0) {
+        fprintf(stderr, "Usage: podvm system prune\n");
+        fprintf(stderr, "Remove unreferenced blobs/layers from the podvm store.\n");
+        return argc < 3 ? 1 : 2;
+    }
+    int freed = 0;
+    if (native_gc(&freed) < 0) return 1;
+    printf("podvm: pruned %d unreferenced store entr%s\n",
+           freed, freed == 1 ? "y" : "ies");
+    return 0;
+}
+
 /* ───────────────────────── podvm build ───────────────────────── */
 
 /*
@@ -1811,7 +1913,17 @@ static int cmd_build(int argc, char **argv) {
         json_csv_array(cf, "Entrypoint", entrycsv);
         fprintf(cf, ",");
         json_csv_array(cf, "Cmd", cmdcsv);
-        fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}}", escwd, escuser);
+        fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}", escwd, escuser);
+        /* rootfs + history: podman/docker load validate against
+         * rootfs.diff_ids (the layer digests, bottom-first). */
+        fprintf(cf, ",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[");
+        for (int i = 0; i < nall; i++)
+            fprintf(cf, "%s\"%s\"", i ? "," : "", aptr[i]);
+        fprintf(cf, "]}");
+        fprintf(cf, ",\"history\":[");
+        for (int i = 0; i < nall; i++)
+            fprintf(cf, "%s{\"created_by\":\"layer %d\"}", i ? "," : "", i);
+        fprintf(cf, "]}");
         fclose(cf);   /* flushes cfgjson/cfglen */
 
         char cfg_digest[NATIVE_DIGEST_MAX];
@@ -2023,6 +2135,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  images              List cached images\n");
     fprintf(stderr, "  rmi <image>...      Remove cached images (refused while in use)\n");
     fprintf(stderr, "  build               Build a Dockerfile into a cached image\n");
+    fprintf(stderr, "  save [-o F] IMAGE   Save an image as a docker-archive tar\n");
+    fprintf(stderr, "  load [-i F]         Load a docker-archive tar\n");
+    fprintf(stderr, "  system prune        Remove unreferenced blobs/layers from the store\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
     fprintf(stderr, "  %s -i debian echo hello\n", prog);
@@ -2045,6 +2160,12 @@ int main(int argc, char **argv) {
         return cmd_rmi(argc, argv);
     if (argc > 1 && strcmp(argv[1], "build") == 0)
         return cmd_build(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "save") == 0)
+        return cmd_save(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "load") == 0)
+        return cmd_load(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "system") == 0)
+        return cmd_system(argc, argv);
     if (argc > 1 && strcmp(argv[1], "stop") == 0)
         return cmd_stop(argc, argv);
     if (argc > 1 && strcmp(argv[1], "logs") == 0)
