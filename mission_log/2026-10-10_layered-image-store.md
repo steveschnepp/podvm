@@ -404,3 +404,56 @@ PASS: 36   WARN: 0   FAIL: 0
   and build both write to the native store.
 - A build cache reusing committed step layers across builds (digest
   lookup before running a RUN) -- the dedup foundation is in place.
+
+---
+
+## Legacy cache retirement (2026-10-11)
+
+With pull (Phase 2) and build (Phase 3) both writing to the native
+layered store, the pre-ADR-027 flattened cache (`/tmp/podvm/images`) was
+dead weight. Retired it so podvm relies solely on the native store.
+Commit `89717e4`.
+
+### What We Did
+
+- **`image.c`**: dropped `cache_dir`, `image_cache_dir`,
+  `image_cache_path`, `image_cache_list`, `image_config_load`,
+  `dir_size`, `mangle_repo`, and the now-unused `mkdir_p`.
+  `image_resolve` lost its legacy flattened-dir branch (native store ->
+  `IMAGE_RESOLVED_NATIVE`, else pull into it). `image_lock` re-keys to a
+  new `native_lock_path` (`<store>/locks/<mangled-ref>`).
+- **`main.c`**: `podvm images` lists native only (drops the IMAGE ID
+  column); `podvm rmi` removes native only; build's FROM legacy branch
+  and the run-path `image_config_load` fallback are gone.
+- **`native_lock_path`** (store_native): a deterministic per-ref lock
+  file for the run-vs-rmi in-use guard, replacing the cache-derived one.
+
+### What We Learned
+
+- **A loose e2e grep can match a diagnostic, not just data.** The
+  "built image still listed after rmi" check grepped `podvm-e2e-build`
+  in `podvm images` output. The retirement made `images` print
+  "no images (native store /tmp/podvm-e2e-build.XXXX/store)" when empty
+  -- and the temp WORK dir's name *contains* `podvm-e2e-build`, so the
+  grep false-matched the store path. It had "passed" before only because
+  leftover old-cache entries made `images` print a table (no path). The
+  fix: anchor the grep on a table row (`^podvm-e2e-build +test`), like
+  the other images checks. Lesson: assert on the shape you mean, not a
+  substring that can appear in a path.
+- **Removing a legacy path surfaces latent test coupling.** The e2e had
+  been green for four phases on an accident of state (old-cache leftovers
+  masking the empty-message path). The retirement made the state clean,
+  exposing the loose assertion.
+
+### Test Results
+
+```
+E2E build (Dockerfile)        PASS   (grep anchored)
+...
+PASS: 36   WARN: 0   FAIL: 0
+```
+
+### ADR-027 fully done, legacy gone
+
+The native layered store is now podvm's only image store: pull, build,
+run, save, load, GC -- no flattened cache anywhere.
