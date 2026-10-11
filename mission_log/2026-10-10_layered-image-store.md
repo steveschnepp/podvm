@@ -326,3 +326,81 @@ PASS: 35   WARN: 0   FAIL: 0
 3. Materialize opaque whiteouts (`.wh..wh..opq`) if a real image needs
    them.
 4. Retire the legacy flattened cache (build + pull both native now).
+
+---
+
+## Phases 4-5: save/load interop + system prune (2026-10-11)
+
+Closed the archive boundary with podman (Phase 4) and garbage-collected
+the store (Phase 5). Commit `7c2317b`. The whole ADR-027 layered store
+(Phases 1-5) is now feature-complete: pull, build, run, save, load, GC.
+
+### What We Did
+
+1. **`podvm save [-o F] IMAGE`** -- writes a docker-archive tar
+   (manifest.json + config + layer blobs as `<hex>/layer.tar`, hardlinked
+   so no data copy). Mirrors `podman save`'s CLI; stdout when `-o` is
+   omitted. **`podvm load [-i F]`** ingests one (extract, per-layer
+   `native_put_layer`, config blob, manifest); stdin when `-i` omitted.
+2. **The rejection fix.** `podman load` first refused the archive --
+   "payload does not match any of the supported image formats." Ground
+   truth (a real `podman save`) showed the config must carry
+   `rootfs.diff_ids`; ours lacked it. `cmd_build` now emits
+   `rootfs.diff_ids` + `history`. For a *pulled* image the registry
+   config already has diff_ids -- and they equal podvm's native digests,
+   because both hash the *uncompressed* tar.
+3. **`podvm system prune`** -- `native_gc` drops blobs/layers no manifest
+   references (native `rmi` and failed builds leave orphans).
+
+### What We Learned
+
+- **`podman load` validates against `rootfs.diff_ids`.** An archive whose
+  config omits rootfs is rejected outright, not repaired. Adding diff_ids
+  (the layer digests, bottom-first) is what makes a hand-rolled
+  docker-archive loadable.
+- **podvm's native digests ARE the canonical diff_ids** for pulled images
+  -- both are sha256 of the uncompressed layer tar. So a registry config
+  dropped into a podvm archive validates with no re-hashing.
+- **Bidirectional interop is the real proof.** `podvm save` -> `podman
+  load` -> `podman run` (sees the file a RUN step created) and `podman
+  save` -> `podvm load` -> `podvm run` both green. The "compare a podvm
+  build to a docker build" goal that started this whole effort is now
+  closable: export either side and diff.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/store_native.c` / `.h` | `native_save`, `native_load`, `native_gc` |
+| `src/main.c` | `save`/`load`/`system prune` subcommands; `cmd_build` config gains `rootfs.diff_ids` + `history` |
+| `tests/test_store_native.c` | GC case |
+| `tests/e2e_saveload.sh` | podvm<->podman save/load interop + safe prune |
+| `tests/run_tests.sh` | wire the save/load e2e |
+
+### Test Results
+
+```
+Native store                  PASS   (+ gc)
+E2E save/load (podman interop) PASS   (new)
+...
+PASS: 36   WARN: 0   FAIL: 0
+```
+
+### ADR-027 Status: all five phases landed
+
+| Phase | Delivered |
+|-------|-----------|
+| 1 | Store skeleton + run path (tar module, store_native, chain via overlay) |
+| 2 | Pull keeps layers (blobs + manifest; ref normalization; images/rmi) |
+| 3 | Build commits each RUN/COPY as a layer + the whiteout fix (userns unpack) |
+| 4 | `podvm save`/`load` (docker-archive interop with podman) |
+| 5 | `podvm system prune` (GC orphan blobs/layers) |
+
+### Remaining / follow-ups
+
+- Opaque whiteouts (`.wh..wh..opq`) not materialized (noted limitation).
+- `--format oci-archive` for save/load (only docker-archive today).
+- Retire the legacy flattened cache (`/tmp/podvm/images`) now that pull
+  and build both write to the native store.
+- A build cache reusing committed step layers across builds (digest
+  lookup before running a RUN) -- the dedup foundation is in place.
