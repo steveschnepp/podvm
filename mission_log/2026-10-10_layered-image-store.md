@@ -235,3 +235,94 @@ PASS: 35   WARN: 0   FAIL: 0
 3. Phase 5 (optional): GC / `podvm system prune` (native `rmi` currently
    leaves orphan blobs).
 4. Retire the legacy flattened cache once build output moves (Phase 3).
+
+---
+
+## Phase 3: Build commits each RUN as a layer (2026-10-11)
+
+`podvm build` now writes a layered image (manifest + config blob) to the
+native store instead of cp-merging into a flattened cache dir. The headline
+was not the build rework but the **whiteout blocker** it exposed. Commit
+`2176722`.
+
+### The whiteout blocker (found while scoping)
+
+`e2e_build` tests `RUN rm /etc/hostname` (a cross-layer deletion). Today
+that works via overlay+cp: the step upper already has a char-0:0 whiteout
+(created by the VM's userns, where the user is root). But a layered store
+stacks diff dirs as overlayfs lowerdirs, so the deletion must be a
+char-0:0 device *in that layer's diff dir* to hide the lower file. And a
+rootless process **cannot `mknod` char 0:0** (CAP_MKNOD). Worse, the
+existing pack->unpack turned the char-0:0 into a `.wh.<name>` tar entry
+that `tar_extract_mem` then *deleted* (a no-op) -- so the deletion was
+silently lost. A latent Phase 2 pull bug too (unnoticed: alpine/busybox
+are single-layer).
+
+Verified empirically (`unshare -Urm` + `mknod c 0 0` + a stacked overlay
+honors it) that a rootless userns CAN create an overlay whiteout. So
+layer unpack now forks a short-lived user+mount ns and `tar_extract_layer`
+materializes `.wh.<name>` as char 0:0 -- rootless-podman's own trick. The
+legacy flatten path keeps applying whiteouts (it extracts into one dir).
+
+### What We Did
+
+1. **Whiteout fix.** `tar_extract_layer` (preserve `.wh.<name>` as char
+   0:0) beside `tar_extract_mem` (apply); `store_layer_bytes` unpacks via
+   `unpack_layer_in_userns`, so both pull and build-commit keep whiteouts.
+2. **Build rework.** FROM base -> digests (reuse a native base's digests;
+   copy a podman/legacy base to native, per "simple now, optimize later");
+   each COPY/RUN commits its upper to the native store and the native diff
+   dir feeds the next step's overlay; final manifest = base (bottom-first)
+   + steps (build order) + config blob (`open_memstream`). No cp merge.
+
+### What We Learned
+
+- **The layered model turns whiteouts from a non-issue into the crux.**
+  overlay+cp hid the problem (the kernel applied whiteouts at merge time);
+  stacking lowerdirs pushes it into the store's representation, where
+  rootless `mknod` is the wall.
+- **A rootless userns can create overlay whiteouts** (`mknod c 0 0` as
+  userns root, honored by a stacked overlay) -- empirically verified before
+  committing to the design. This is exactly what rootless podman does at
+  unpack.
+- **A latent bug hides behind single-layer fixtures.** The Phase 2 pull
+  path lost whiteouts, but alpine/busybox (1 layer) never exercised a
+  cross-layer deletion, so the suite stayed green.
+- **`cp`-merge was masking a representation problem.** Removing it (the
+  whole point of layers) surfaced what it had papered over.
+
+### What We Decided
+
+- Whiteouts = char 0:0 in diff dirs, materialized at unpack inside a
+  userns (not `.wh` files converted at mount, which would mutate shared
+  diffs / race concurrent runs). Opaque dirs (`.wh..wh..opq`) not yet
+  materialized -- a noted limitation.
+- Non-native FROM bases are copied into the native store (self-contained
+  image); a native base reuses its digests. Optimize dedup later.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `src/tar.c` / `.h` | `tar_extract_layer` (preserve whiteouts as char 0:0) |
+| `src/store_native.c` / `.h` | userns unpack; `native_diff_path` |
+| `src/main.c` | `cmd_build` -> layered manifest + config blob |
+| `tests/e2e_build.sh` | isolate `PODVM_STORE_DIR` |
+
+### Test Results
+
+```
+E2E build (Dockerfile)        PASS   (2 RUNs, whiteout -> GONE, COPY, config, rmi)
+...
+PASS: 35   WARN: 0   FAIL: 0
+```
+
+### Next Steps
+
+1. Phase 4: `podvm save`/`load` (OCI/docker archive interop with podman) --
+   `tar_pack_dir` already emits the portable `.wh` form for save.
+2. Phase 5 (optional): GC / `podvm system prune` (native `rmi` + failed
+   builds leave orphan blobs).
+3. Materialize opaque whiteouts (`.wh..wh..opq`) if a real image needs
+   them.
+4. Retire the legacy flattened cache (build + pull both native now).
