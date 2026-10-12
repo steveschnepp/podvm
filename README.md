@@ -345,9 +345,13 @@ The kernel config minimizes attack surface:
 4. Ensure all tests pass
 5. Submit a pull request
 
+## Maintainers
+
+- Steve SCHNEPP <<steve.schnepp@pwkf.org>>
+
 ## License
 
-Apache 2.0
+Licensed under the [Apache License, Version 2.0](LICENSE) (SPDX-License-Identifier: `Apache-2.0`).
 
 ## See also
 
