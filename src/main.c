@@ -875,6 +875,11 @@ static int start_qemu(void) {
     build_cmdline(cmdline, sizeof(cmdline));
     snprintf(memory_str, sizeof(memory_str), "%dM", config.memory);
     snprintf(cpu_str, sizeof(cpu_str), "%d", config.cpus);
+    /* ADR-028 exploration: QEMU 9p mapped-xattr/mapped were tried
+     * here (ownership as user.v9fs.uid/gid xattrs beside the data) and
+     * rejected -- both modes ELOOP on every image symlink (no xattr
+     * support on symlinks), breaking all execs. Kept as security_model
+     * =none; ownership moves guest-side instead (see ADR-028 final). */
     snprintf(fsdev_str, sizeof(fsdev_str),
              "local,id=fsdev0,path=%s,security_model=none%s",
              config.rootfs_dir, config.read_only ? ",readonly=on" : "");

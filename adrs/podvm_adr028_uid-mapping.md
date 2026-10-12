@@ -1,4 +1,4 @@
-# ADR-028: Subuid-Range UID Mapping (Rootless podman Parity)
+# ADR-028: Guest-Side Ownership (Overlay in the Guest, Not UID Translation)
 
 **Date:** 2026-10-12
 
@@ -9,119 +9,103 @@
 podvm maps exactly one uid per VM. The QEMU child unshares
 user+mount, writes `0 <invoking-uid> 1` into its own `uid_map`
 (`setup_userns_overlay()`, `src/main.c`), mounts the overlay inside
-that namespace, and execs QEMU there. The store unpack
-(`unpack_layer_in_userns()`, `src/store_native.c`) uses the same
-single-uid map when it unpacks layer tars.
+that namespace, and execs QEMU there; 9p serves the merged rootfs with
+`security_model=none`.
 
 Two consequences, both visible in the field:
 
 1. **Cross-uid `chown` fails in the guest** with `Invalid argument`.
-   9p runs `security_model=none`, so guest-root's `chown(N)` becomes a
-   real `chown()` by QEMU against the overlay -- checked against the
-   *userns that owns the mount*, whose map contains only uid 0. Any
-   `N != 0` is unmapped -> `EINVAL`. Every Dockerfile that does
-   `RUN chown -R app:app /app` before `USER` breaks (hit concretely
-   building mermaid-ascii; see `2026-10-12_multistage-build.md`).
-2. **Image ownership is discarded at ingest.** Because the unpack
-   userns maps one uid, every file in a layer lands on disk owned by
-   the invoking user, and the guest sees the entire rootfs as
-   `root:root`. `USER`, setuid bits, and multi-user images cannot
-   work; `podvm run -u` resolves the user but nothing on disk
-   honors it.
-
-ADR-024's principle stands -- the VM is the isolation boundary, the
-userns staging is plumbing -- but the plumbing is currently too thin
-to carry the ownership information that images contain.
+   Guest-root's `chown(N)` becomes a real `chown()` by QEMU against
+   the overlay, checked against the userns that owns the mount -- whose
+   map contains only uid 0. Every Dockerfile that does `RUN chown -R
+   app:app /app` before `USER` breaks (hit concretely building
+   mermaid-ascii; see `2026-10-12_multistage-build.md`).
+2. **Image ownership is discarded at ingest.** The unpack userns maps
+   one uid and the tar writer hardcoded uid 0, so every layer file
+   lands owned by the invoking user and the guest sees `root:root`
+   everywhere. `USER`, setuid bits, and multi-user images cannot work.
 
 ## Decision
 
-**Map a full subuid range, exactly as rootless podman does.**
+**Ownership becomes guest-side state. The host filesystem never
+represents uids the invoking user doesn't own.**
 
-Read the invoking user's allocation from `/etc/subuid` and
-`/etc/subgid` (e.g. `snide:165536:65536`) and install a two-range map
-in the QEMU child's userns, via the setuid `newuidmap`/`newgidmap`
-helpers (multi-range maps cannot be self-written without privileges):
+Concretely, the rootfs 9p share turns into a **read-only lower** and
+the writable overlay is mounted **inside the guest** (tmpfs upper):
 
-```
-guest uid 0        -> invoking uid          (today's mapping, kept)
-guest uid 1..65536 -> subuid base + 0..65535
-```
+- `chown`/`chmod`/`USER`/setuid are guest-kernel operations on a
+  guest-owned tmpfs -- no host check, no uid map, no xattr limits.
+  They work on every host, with no `newuidmap`/`/etc/subuid`
+  requirement.
+- The synthetic kernel gains `CONFIG_OVERLAY_FS` (+ tmpfs, already
+  present); `/init` mounts `overlay` with the 9p rootfs as lowerdir
+  and a tmpfs upper/work pair, same as any container runtime mounts
+  its rootfs -- except the runtime here is init, and the VM is the
+  isolation boundary (ADR-001), so nothing outside can observe or
+  care about the ids inside.
+- Where ownership must cross the VM boundary -- build-step commits
+  and named-container write-back (ADR-026) -- the guest ships its
+  upper back **as a tar with uid/gid metadata** (ustar header fields;
+  `src/tar.c` already stamps/reads `user.v9fs.uid/gid` xattrs as the
+  on-disk sidecar for that tar). The tar *is* the metadata file.
 
-The store unpack uses the same map, so layers keep their numeric
-ownership on disk (subuid-owned files in the store, identical to
-podman's graphroot). With ADR-024, this makes mounting podman's diff
-dirs *more* correct, not less: those files are already subuid-owned
-and will now render in the guest with their true image uids.
+### Ingest / commit
+
+- **Ingest** stamps ownership metadata (xattr beside the data) from
+  the tar headers, so commit and save can reproduce it.
+- **Commit** reads that metadata back; podman-owned diffs (subuid
+  ids on disk, no xattrs) translate via the subuid allocation
+  (`src/subuid.c`: invoking user -> 0, subuid range -> range-relative).
 
 ### Fallback
 
-No `/etc/subuid` entry, no `newuidmap`/`newgidmap`, or the helper
-failing (AppArmor restrictions on some older hosts) -> keep today's
-single-uid map, print one loud warning that cross-uid chown and image
-ownership are degraded. podvm must keep working everywhere; this is a
-capability, not a requirement.
+Hosts/kernels without overlayfs in the guest kernel -- i.e. a podvm
+kernel built without `CONFIG_OVERLAY_FS` -- degrade to today's
+behavior: host-side merged view, chown limited to root. Loud warning,
+podvm keeps running.
 
-## Rationale
+## Exploration: why not metadata in 9p (falsified)
 
-- **It's the ecosystem's answer.** rootless podman, rootless LXC, and
-  Buildah all solve rootless cross-uid ownership with the subuid
-  mechanism. Matching their mapping convention means podman-stored
-  images (ADR-024) are directly usable with correct ownership, and
-  users who already run rootless podman already have the config.
-- **The kernel work is done and stable.** `newuidmap`/`newgidmap` are
-  standard (shadow-utils), `/etc/subuid` is allocated by every major
-  distro's user-creation path; we consume, not invent.
-- **The alternative directions were checked and rejected** (below).
-- **The degradation path is graceful.** The single-uid map is a
-  special case of the design, not a fork of it -- same code path with
-  a one-entry map.
+The first cut of this ADR chose QEMU 9p's `security_model=mapped-xattr`
+-- ownership as `user.v9fs.uid/gid` xattrs beside the data, guest
+chown becomes an xattr write server-side. Implemented and tested:
+**both `mapped-xattr` and `mapped` return `ELOOP` for every symlink
+in the image** (`exec /bin/sh` -> `Symbolic link loop`; alpine's whole
+`/bin` is symlinks to busybox). The modes must record ownership
+metadata for symlinks too, and ext4/tmpfs don't support xattrs on
+symlinks. Structural, not a bug we could configure around. The
+tar-side xattr stamping from that attempt survives -- it is exactly
+the commit/save metadata this decision needs. The commit is in git
+history (`wip: uid ownership via 9p mapped-xattr (falsified)`) and
+reverted immediately after.
+
+The other rejected direction: **subuid-range mapping via newuidmap**
+(the original ADR-028). Proven (rootless podman's approach) and free
+podman-store interop, but it makes the host filesystem represent
+container uids (every store/state file becomes subuid-owned), adds a
+soft host requirement (setuid helper + allocation, with an AppArmor
+history on older Ubuntus), and pushes translation to the serve side --
+the opposite of where this project wants the boundary (ADR-001,
+ADR-024: the VM is the boundary; plumbing should not carry meaning).
+Kept as a live fallback option if the guest-side overlay proves too
+costly in the performance phase.
 
 ## Implications
 
-- **Fork-dance reorder in `setup_userns_overlay()`.** The uid_map
-  write moves from "child writes its own map" (legal only for the
-  invoking uid) to "parent calls `newuidmap <child-pid>` after the
-  child unshares and blocks". The gid dance follows, still after
-  `setgroups=deny`. ~40 lines of new helper (`src/subuid.c`), plus a
-  small parse of `/etc/subuid`.
-- **State dirs gain subuid-owned files.** Container uppers and store
-  diffs will contain files owned by uids 165536+. They stay
-  deletable (directory write is yours), readable (0644), and
-  invisible to `ls` mapping-wise -- the same lived experience as any
-  rootless podman user. Documented, not defended.
-- **Whiteouts are unaffected.** Char 0:0 devices still require only
-  uid 0 in the owning userns, which the map keeps.
-- **`podvm save`/`load` OCI interop improves.** Ownership now
-  round-trips through the tar layer instead of being flattened.
-- **A new soft host requirement** (subuid + newuidmap) for full
-  functionality; README requirements section gets a line.
-- **Test surface**: an e2e that builds a Dockerfile with
-  `RUN chown -R <uid> /app`, runs it with `-u`, and asserts the
-  ownership and writability from inside the guest; plus a unit-ish
-  test for the `/etc/subuid` parser and the fallback path.
-
-## Alternatives Considered
-
-**Idmapped mounts (`mount_setattr`, `MOUNT_ATTR_IDMAP`).** The
-modern kernel answer, but the 9p client gives no mount-side hook for
-the *server's* view: QEMU performs the chown against the host
-filesystem, and an idmapped mount there would need to be set up
-outside our userns with privileges we don't have. Would also pin us
-to newer kernels for zero gain over newuidmap. Revisit only if
-newuidmap proves unshippable in practice.
-
-**Nested userns inside the guest.** Does not help: the ownership
-check happens on the host side of 9p regardless of what the guest
-does internally.
-
-**Teach /init to fake it (chown interception, LD_PRELOAD in the
-guest).** Fragile, transparently wrong for anything stat'ing
-ownership, and breaks the "no guest runtime" principle (ADR-001).
-
-**Run QEMU as the real root via a setuid helper.** Rejected outright:
-it moves the trust boundary the project is built on (ADR-001,
-ADR-024).
-
-**Status quo + `|| true` in affected Dockerfiles.** Rejected as the
-plan of record; kept only as the documented fallback for hosts
-without newuidmap.
+- `guest/init.c`: mount the overlay (lower = 9p rootfs read-only,
+  upper+work = tmpfs), sync the upper back on exit (tar over vsock or
+  a 9p staging dir) when the run is named (write-back) or the step is
+  a build commit. PID 1 keeps owning the exit-code report.
+- `kernel/config`: `CONFIG_OVERLAY_FS=y` (built-in; modules are not
+  loaded in the guest).
+- `src/main.c`: rootfs 9p share gains `readonly=on` always; the
+  host-side overlay for the rootfs goes away (volumes keep their
+  current per-volume 9p shares; they are host dirs by definition).
+- `src/tar.c` / `src/subuid.c`: the ingest/commit metadata path from
+  the exploration, as described above.
+- `tests`: an e2e that chowns in a build step, runs the image with
+  `-u`, and asserts ownership from inside the guest; write-back e2e
+  gains an ownership-persistence assertion.
+- The host-side userns overlay remains only for podman-store
+  *staging* (mounting untrusted images read-only to serve them), not
+  for ownership.
