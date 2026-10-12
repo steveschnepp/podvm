@@ -74,10 +74,11 @@ in the image** (`exec /bin/sh` -> `Symbolic link loop`; alpine's whole
 `/bin` is symlinks to busybox). The modes must record ownership
 metadata for symlinks too, and ext4/tmpfs don't support xattrs on
 symlinks. Structural, not a bug we could configure around. The
-tar-side xattr stamping from that attempt survives -- it is exactly
-the commit/save metadata this decision needs. The commit is in git
-history (`wip: uid ownership via 9p mapped-xattr (falsified)`) and
-reverted immediately after.
+tar-side xattr stamping from that attempt is exactly the commit/save
+metadata this decision needs; it lives in git history (`wip: uid
+ownership via 9p mapped-xattr (falsified)`) and is restored when this
+ADR is implemented -- the revert that accompanies this record keeps
+the codebase clean until then.
 
 The other rejected direction: **subuid-range mapping via newuidmap**
 (the original ADR-028). Proven (rootless podman's approach) and free

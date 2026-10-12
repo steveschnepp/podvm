@@ -14,55 +14,10 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
-#include <sys/xattr.h>      /* ADR-028: ownership lives in xattrs */
 #include <time.h>
 #include <unistd.h>
 
-#include "subuid.h"
-
 #define PATH_SIZE 2048
-
-/*
- * ADR-028: guest-visible ownership is metadata beside the data -- the
- * same user.v9fs.* xattrs QEMU's 9p mapped-xattr security model reads.
- * Ingest stamps them from the tar header; commit reads them back
- * (falling back to on-disk uid -> guest translation for podman-owned
- * diffs, which carry no xattrs).
- */
-#define PODVM_XATTR_UID "user.v9fs.uid"
-#define PODVM_XATTR_GID "user.v9fs.gid"
-
-static void xattr_set_ids(const char *path, unsigned uid, unsigned gid) {
-    char buf[16];
-    /* lsetxattr: symlinks carry metadata too (it is a no-op-ish error
-     * on filesystems without symlink xattrs -- ignored either way) */
-    int n = snprintf(buf, sizeof(buf), "%u", uid);
-    if (lsetxattr(path, PODVM_XATTR_UID, buf, (size_t)n, 0) < 0 &&
-        errno != EOPNOTSUPP && errno != ENOTSUP)
-        return;                        /* best effort; root stays root */
-    n = snprintf(buf, sizeof(buf), "%u", gid);
-    (void)lsetxattr(path, PODVM_XATTR_GID, buf, (size_t)n, 0);
-}
-
-/* Guest id for a packed entry: xattr wins (the guest's view is
- * authoritative), else translate the on-disk owner. Missing/unreadable
- * metadata collapses to 0, matching today's behavior. */
-static unsigned xattr_get_id(const char *path, int is_uid) {
-    const char *name = is_uid ? PODVM_XATTR_UID : PODVM_XATTR_GID;
-    char buf[32];
-    ssize_t n = lgetxattr(path, name, buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        char *end = NULL;
-        unsigned long v = strtoul(buf, &end, 10);
-        if (end && *end == '\0' && v <= 0xffffffffUL) return (unsigned)v;
-    }
-    struct stat st;
-    if (lstat(path, &st) == 0)
-        return subuid_to_guest((unsigned long)(is_uid ? st.st_uid
-                                                      : st.st_gid));
-    return 0;
-}
 
 static int mkdir_p(const char *path, int mode) {
     char tmp[PATH_SIZE];
@@ -234,15 +189,8 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
             continue;
         }
 
-        /* ADR-028: ownership is metadata; stamp the ids from the
-         * header (preserve mode only -- the legacy flatten path has
-         * no ownership story and stays root). */
-        unsigned hdr_uid = (unsigned)tar_octal(h + 108, 8);
-        unsigned hdr_gid = (unsigned)tar_octal(h + 116, 8);
-
         if (typeflag == '5') { /* directory */
             mkdir_p(path, 0755);
-            if (preserve) xattr_set_ids(path, hdr_uid, hdr_gid);
         } else if (typeflag == '2') { /* symlink */
             char target[PATH_SIZE];
             memcpy(target, h + 157, 100);
@@ -254,7 +202,6 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
             mkdir_p(parent, 0755);
             remove(path);
             symlink(target, path);
-            if (preserve) xattr_set_ids(path, hdr_uid, hdr_gid);
         } else if (typeflag == '1') { /* hardlink: treat as symlink-ish copy target */
             char target[PATH_SIZE];
             memcpy(target, h + 157, 100);
@@ -283,7 +230,6 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
                 if (size) { ssize_t w = write(fd, data, (size_t)size); (void)w; }
                 close(fd);
             }
-            if (preserve) xattr_set_ids(path, hdr_uid, hdr_gid);
         }
 
         off += data_blocks;
@@ -308,8 +254,7 @@ static void hdr_octal(char *field, size_t n, unsigned long long v) {
  * fallback handled by the caller). */
 static void hdr_build(char h[512], const char *name, const char *linkname,
                       unsigned long long size, unsigned mode, char typeflag,
-                      time_t mtime, const char *prefix,
-                      unsigned uid, unsigned gid) {
+                      time_t mtime, const char *prefix) {
     memset(h, 0, 512);
     const char *nm = name;
     if (prefix && prefix[0]) {
@@ -320,8 +265,8 @@ static void hdr_build(char h[512], const char *name, const char *linkname,
     }
     strncpy(h + 0, nm, 100);
     hdr_octal(h + 100, 8, mode & 07777);
-    hdr_octal(h + 108, 8, uid);        /* ADR-028: from xattr, else 0 */
-    hdr_octal(h + 116, 8, gid);
+    hdr_octal(h + 108, 8, 0);            /* uid: root in the layer */
+    hdr_octal(h + 116, 8, 0);            /* gid */
     hdr_octal(h + 124, 12, size);
     hdr_octal(h + 136, 12, (unsigned long long)mtime);
     memset(h + 148, ' ', 8);             /* chksum placeholder */
@@ -371,28 +316,25 @@ static int write_all(int fd, const void *buf, size_t n) {
 
 static int emit_entry(int fd, const char *rel, const char *linkname,
                       unsigned long long size, unsigned mode, char typeflag,
-                      const char *content, unsigned uid, unsigned gid) {
+                      const char *content) {
     char prefix[160], base[104];
     char h[512];
     if (name_split(rel, prefix, sizeof(prefix), base, sizeof(base)) >= 0) {
-        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), prefix,
-                  uid, gid);
+        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), prefix);
         if (write_all(fd, h, 512) < 0) return -1;
     } else {
         /* GNU longname: an 'L' entry carrying the full name, then the
          * header with a truncated name field (the reader uses the 'L'). */
         char lh[512];
         unsigned long long nlen = (unsigned long long)strlen(rel);
-        hdr_build(lh, "././@LongLink", NULL, nlen + 1, 0, 'L', time(NULL),
-                  NULL, 0, 0);
+        hdr_build(lh, "././@LongLink", NULL, nlen + 1, 0, 'L', time(NULL), NULL);
         lh[156] = 'L';
         if (write_all(fd, lh, 512) < 0) return -1;
         if (write_all(fd, rel, (size_t)nlen) < 0) return -1;
         size_t pad = (size_t)((nlen + 1 + 511) / 512) * 512 - (size_t)nlen;
         char z[512]; memset(z, 0, sizeof(z));
         if (write_all(fd, z, pad) < 0) return -1;
-        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), NULL,
-                  uid, gid);
+        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), NULL);
         if (write_all(fd, h, 512) < 0) return -1;
     }
     if (typeflag == '0' && size && content) {
@@ -429,9 +371,7 @@ static int pack_walk(int fd, const char *root, const char *rel) {
 
         if (S_ISDIR(st.st_mode)) {
             if (emit_entry(fd, childrel, NULL, 0, (unsigned)st.st_mode & 07777,
-                           '5', NULL,
-                           xattr_get_id(childpath, 1),
-                           xattr_get_id(childpath, 0)) < 0) { closedir(d); return -1; }
+                           '5', NULL) < 0) { closedir(d); return -1; }
             if (pack_walk(fd, root, childrel) < 0) { closedir(d); return -1; }
         } else if (S_ISREG(st.st_mode)) {
             int f = open(childpath, O_RDONLY);
@@ -448,9 +388,7 @@ static int pack_walk(int fd, const char *root, const char *rel) {
             }
             close(f);
             int rc = emit_entry(fd, childrel, NULL, (unsigned long long)st.st_size,
-                                (unsigned)st.st_mode & 07777, '0', content,
-                                xattr_get_id(childpath, 1),
-                                xattr_get_id(childpath, 0));
+                                (unsigned)st.st_mode & 07777, '0', content);
             free(content);
             if (rc < 0) { closedir(d); return -1; }
         } else if (S_ISLNK(st.st_mode)) {
@@ -458,9 +396,7 @@ static int pack_walk(int fd, const char *root, const char *rel) {
             ssize_t n = readlink(childpath, target, sizeof(target) - 1);
             if (n < 0) { closedir(d); return -1; }
             target[n] = '\0';
-            if (emit_entry(fd, childrel, target, 0, 0777, '2', NULL,
-                           xattr_get_id(childpath, 1),
-                           xattr_get_id(childpath, 0)) < 0) {
+            if (emit_entry(fd, childrel, target, 0, 0777, '2', NULL) < 0) {
                 closedir(d); return -1;
             }
         } else if (S_ISCHR(st.st_mode) &&
@@ -473,7 +409,7 @@ static int pack_walk(int fd, const char *root, const char *rel) {
                          (int)(slash - childrel), childrel, slash + 1);
             else
                 snprintf(whrel, sizeof(whrel), ".wh.%s", childrel);
-            if (emit_entry(fd, whrel, NULL, 0, 0644, '0', NULL, 0, 0) < 0) {
+            if (emit_entry(fd, whrel, NULL, 0, 0644, '0', NULL) < 0) {
                 closedir(d);
                 return -1;
             }
