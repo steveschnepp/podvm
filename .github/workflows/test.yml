@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build deps: cmake/gcc (host), musl-gcc (guest init, static),
+      # curl+zlib+zstd (image pipeline tests), cpio (initramfs),
+      # qemu (e2e boots), podman (image-dependent e2es).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake gcc make \
+            musl-tools \
+            libcurl4-openssl-dev zlib1g-dev libzstd-dev \
+            cpio qemu-system-x86 podman
+
+      # Hosted runners expose /dev/kvm, but not world-accessible.
+      # Without this every e2e silently degrades to SKIPPED and CI
+      # would only ever exercise unit tests.
+      - name: Enable KVM access
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod a+rw /dev/kvm
+            echo "KVM available"
+          else
+            echo "WARNING: no /dev/kvm -- e2e tests will be skipped"
+          fi
+
+      # Several e2es (podman image, net, imgcfg) are gated on a local
+      # alpine image being present; pre-pull so they actually run.
+      - name: Pre-pull alpine image
+        run: podman pull docker.io/library/alpine:latest
+
+      # run_tests.sh: unit tests -> host+guest build -> CLI matrix ->
+      # KVM e2e boot/lifecycle suite. Skips e2es cleanly on KVM-less
+      # hosts; FAIL count drives the exit code.
+      - name: Run test suite
+        run: make test
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            build/**/*.log
+            out/
+          if-no-files-found: ignore
