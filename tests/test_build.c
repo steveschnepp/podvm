@@ -105,7 +105,8 @@ static void test_errors(void) {
 
     n = dockerfile_parse("FROM alpine\nCOPY onlysrc\n", ops, BUILD_OPS_MAX,
                          err, sizeof(err));
-    CHECK(n == -1 && strstr(err, "destination") != NULL);
+    /* one token: no dst (docker: "COPY requires at least two arguments") */
+    CHECK(n == -1 && strstr(err, "src and dst") != NULL);
 
     n = dockerfile_parse("FROM alpine\nRUN echo x \\\n", ops, BUILD_OPS_MAX,
                          err, sizeof(err));
@@ -116,6 +117,60 @@ static void test_errors(void) {
     CHECK(n == -1 && strstr(err, "no instructions") != NULL);
 
     printf("PASS: error cases\n");
+}
+
+static void test_multistage(void) {
+    int n = parse_ok(
+        "FROM alpine:latest AS builder\n"
+        "RUN make\n"
+        "COPY --from=builder /src/app /usr/local/bin/app\n"
+        "FROM scratch\n"
+        "COPY --from=alpine:3 /bin/sh /bin/sh\n"
+        "CMD [\"/usr/local/bin/app\"]\n");
+    CHECK(n == 6);
+    /* FROM ... AS name */
+    CHECK(ops[0].kind == BFROM && strcmp(ops[0].a, "alpine:latest") == 0 &&
+          strcmp(ops[0].b, "builder") == 0);
+    /* FROM without AS leaves the stage name empty */
+    CHECK(ops[3].kind == BFROM && strcmp(ops[3].a, "scratch") == 0 &&
+          ops[3].b[0] == '\0');
+    /* COPY --from=<stage>: flag captured, src is the stage path */
+    CHECK(ops[2].kind == BCOPY && strcmp(ops[2].from, "builder") == 0 &&
+          strcmp(ops[2].a, "/src/app") == 0 &&
+          strcmp(ops[2].b, "/usr/local/bin/app") == 0);
+    /* COPY --from=<image> */
+    CHECK(ops[4].kind == BCOPY && strcmp(ops[4].from, "alpine:3") == 0 &&
+          strcmp(ops[4].a, "/bin/sh") == 0);
+    /* plain COPY keeps an empty --from */
+    n = parse_ok("FROM alpine\nCOPY x /x\n");
+    CHECK(n == 2 && ops[1].from[0] == '\0');
+    /* multi-source COPY: everything but the last token is a source */
+    n = parse_ok("FROM alpine\nWORKDIR /build\nCOPY go.mod go.sum ./\n");
+    CHECK(n == 3);
+    CHECK(ops[2].kind == BCOPY && strcmp(ops[2].a, "go.mod go.sum") == 0 &&
+          strcmp(ops[2].b, "./") == 0);
+    printf("PASS: multi-stage (FROM..AS, COPY --from)\n");
+}
+
+static void test_multistage_errors(void) {
+    int n;
+
+    n = dockerfile_parse("FROM alpine AS\n", ops, BUILD_OPS_MAX, err, sizeof(err));
+    CHECK(n == -1 && strstr(err, "stage name") != NULL);
+
+    n = dockerfile_parse("FROM alpine nope x\n", ops, BUILD_OPS_MAX,
+                         err, sizeof(err));
+    CHECK(n == -1 && strstr(err, "AS") != NULL);
+
+    n = dockerfile_parse("FROM alpine\nCOPY --from= /x\n", ops, BUILD_OPS_MAX,
+                         err, sizeof(err));
+    CHECK(n == -1 && strstr(err, "--from") != NULL);
+
+    n = dockerfile_parse("FROM alpine\nCOPY --chown=1:1 x /x\n", ops,
+                         BUILD_OPS_MAX, err, sizeof(err));
+    CHECK(n == -1 && strstr(err, "unsupported COPY flag") != NULL);
+
+    printf("PASS: multi-stage error cases\n");
 }
 
 static void test_env_set(void) {
@@ -139,6 +194,8 @@ int main(void) {
     test_continuation();
     test_shell_form_cmd();
     test_errors();
+    test_multistage();
+    test_multistage_errors();
     test_env_set();
 
     if (failures) {

@@ -94,6 +94,32 @@ timeout "$TIMEOUT_SECS" "$PODVM" -r "$IR" "$IMGREF" \
     || { cp "$WORK/r2.log" "$WORK/last.log"; fail "whiteout check run failed"; }
 grep -q "GONE" "$WORK/r2.log" || fail "a file deleted in a RUN step survived the build"
 
+# ---- multi-stage: FROM..AS + COPY --from ----
+
+# Isolation invariants: only the copied file crosses stages; the
+# builder's extra files AND its whiteouts must not. The checks ride on
+# the exit code (a marker string would also appear in the serial log's
+# kernel cmdline echo of the command itself).
+mkdir -p "$WORK/ctx3"
+cat > "$WORK/ctx3/Dockerfile" <<'EOF'
+FROM docker.io/library/alpine:latest AS builder
+RUN echo ms-artifact > /artifact.txt && touch /builder-only
+RUN rm /etc/hostname
+FROM docker.io/library/alpine:latest
+COPY --from=builder /artifact.txt /final.txt
+CMD ["/bin/sh", "-c", "cat /final.txt; test ! -e /builder-only -a -e /etc/hostname"]
+EOF
+timeout $((TIMEOUT_SECS * 6)) "$PODVM" build -r "$IR" -t podvm-e2e-ms:test "$WORK/ctx3" \
+    > "$WORK/b3.log" 2>&1 \
+    || { cp "$WORK/b3.log" "$WORK/last.log"; fail "multi-stage build failed"; }
+grep -q "stage 2: FROM" "$WORK/b3.log" || fail "the second stage was not started"
+grep -q "COPY --from=builder" "$WORK/b3.log" || fail "COPY --from step missing"
+timeout "$TIMEOUT_SECS" "$PODVM" -r "$IR" podvm-e2e-ms:test > "$WORK/r3.log" 2>&1 \
+    || { cp "$WORK/r3.log" "$WORK/last.log"; fail "running the multi-stage image failed"; }
+grep -q "ms-artifact" "$WORK/r3.log" || fail "COPY --from did not carry the artifact"
+
+"$PODVM" rmi podvm-e2e-ms:test > /dev/null 2>&1 || true
+
 # ---- a failing RUN aborts the build and leaves nothing ----
 
 mkdir -p "$WORK/ctx2"

@@ -16,36 +16,33 @@ podvm runs containers in lightweight VMs using KVM, providing hardware isolation
 - **No guest runtime** - Container runs directly in VM
 - **9p rootfs share** - No host daemon required (virtiofs returns in the
   performance phase; see [ADR-022](adrs/podvm_adr022_9p-rootfs-transport.md))
-- **Podman storage backend** - Uses images podman already pulled, layers
-  in place, no export (see [ADR-024](adrs/podvm_adr024_podman-storage-backend.md))
+- **Layered image store** - Content-addressed layers with dedup; pull,
+  build, run, `save`/`load` (docker-archive interop with podman) and
+  `system prune` all operate on it (see
+  [ADR-027](adrs/podvm_adr027_podvm-native-layered-store.md))
+- **Podman storage backend** - Runs images podman already pulled, layers
+  in place, no export (fallback resolution path; see
+  [ADR-024](adrs/podvm_adr024_podman-storage-backend.md))
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  HOST                                                        │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │  podvm CLI                                              │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │  QEMU                                                   │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                             │
-                    9p │ vsock
-                             │
-┌─────────────────────────────┼───────────────────────────────┐
-│  VM                         │                               │
-│  ┌──────────────────────────▼─────────────────────────────┐ │
-│  │  Synthetic Kernel (~2MB)                                │ │
-│  └──────────────────────────┬─────────────────────────────┘ │
-│  ┌──────────────────────────▼─────────────────────────────┐ │
-│  │  /init (static)                                          │ │
-│  └──────────────────────────┬─────────────────────────────┘ │
-│  ┌──────────────────────────▼─────────────────────────────┐ │
-│  │  Container Rootfs (via virtio 9p)                       │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph HOST["HOST (trusted)"]
+        CLI["podvm CLI"]
+        QEMU["QEMU"]
+        CLI --> QEMU
+    end
+
+    subgraph VM["VM (container is untrusted)"]
+        KERNEL["Synthetic Kernel (~2MB)"]
+        INIT["/init (static)"]
+        ROOTFS["Container Rootfs (via virtio 9p)"]
+        KERNEL --> INIT
+        INIT --> ROOTFS
+    end
+
+    QEMU -- "9p | vsock" --> KERNEL
 ```
 
 ## Requirements
@@ -144,6 +141,11 @@ podvm rm build
 podvm build -t myapp:1 ./myapp-dir
 podvm myapp:1
 
+# Multi-stage builds: FROM ... AS <stage>, COPY --from=<stage|image>.
+# -m/-c size the RUN-step VMs (compile steps need real memory).
+podvm build -m 2048 -c 2 -t myapp:2 ./myapp-dir
+podvm myapp:2
+
 # Run a service in the background, then read its log and stop it
 podvm -d -n web -p 18080:80 alpine /bin/sh -c '...'
 podvm logs web
@@ -197,15 +199,22 @@ Subcommands:
   rm <name>...        Delete named containers' persistent state
   stop <name>...      Stop detached containers
   logs <name>         Print a detached container's serial log
-  images              List cached images
-  rmi <image>...      Remove cached images (refused while in use)
-  build               Build a Dockerfile into a cached image
+  images              List images in the layered store
+  rmi <image>...      Remove images (refused while in use)
+  build               Build a Dockerfile into a layered image
+  save [-o F] IMAGE   Save an image as a docker-archive tar
+  load [-i F]         Load a docker-archive tar
+                      (podman/docker save compatible)
+  system prune        Remove unreferenced blobs/layers from the store
 ```
 
 The first positional argument may be a rootfs directory **or** an image
-reference (e.g. `debian:12`, `registry.example.com:5000/foo/bar:v1`). Image
-references are pulled from an OCI registry into a local cache
-(`/tmp/podvm/images`) on first use and reused afterward.
+reference (e.g. `debian:12`, `registry.example.com:5000/foo/bar:v1`).
+References resolve in order: podvm's native layered store
+(`$XDG_DATA_HOME/podvm/store`), then podman's storage, then a pull from
+an OCI registry into the layered store on first use. Pulls and builds
+land as content-addressed layers with a manifest, so images dedup and
+export cleanly (`podvm save`/`load`).
 
 ### Examples
 
@@ -231,8 +240,18 @@ podvm /rootfs /bin/id
 podvm/
 ├── src/                    # Host-side code
 │   ├── main.c             # CLI entry point
-│   ├── strparse.c         # String parsing helpers
-│   └── strparse.h
+│   ├── build.c            # Dockerfile build driver
+│   ├── container.c        # Named-container state + locking
+│   ├── image.c            # Registry pull + image refs
+│   ├── imgcfg.c           # Image config (Env/Cmd/User)
+│   ├── json.c             # JSON parser
+│   ├── sha256.c           # Content addressing
+│   ├── store.c            # Podman storage reader (ADR-024)
+│   ├── store_native.c     # Layered image store (ADR-027)
+│   ├── tar.c              # ustar/GNU pack/unpack + whiteouts
+│   ├── userdb.c           # User/group resolution
+│   ├── vsockalloc.c       # Per-VM vsock CID/port allocator
+│   └── strparse.{c,h}     # String parsing helpers
 ├── guest/                  # Guest-side code
 │   ├── init.c             # Guest init
 │   ├── Makefile           # Build guest init
@@ -296,7 +315,10 @@ See [adrs/](adrs/) for detailed architecture decisions:
 - **ADR022**: 9p rootfs transport (current)
 - **ADR023**: User-mode networking first (current; bridge in the
   performance phase)
-- **ADR024**: Podman storage backend (current)
+- **ADR024**: Podman storage backend (run-path fallback)
+- **ADR025**: Escape the config channel (implemented)
+- **ADR026**: Host-side write-back for named containers (implemented)
+- **ADR027**: Podvm-native layered image store (current)
 
 ## Security
 

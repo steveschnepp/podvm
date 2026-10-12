@@ -1411,6 +1411,143 @@ static void chain_insert_front(char chain[MAX_CHAIN][MAX_PATH], int *n,
     (*n)++;
 }
 
+/* ─────────────── multi-stage build state (podvm build) ─────────────── */
+
+/*
+ * Everything one FROM ... [next FROM] owns. Each stage builds its own
+ * layer chain on top of its own base; the LAST stage is the image.
+ * Stage-sized arrays make this too big for the stack, so cmd_build
+ * heap-allocates an array of these.
+ */
+typedef struct {
+    char name[128];                          /* "AS name", may be empty */
+    char base_diffs[MAX_CHAIN][MAX_PATH];    /* base chain, top-first */
+    int  nbase;
+    char base_dig_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* bottom-first */
+    int  nbase_dig;
+    char layer_chain[MAX_CHAIN][MAX_PATH];   /* committed step layers, top-first */
+    int  nlayers;
+    char step_dig[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* step digests, build order */
+    int  nstepdig;
+    char envlist[4096];
+    char cwd[MAX_PATH];
+    char user[128];
+    char cmdcsv[4096];
+    char entrycsv[4096];
+} BuildStage;
+
+/*
+ * Resolve an image ref (podman store first, then the native layered
+ * store) into its layer chain. Fills diffs (top-first) and, when
+ * digs_bottom is non-NULL, the digests (bottom-first; podman layers are
+ * committed to the native store first). ic, when non-NULL, receives the
+ * image config. Returns the layer count, or -1 with a message in err.
+ */
+static int resolve_image_chain(const char *ref,
+                               char diffs[MAX_CHAIN][MAX_PATH],
+                               char digs_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX],
+                               ImageConfig *ic,
+                               char *err, size_t errsz) {
+    char top[STORE_PATH_MAX];
+    if (store_resolve(ref, top, sizeof(top), 1) == 0) {
+        StoreLayer lay[MAX_CHAIN];
+        int c = store_chain(top, lay, MAX_CHAIN);
+        if (c <= 0) {
+            snprintf(err, errsz, "no layer chain for %s", ref);
+            return -1;
+        }
+        for (int l = 0; l < c && l < MAX_CHAIN; l++)
+            snprintf(diffs[l], MAX_PATH, "%s", lay[l].diff);
+        if (digs_bottom) {
+            /* Commit each base layer into the native store (bottom-first
+             * for the manifest). Copy-to-native, simple; optimize later. */
+            for (int l = 0; l < c && l < MAX_CHAIN; l++) {
+                if (native_commit_diff(lay[l].diff,
+                                       digs_bottom[c - 1 - l],
+                                       NATIVE_DIGEST_MAX) < 0) {
+                    snprintf(err, errsz, "cannot commit base layer");
+                    return -1;
+                }
+            }
+        }
+        if (ic) store_image_config(ref, ic);
+        return c;
+    }
+
+    char root[STORE_PATH_MAX];
+    if (image_resolve(ref, root, sizeof(root)) != IMAGE_RESOLVED_NATIVE) {
+        snprintf(err, errsz, "cannot resolve FROM image %s", ref);
+        return -1;
+    }
+    /* Base lives in the layered store: use its chain. */
+    NativeLayer nl[MAX_CHAIN];
+    int c = native_chain(ref, nl, MAX_CHAIN);
+    if (c <= 0) {
+        snprintf(err, errsz, "no native chain for %s", ref);
+        return -1;
+    }
+    for (int l = 0; l < c && l < MAX_CHAIN; l++)
+        snprintf(diffs[l], MAX_PATH, "%s", nl[l].diff);
+    /* Reuse the base's existing digests (bottom-first). */
+    if (digs_bottom) {
+        for (int l = 0; l < c && l < MAX_CHAIN; l++)
+            snprintf(digs_bottom[c - 1 - l], sizeof(digs_bottom[0]), "%s",
+                     nl[l].digest);
+    }
+    if (ic) native_config(ref, ic);
+    return c;
+}
+
+/* Seed a stage's metadata from a base image's config (docker: FROM
+ * inherits the base image's config). */
+static void stage_seed_from_config(BuildStage *st, const ImageConfig *ic) {
+    snprintf(st->cwd, sizeof(st->cwd), "%s", ic->cwd);
+    snprintf(st->user, sizeof(st->user), "%s", ic->user);
+    for (int e = 0; e < ic->nenv; e++) {
+        const char *eq = strchr(ic->env[e], '=');
+        size_t klen = eq ? (size_t)(eq - ic->env[e]) : strlen(ic->env[e]);
+        const char *val = eq ? eq + 1 : ic->env[e] + klen;
+        char enc[BUILD_OP_STR * 2], pair[BUILD_OP_STR * 2];
+        if (kv_escape(enc, sizeof(enc), val) == (size_t)-1) enc[0] = '\0';
+        snprintf(pair, sizeof(pair), "%.*s=%s", (int)klen, ic->env[e], enc);
+        if (build_env_set(st->envlist, sizeof(st->envlist), pair) < 0) break;
+    }
+    char raw[8192];
+    size_t off = 0;
+    for (int c = 0; c < ic->ncmd; c++) {
+        int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
+                         off ? "," : "", ic->cmd[c]);
+        if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
+        off += (size_t)w;
+    }
+    if (csv_escape_words(raw, st->cmdcsv, sizeof(st->cmdcsv)) < 0)
+        st->cmdcsv[0] = '\0';
+    raw[0] = '\0'; off = 0;
+    for (int c = 0; c < ic->nentry; c++) {
+        int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
+                         off ? "," : "", ic->entrypoint[c]);
+        if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
+        off += (size_t)w;
+    }
+    if (csv_escape_words(raw, st->entrycsv, sizeof(st->entrycsv)) < 0)
+        st->entrycsv[0] = '\0';
+}
+
+/* dst of a COPY: with multiple sources docker requires a directory
+ * target and each file lands at dst/<basename>. */
+static void copy_target(const char *dstabs, const char *src, int multi,
+                        char *out, size_t n) {
+    if (!multi) {
+        snprintf(out, n, "%s", dstabs);
+        return;
+    }
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    size_t bl = strlen(base);
+    while (bl && base[bl - 1] == '/') bl--;      /* "dir/" -> "dir" */
+    snprintf(out, n, "%s/%.*s", dstabs, (int)bl, base);
+}
+
 static int cmd_build(int argc, char **argv) {
     const char *df_arg = NULL, *tag = NULL, *context = NULL;
 
@@ -1421,12 +1558,18 @@ static int cmd_build(int argc, char **argv) {
             snprintf(config.initramfs, sizeof(config.initramfs), "%s", argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc)
             snprintf(config.kernel, sizeof(config.kernel), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "-m") && i + 1 < argc)
+            config.memory = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc)
+            config.cpus = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             fprintf(stderr, "Usage: podvm build [-f Dockerfile] -t <name:tag> "
-                            "[-r initramfs] [-k kernel] [context]\n");
-            fprintf(stderr, "Build a Dockerfile into a podvm image. Supported: FROM,\n");
-            fprintf(stderr, "RUN (shell form), COPY, WORKDIR, ENV, USER, CMD, ENTRYPOINT;\n");
-            fprintf(stderr, "EXPOSE/LABEL are accepted and ignored. One stage only.\n");
+                            "[-r initramfs] [-k kernel] [-m MB] [-c CPUS] [context]\n");
+            fprintf(stderr, "Build a Dockerfile into a podvm image. Supported: FROM\n");
+            fprintf(stderr, "(multi-stage: 'FROM x AS name'), RUN (shell form), COPY\n");
+            fprintf(stderr, "(context-relative, or '--from=<stage|image>'), WORKDIR,\n");
+            fprintf(stderr, "ENV, USER, CMD, ENTRYPOINT; EXPOSE/LABEL are accepted\n");
+            fprintf(stderr, "and ignored. -m/-c size the RUN-step VMs.\n");
             return 0;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "podvm build: unknown option '%s'\n", argv[i]);
@@ -1476,15 +1619,6 @@ static int cmd_build(int argc, char **argv) {
         fprintf(stderr, "podvm build: %s: %s\n", df_path, perr);
         return 1;
     }
-    if (nops > 1) {
-        for (int i = 1; i < nops; i++) {
-            if (ops[i].kind == BFROM) {
-                fprintf(stderr, "podvm build: line %d: multi-stage builds "
-                                "are not supported\n", ops[i].line);
-                return 1;
-            }
-        }
-    }
 
     detect_vsock();
     if (config.kernel[0] == '\0')
@@ -1506,123 +1640,105 @@ static int cmd_build(int argc, char **argv) {
         return 1;
     }
 
-    /* ── FROM: resolve to a layer chain + the image's config ── */
-    const char *from = ops[0].a;
-    char base_diffs[MAX_CHAIN][MAX_PATH];
-    int nbase = 0;
-    ImageConfig ic;
-    image_config_init(&ic);
-    int from_podman = 0, from_lock = -1;
-    char layer_chain[MAX_CHAIN][MAX_PATH];   /* committed step native diff dirs, top-first */
-    int nlayers = 0;
-    char step_dig[MAX_CHAIN][NATIVE_DIGEST_MAX];  /* step digests, build order */
-    int nstepdig = 0;
-    char base_dig_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* base digests, bottom-first */
-    int nbase_dig = 0;
-    char envlist[4096] = "";
-    char cwd[MAX_PATH] = "", user[128] = "";
-    char cmdcsv[4096] = "", entrycsv[4096] = "";
+    /* ── stages: each FROM starts a new one; the last one is the image ── */
+    BuildStage *stages = calloc(BUILD_STAGES_MAX, sizeof(*stages));
+    if (!stages) {
+        fprintf(stderr, "podvm build: out of memory\n");
+        return 1;
+    }
+    int nstages = 0;
+    BuildStage *cur = NULL;
     int rc = 0;
 
-    (void)from_podman;
-    if (image_is_path(from)) {
-        fprintf(stderr, "podvm build: line %d: FROM must be an image, "
-                        "not a directory\n", ops[0].line);
-        rc = 1;
-        goto out;
-    }
-    {
-        char top[STORE_PATH_MAX];
-        if (store_resolve(from, top, sizeof(top), 1) == 0) {
-            StoreLayer lay[MAX_CHAIN];
-            int c = store_chain(top, lay, MAX_CHAIN);
-            if (c <= 0) {
-                fprintf(stderr, "podvm build: no layer chain for %s\n", from);
-                rc = 1;
-                goto out;
-            }
-            for (int l = 0; l < c && l < MAX_CHAIN; l++)
-                snprintf(base_diffs[l], MAX_PATH, "%s", lay[l].diff);
-            nbase = c;
-            /* Commit each base layer into the native store (bottom-first
-             * for the manifest). Copy-to-native, simple; optimize later. */
-            nbase_dig = c;
-            for (int l = 0; l < c && l < MAX_CHAIN; l++) {
-                if (native_commit_diff(lay[l].diff, base_dig_bottom[c - 1 - l],
-                                       sizeof(base_dig_bottom[0])) < 0) {
-                    fprintf(stderr, "podvm build: cannot commit base layer\n");
-                    rc = 1;
-                    goto out;
-                }
-            }
-            store_image_config(from, &ic);
-            from_podman = 1;
-        } else {
-            char root[STORE_PATH_MAX];
-            int r = image_resolve(from, root, sizeof(root));
-            if (r == IMAGE_RESOLVED_NATIVE) {
-                /* Base lives in the layered store: use its chain. */
-                NativeLayer nl[MAX_CHAIN];
-                int c = native_chain(from, nl, MAX_CHAIN);
-                if (c <= 0) {
-                    fprintf(stderr, "podvm build: no native chain for %s\n", from);
-                    rc = 1;
-                    goto out;
-                }
-                for (int l = 0; l < c && l < MAX_CHAIN; l++)
-                    snprintf(base_diffs[l], MAX_PATH, "%s", nl[l].diff);
-                nbase = c;
-                /* Reuse the base's existing digests (bottom-first). */
-                nbase_dig = c;
-                for (int l = 0; l < c && l < MAX_CHAIN; l++)
-                    snprintf(base_dig_bottom[c - 1 - l],
-                             sizeof(base_dig_bottom[0]), "%s", nl[l].digest);
-                native_config(from, &ic);
-            } else {
-                fprintf(stderr, "podvm build: cannot resolve FROM image %s\n", from);
-                rc = 1;
-                goto out;
-            }
-        }
-    }
-    printf("podvm: build from %s (%d base layer%s)\n", from, nbase,
-           nbase == 1 ? "" : "s");
-
-    /* Seed metadata from the base image (docker: FROM inherits config). */
-    snprintf(cwd, sizeof(cwd), "%s", ic.cwd);
-    snprintf(user, sizeof(user), "%s", ic.user);
-    for (int e = 0; e < ic.nenv; e++) {
-        const char *eq = strchr(ic.env[e], '=');
-        size_t klen = eq ? (size_t)(eq - ic.env[e]) : strlen(ic.env[e]);
-        const char *val = eq ? eq + 1 : ic.env[e] + klen;
-        char enc[BUILD_OP_STR * 2], pair[BUILD_OP_STR * 2];
-        if (kv_escape(enc, sizeof(enc), val) == (size_t)-1) enc[0] = '\0';
-        snprintf(pair, sizeof(pair), "%.*s=%s", (int)klen, ic.env[e], enc);
-        if (build_env_set(envlist, sizeof(envlist), pair) < 0) break;
-    }
-    {
-        char raw[8192];
-        size_t off = 0;
-        for (int c = 0; c < ic.ncmd; c++) {
-            int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
-                             off ? "," : "", ic.cmd[c]);
-            if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
-            off += (size_t)w;
-        }
-        if (csv_escape_words(raw, cmdcsv, sizeof(cmdcsv)) < 0) cmdcsv[0] = '\0';
-        raw[0] = '\0'; off = 0;
-        for (int c = 0; c < ic.nentry; c++) {
-            int w = snprintf(raw + off, sizeof(raw) - off, "%s%s",
-                             off ? "," : "", ic.entrypoint[c]);
-            if (w < 0 || (size_t)w >= sizeof(raw) - off) break;
-            off += (size_t)w;
-        }
-        if (csv_escape_words(raw, entrycsv, sizeof(entrycsv)) < 0) entrycsv[0] = '\0';
-    }
-
     /* ── the op loop ── */
-    for (int i = 1; i < nops; i++) {
+    for (int i = 0; i < nops; i++) {
         BuildOp *op = &ops[i];
+
+        if (op->kind == BFROM) {
+            char perr[512];
+            if (nstages >= BUILD_STAGES_MAX) {
+                fprintf(stderr, "podvm build: too many stages (max %d)\n",
+                        BUILD_STAGES_MAX);
+                rc = 1;
+                goto out;
+            }
+            for (int s = 0; s < nstages; s++) {
+                if (op->b[0] && !strcmp(stages[s].name, op->b)) {
+                    fprintf(stderr, "podvm build: line %d: duplicate stage "
+                                    "name '%s'\n", op->line, op->b);
+                    rc = 1;
+                    goto out;
+                }
+            }
+            BuildStage *st = &stages[nstages];
+            if (op->b[0])
+                snprintf(st->name, sizeof(st->name), "%s", op->b);
+
+            if (image_is_path(op->a)) {
+                fprintf(stderr, "podvm build: line %d: FROM must be an image, "
+                                "not a directory\n", op->line);
+                rc = 1;
+                goto out;
+            }
+            int src_stage = -1;
+            for (int s = 0; s < nstages; s++)
+                if (stages[s].name[0] && !strcmp(stages[s].name, op->a))
+                    src_stage = s;
+            if (src_stage >= 0) {
+                /* FROM <prior stage>: that stage's whole chain becomes
+                 * our base, and its final config is inherited. */
+                BuildStage *src = &stages[src_stage];
+                for (int l = 0; l < src->nlayers && st->nbase < MAX_CHAIN; l++)
+                    snprintf(st->base_diffs[st->nbase++], MAX_PATH, "%s",
+                             src->layer_chain[l]);
+                for (int b = 0; b < src->nbase && st->nbase < MAX_CHAIN; b++)
+                    snprintf(st->base_diffs[st->nbase++], MAX_PATH, "%s",
+                             src->base_diffs[b]);
+                for (int b = 0; b < src->nbase_dig && st->nbase_dig < MAX_CHAIN;
+                     b++)
+                    snprintf(st->base_dig_bottom[st->nbase_dig++],
+                             NATIVE_DIGEST_MAX, "%s", src->base_dig_bottom[b]);
+                for (int s2 = 0; s2 < src->nstepdig && st->nbase_dig < MAX_CHAIN;
+                     s2++)
+                    snprintf(st->base_dig_bottom[st->nbase_dig++],
+                             NATIVE_DIGEST_MAX, "%s", src->step_dig[s2]);
+                snprintf(st->envlist, sizeof(st->envlist), "%s", src->envlist);
+                snprintf(st->cwd, sizeof(st->cwd), "%s", src->cwd);
+                snprintf(st->user, sizeof(st->user), "%s", src->user);
+                snprintf(st->cmdcsv, sizeof(st->cmdcsv), "%s", src->cmdcsv);
+                snprintf(st->entrycsv, sizeof(st->entrycsv), "%s",
+                         src->entrycsv);
+            } else {
+                ImageConfig ic;
+                image_config_init(&ic);
+                int c = resolve_image_chain(op->a, st->base_diffs,
+                                            st->base_dig_bottom, &ic,
+                                            perr, sizeof(perr));
+                if (c < 0) {
+                    fprintf(stderr, "podvm build: line %d: %s\n", op->line, perr);
+                    image_config_free(&ic);
+                    rc = 1;
+                    goto out;
+                }
+                st->nbase = c;
+                st->nbase_dig = c;
+                stage_seed_from_config(st, &ic);
+                image_config_free(&ic);
+            }
+            nstages++;
+            cur = st;
+            printf("podvm: stage %d: FROM %s (%d base layer%s)\n",
+                   nstages, op->a, cur->nbase, cur->nbase == 1 ? "" : "s");
+            continue;
+        }
+
+        if (!cur) {   /* the parser requires FROM first; belt + braces */
+            fprintf(stderr, "podvm build: line %d: instruction before FROM\n",
+                    op->line);
+            rc = 1;
+            goto out;
+        }
+
         switch (op->kind) {
         case BENV: {
             /* "K=V K2=V2": split on spaces; quoting not supported (v1). */
@@ -1640,7 +1756,7 @@ static int cmd_build(int argc, char **argv) {
                 if (kv_escape(enc, sizeof(enc), eq + 1) == (size_t)-1) enc[0] = '\0';
                 *eq = '\0';
                 snprintf(pair, sizeof(pair), "%s=%s", tok, enc);
-                if (build_env_set(envlist, sizeof(envlist), pair) < 0) {
+                if (build_env_set(cur->envlist, sizeof(cur->envlist), pair) < 0) {
                     fprintf(stderr, "podvm build: line %d: env list overflow\n",
                             op->line);
                     rc = 1;
@@ -1656,14 +1772,14 @@ static int cmd_build(int argc, char **argv) {
                 rc = 1;
                 goto out;
             }
-            snprintf(cwd, sizeof(cwd), "%s", op->a);
+            snprintf(cur->cwd, sizeof(cur->cwd), "%s", op->a);
             break;
         case BUSER:
-            snprintf(user, sizeof(user), "%s", op->a);
+            snprintf(cur->user, sizeof(cur->user), "%s", op->a);
             break;
         case BCMD:
             if (op->json_form) {
-                if (csv_escape_words(op->a, cmdcsv, sizeof(cmdcsv)) < 0) {
+                if (csv_escape_words(op->a, cur->cmdcsv, sizeof(cur->cmdcsv)) < 0) {
                     fprintf(stderr, "podvm build: line %d: CMD too long\n", op->line);
                     rc = 1;
                     goto out;
@@ -1672,12 +1788,12 @@ static int cmd_build(int argc, char **argv) {
                 /* shell form: docker stores ["sh","-c",raw] */
                 char enc[BUILD_OP_STR * 2];
                 if (kv_escape(enc, sizeof(enc), op->a) == (size_t)-1) enc[0] = '\0';
-                snprintf(cmdcsv, sizeof(cmdcsv), "sh,-c,%s", enc);
+                snprintf(cur->cmdcsv, sizeof(cur->cmdcsv), "sh,-c,%s", enc);
             }
             break;
         case BENTRYPOINT:
             if (op->json_form) {
-                if (csv_escape_words(op->a, entrycsv, sizeof(entrycsv)) < 0) {
+                if (csv_escape_words(op->a, cur->entrycsv, sizeof(cur->entrycsv)) < 0) {
                     fprintf(stderr, "podvm build: line %d: ENTRYPOINT too long\n",
                             op->line);
                     rc = 1;
@@ -1686,17 +1802,81 @@ static int cmd_build(int argc, char **argv) {
             } else {
                 char enc[BUILD_OP_STR * 2];
                 if (kv_escape(enc, sizeof(enc), op->a) == (size_t)-1) enc[0] = '\0';
-                snprintf(entrycsv, sizeof(entrycsv), "sh,-c,%s", enc);
+                snprintf(cur->entrycsv, sizeof(cur->entrycsv), "sh,-c,%s", enc);
             }
             break;
         case BCOPY: {
-            char ldir[MAX_PATH], srcabs[MAX_PATH], cerr[512];
-            if (op->a[0] == '/' || strstr(op->a, "..")) {
+            char ldir[MAX_PATH], srcabs[MAX_PATH], dstabs[MAX_PATH], cerr[512];
+            char fromdiffs[MAX_CHAIN][MAX_PATH];
+            const char *chain[MAX_CHAIN];
+            int nchain = 0;
+
+            /* docker: a relative COPY dst is relative to WORKDIR */
+            if (op->b[0] == '/')
+                snprintf(dstabs, sizeof(dstabs), "%s", op->b);
+            else
+                snprintf(dstabs, sizeof(dstabs), "%s/%s",
+                         cur->cwd[0] ? cur->cwd : "/", op->b);
+
+            if (op->from[0]) {
+                /* --from=<stage|image>: src is a path INSIDE that
+                 * image's merged rootfs, not a context path. */
+                int found = -1;
+                for (int s = 0; s < nstages; s++)
+                    if (stages[s].name[0] && !strcmp(stages[s].name, op->from))
+                        found = s;
+                if (found >= 0) {
+                    BuildStage *src = &stages[found];
+                    for (int l = 0; l < src->nlayers && nchain < MAX_CHAIN; l++)
+                        chain[nchain++] = src->layer_chain[l];
+                    for (int b = 0; b < src->nbase && nchain < MAX_CHAIN; b++)
+                        chain[nchain++] = src->base_diffs[b];
+                } else {
+                    char perr2[512];
+                    if (image_is_path(op->from)) {
+                        fprintf(stderr, "podvm build: line %d: COPY --from "
+                                "must be a stage name or an image: '%s'\n",
+                                op->line, op->from);
+                        rc = 1;
+                        goto out;
+                    }
+                    int c = resolve_image_chain(op->from, fromdiffs, NULL, NULL,
+                                                perr2, sizeof(perr2));
+                    if (c < 0) {
+                        fprintf(stderr, "podvm build: line %d: COPY --from: %s\n",
+                                op->line, perr2);
+                        rc = 1;
+                        goto out;
+                    }
+                    for (int l = 0; l < c && nchain < MAX_CHAIN; l++)
+                        chain[nchain++] = fromdiffs[l];
+                }
+            } else if (op->a[0] == '/' || strstr(op->a, "..")) {
                 fprintf(stderr, "podvm build: line %d: COPY src must be a "
                                 "context-relative path without '..': '%s'\n",
                         op->line, op->a);
                 rc = 1;
                 goto out;
+            }
+            /* split the (possibly multi-) source list; dst is a
+             * directory when there is more than one source */
+            char srcbuf[BUILD_OP_STR];
+            char *srcs[64];
+            int nsrc = 0;
+            snprintf(srcbuf, sizeof(srcbuf), "%s", op->a);
+            for (char *tok = strtok(srcbuf, " \t"); tok && nsrc < 64;
+                 tok = strtok(NULL, " \t"))
+                srcs[nsrc++] = tok;
+            if (!op->from[0]) {
+                for (int s = 0; s < nsrc; s++) {
+                    if (srcs[s][0] == '/' || strstr(srcs[s], "..")) {
+                        fprintf(stderr, "podvm build: line %d: COPY src must "
+                                "be a context-relative path without '..': '%s'\n",
+                                op->line, srcs[s]);
+                        rc = 1;
+                        goto out;
+                    }
+                }
             }
             snprintf(ldir, sizeof(ldir), "%s/c%03d", layersdir, i);
             if (mkdir_p(ldir, 0755) < 0) {
@@ -1705,13 +1885,33 @@ static int cmd_build(int argc, char **argv) {
                 rc = 1;
                 goto out;
             }
-            snprintf(srcabs, sizeof(srcabs), "%s/%s", context, op->a);
-            if (build_copy_path(srcabs, ldir, op->b, cerr, sizeof(cerr)) < 0) {
-                fprintf(stderr, "podvm build: line %d: %s\n", op->line, cerr);
-                rc = 1;
-                goto out;
+            if (op->from[0]) {
+                for (int s = 0; s < nsrc; s++) {
+                    char target[MAX_PATH];
+                    copy_target(dstabs, srcs[s], nsrc > 1, target, sizeof(target));
+                    if (build_copy_from_chain((const char *const *)chain, nchain,
+                                              srcs[s], ldir, target,
+                                              cerr, sizeof(cerr)) < 0) {
+                        fprintf(stderr, "podvm build: line %d: %s\n", op->line, cerr);
+                        rc = 1;
+                        goto out;
+                    }
+                }
+                printf("podvm: step %d: COPY --from=%s %s %s\n",
+                       i, op->from, op->a, op->b);
+            } else {
+                for (int s = 0; s < nsrc; s++) {
+                    char target[MAX_PATH];
+                    copy_target(dstabs, srcs[s], nsrc > 1, target, sizeof(target));
+                    snprintf(srcabs, sizeof(srcabs), "%s/%s", context, srcs[s]);
+                    if (build_copy_path(srcabs, ldir, target, cerr, sizeof(cerr)) < 0) {
+                        fprintf(stderr, "podvm build: line %d: %s\n", op->line, cerr);
+                        rc = 1;
+                        goto out;
+                    }
+                }
+                printf("podvm: step %d: COPY %s %s\n", i, op->a, op->b);
             }
-            printf("podvm: step %d: COPY %s %s\n", i, op->a, op->b);
             {
                 char dig[NATIVE_DIGEST_MAX], ndir[MAX_PATH];
                 if (native_commit_diff(ldir, dig, sizeof(dig)) < 0) {
@@ -1720,9 +1920,10 @@ static int cmd_build(int argc, char **argv) {
                     goto out;
                 }
                 native_diff_path(dig, ndir, sizeof(ndir));
-                chain_insert_front(layer_chain, &nlayers, ndir);
-                snprintf(step_dig[nstepdig], sizeof(step_dig[0]), "%s", dig);
-                nstepdig++;
+                chain_insert_front(cur->layer_chain, &cur->nlayers, ndir);
+                snprintf(cur->step_dig[cur->nstepdig],
+                         sizeof(cur->step_dig[0]), "%s", dig);
+                cur->nstepdig++;
             }
             break;
         }
@@ -1734,21 +1935,21 @@ static int cmd_build(int argc, char **argv) {
 
             /* Step chain: committed layers (top-first), then the base. */
             store_nlayers = 0;
-            for (int l = 0; l < nlayers && store_nlayers < MAX_CHAIN; l++)
+            for (int l = 0; l < cur->nlayers && store_nlayers < MAX_CHAIN; l++)
                 snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
-                         "%s", layer_chain[l]);
-            for (int b = 0; b < nbase && store_nlayers < MAX_CHAIN; b++)
+                         "%s", cur->layer_chain[l]);
+            for (int b = 0; b < cur->nbase && store_nlayers < MAX_CHAIN; b++)
                 snprintf(store_layers[store_nlayers++].diff, STORE_PATH_MAX,
-                         "%s", base_diffs[b]);
+                         "%s", cur->base_diffs[b]);
 
             snprintf(config.name, sizeof(config.name), "%s", stepname);
             snprintf(config.rootfs_dir, sizeof(config.rootfs_dir),
                      "/tmp/podvm-build-ovl.%d.%d", (int)getpid(), i);
             snprintf(config.entrypoint, sizeof(config.entrypoint), "/bin/sh");
             snprintf(config.args, sizeof(config.args), "%s", "/.podvm-step.sh");
-            snprintf(config.env, sizeof(config.env), "%s", envlist);
-            snprintf(config.cwd, sizeof(config.cwd), "%s", cwd);
-            snprintf(config.user, sizeof(config.user), "%s", user);
+            snprintf(config.env, sizeof(config.env), "%s", cur->envlist);
+            snprintf(config.cwd, sizeof(config.cwd), "%s", cur->cwd);
+            snprintf(config.user, sizeof(config.user), "%s", cur->user);
             config.interactive = 0;
             config.read_only = 0;
             config.autoremove = 0;
@@ -1823,9 +2024,10 @@ static int cmd_build(int argc, char **argv) {
                     goto out;
                 }
                 native_diff_path(dig, ndir, sizeof(ndir));
-                chain_insert_front(layer_chain, &nlayers, ndir);
-                snprintf(step_dig[nstepdig], sizeof(step_dig[0]), "%s", dig);
-                nstepdig++;
+                chain_insert_front(cur->layer_chain, &cur->nlayers, ndir);
+                snprintf(cur->step_dig[cur->nstepdig],
+                         sizeof(cur->step_dig[0]), "%s", dig);
+                cur->nstepdig++;
             }
             container_rm_rf(sdir);
             container_lock_unlink(stepname);
@@ -1842,10 +2044,10 @@ static int cmd_build(int argc, char **argv) {
          * build order (top). */
         const char *aptr[MAX_CHAIN * 2];
         int nall = 0;
-        for (int b = 0; b < nbase_dig; b++)
-            aptr[nall++] = base_dig_bottom[b];
-        for (int s = 0; s < nstepdig; s++)
-            aptr[nall++] = step_dig[s];
+        for (int b = 0; b < cur->nbase_dig; b++)
+            aptr[nall++] = cur->base_dig_bottom[b];
+        for (int s = 0; s < cur->nstepdig; s++)
+            aptr[nall++] = cur->step_dig[s];
 
         /* The OCI-shaped config blob the run path already reads. */
         char *cfgjson = NULL;
@@ -1857,14 +2059,14 @@ static int cmd_build(int argc, char **argv) {
             goto out;
         }
         char escwd[STORE_PATH_MAX], escuser[300];
-        json_escape(cwd, escwd, sizeof(escwd));
-        json_escape(user, escuser, sizeof(escuser));
+        json_escape(cur->cwd, escwd, sizeof(escwd));
+        json_escape(cur->user, escuser, sizeof(escuser));
         fprintf(cf, "{\"architecture\":\"amd64\",\"os\":\"linux\",\"config\":{");
-        json_csv_array(cf, "Env", envlist);
+        json_csv_array(cf, "Env", cur->envlist);
         fprintf(cf, ",");
-        json_csv_array(cf, "Entrypoint", entrycsv);
+        json_csv_array(cf, "Entrypoint", cur->entrycsv);
         fprintf(cf, ",");
-        json_csv_array(cf, "Cmd", cmdcsv);
+        json_csv_array(cf, "Cmd", cur->cmdcsv);
         fprintf(cf, ",\"WorkingDir\":\"%s\",\"User\":\"%s\"}", escwd, escuser);
         /* rootfs + history: podman/docker load validate against
          * rootfs.diff_ids (the layer digests, bottom-first). */
@@ -1898,8 +2100,7 @@ static int cmd_build(int argc, char **argv) {
 
 out:
     container_rm_rf(workdir);
-    if (from_lock >= 0) close(from_lock);
-    image_config_free(&ic);
+    free(stages);
     return rc;
 }
 

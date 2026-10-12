@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/sysmacros.h>      /* major()/minor() for whiteout checks */
 
 #include "build.h"
 
@@ -162,7 +163,40 @@ int dockerfile_parse(const char *text, BuildOp *ops, int max,
         op->line = cont_start;
 
         switch (k) {
-        case BFROM:
+        case BFROM: {
+            if (!*arg) {
+                seterr(err, errsz, "line %d: FROM needs an argument",
+                       cont_start);
+                return -1;
+            }
+            char *sp = arg;
+            while (*sp && *sp != ' ' && *sp != '\t') sp++;
+            if (*sp) { *sp++ = '\0'; while (*sp == ' ' || *sp == '\t') sp++; }
+            rstrip(sp);
+            snprintf(op->a, sizeof(op->a), "%s", arg);
+            if (*sp) {
+                /* split the next word ("AS") off the remainder */
+                char *word = sp;
+                while (*word && *word != ' ' && *word != '\t') word++;
+                if (*word) {
+                    *word++ = '\0';
+                    while (*word == ' ' || *word == '\t') word++;
+                }
+                rstrip(word);
+                if (strcasecmp(sp, "AS")) {
+                    seterr(err, errsz, "line %d: expected 'AS <name>' "
+                           "after FROM, got '%s'", cont_start, sp);
+                    return -1;
+                }
+                if (!*word) {
+                    seterr(err, errsz, "line %d: FROM ... AS needs a "
+                           "stage name", cont_start);
+                    return -1;
+                }
+                snprintf(op->b, sizeof(op->b), "%s", word);
+            }
+            break;
+        }
         case BWORKDIR:
         case BUSER:
             if (!*arg) {
@@ -193,24 +227,57 @@ int dockerfile_parse(const char *text, BuildOp *ops, int max,
             snprintf(op->a, sizeof(op->a), "%s", arg);
             break;
         case BCOPY: {
+            /* Leading flags: only --from=<ref> (docker also has
+             * --chown/--link; reject those explicitly rather than
+             * silently misparsing them as a src path). */
+            while (!strncmp(arg, "--", 2)) {
+                if (strncmp(arg, "--from=", 7)) {
+                    seterr(err, errsz, "line %d: unsupported COPY flag '%s'",
+                           cont_start, arg);
+                    return -1;
+                }
+                char *val = arg + 7;
+                char *end = val;
+                while (*end && *end != ' ' && *end != '\t') end++;
+                char save = *end; *end = '\0';
+                if (!*val) {
+                    *end = save;
+                    seterr(err, errsz, "line %d: COPY --from needs a "
+                           "stage name or image", cont_start);
+                    return -1;
+                }
+                snprintf(op->from, sizeof(op->from), "%s", val);
+                *end = save;
+                arg = end;
+                while (*arg == ' ' || *arg == '\t') arg++;
+            }
+            /* dst is the LAST token; everything before it is the src
+             * list (docker: "COPY a b /dir/" copies each source). */
             if (!*arg) {
                 seterr(err, errsz, "line %d: COPY needs src and dst", cont_start);
                 return -1;
             }
-            char *sp = arg;
-            while (*sp && *sp != ' ' && *sp != '\t') sp++;
-            if (*sp) { *sp++ = '\0'; while (*sp == ' ' || *sp == '\t') sp++; }
-            rstrip(sp);
-            if (!*sp) {
+            char *dststart = arg, *p = arg;
+            while (*p) {
+                while (*p == ' ' || *p == '\t') { p++; dststart = p; }
+                while (*p && *p != ' ' && *p != '\t') p++;
+            }
+            if (dststart == arg) {
+                seterr(err, errsz, "line %d: COPY needs src and dst", cont_start);
+                return -1;
+            }
+            char *srcend = dststart;
+            while (srcend > arg && (srcend[-1] == ' ' || srcend[-1] == '\t'))
+                srcend--;
+            *srcend = '\0';
+            rstrip(dststart);
+            if (!*dststart) {
                 seterr(err, errsz, "line %d: COPY needs a destination",
                        cont_start);
                 return -1;
             }
-            char *sp2 = sp;
-            while (*sp2 && *sp2 != ' ' && *sp2 != '\t') sp2++;
-            *sp2 = '\0';
             snprintf(op->a, sizeof(op->a), "%s", arg);
-            snprintf(op->b, sizeof(op->b), "%s", sp);
+            snprintf(op->b, sizeof(op->b), "%s", dststart);
             break;
         }
         case BCMD:
@@ -431,6 +498,157 @@ int build_copy_path(const char *src, const char *layer_root,
     }
     remove(dst);
     return copy_rec(src, dst, err, errsz);
+}
+
+/* ─────────────────── COPY --from (layer chain) ─────────────────── */
+
+static int rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char sub[PATH_MAX_BUILD];
+            if (snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name)
+                >= (int)sizeof(sub)) { closedir(d); return -1; }
+            rm_rf(sub);
+        }
+        closedir(d);
+    }
+    return remove(path);
+}
+
+/* overlayfs whiteout: char device 0:0 with the deleted path's name. */
+static int is_whiteout(const struct stat *st) {
+    return S_ISCHR(st->st_mode) && major(st->st_rdev) == 0 &&
+           minor(st->st_rdev) == 0;
+}
+
+/*
+ * Merge src (one layer's view of the subtree, bottom-to-top order) into
+ * dst (the merged view so far): whiteout clears dst, a directory merges
+ * entry-by-entry, a file/symlink replaces dst wholesale.
+ */
+static int merge_subtree(const char *src, const char *dst,
+                         char *err, size_t errsz) {
+    struct stat st;
+    if (lstat(src, &st) < 0) return 0;            /* not in this layer */
+
+    if (is_whiteout(&st)) {
+        if (rm_rf(dst) < 0) {
+            seterr(err, errsz, "cannot apply whiteout %s: %s", dst,
+                   strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir_p(dst, st.st_mode & 07777) < 0 && errno != EEXIST) {
+            seterr(err, errsz, "cannot mkdir %s: %s", dst, strerror(errno));
+            return -1;
+        }
+        DIR *d = opendir(src);
+        if (!d) {
+            seterr(err, errsz, "cannot read %s: %s", src, strerror(errno));
+            return -1;
+        }
+        struct dirent *de;
+        int rc = 0;
+        while (rc == 0 && (de = readdir(d)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char s2[PATH_MAX_BUILD], d2[PATH_MAX_BUILD];
+            if (snprintf(s2, sizeof(s2), "%s/%s", src, de->d_name) >= (int)sizeof(s2) ||
+                snprintf(d2, sizeof(d2), "%s/%s", dst, de->d_name) >= (int)sizeof(d2)) {
+                seterr(err, errsz, "path too long under %s", src);
+                rc = -1;
+                break;
+            }
+            rc = merge_subtree(s2, d2, err, errsz);
+        }
+        closedir(d);
+        return rc;
+    }
+
+    if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode)) {
+        char parent[PATH_MAX_BUILD];
+        snprintf(parent, sizeof(parent), "%s", dst);
+        char *slash = strrchr(parent, '/');
+        if (slash) *slash = '\0';
+        if (parent[0] && mkdir_p(parent, 0755) < 0) {
+            seterr(err, errsz, "cannot mkdir %s: %s", parent, strerror(errno));
+            return -1;
+        }
+        remove(dst);
+        return copy_rec(src, dst, err, errsz);
+    }
+
+    fprintf(stderr, "podvm build: skipping special file %s\n", src);
+    return 0;
+}
+
+int build_copy_from_chain(const char *const *diffs, int nd,
+                          const char *srcrel, const char *layer_root,
+                          const char *target, char *err, size_t errsz) {
+    if (nd <= 0) {
+        seterr(err, errsz, "COPY --from: empty layer chain");
+        return -1;
+    }
+    if (strstr(srcrel, "..")) {
+        seterr(err, errsz, "COPY --from src must not contain '..': '%s'",
+               srcrel);
+        return -1;
+    }
+    while (*srcrel == '/') srcrel++;               /* /out and out are equal */
+    if (!*srcrel) {
+        seterr(err, errsz, "COPY --from src is empty");
+        return -1;
+    }
+
+    char tmpl[] = "/tmp/podvm-cpyfrom.XXXXXX";
+    char *tmp = mkdtemp(tmpl);
+    if (!tmp) {
+        seterr(err, errsz, "cannot create a temp dir: %s", strerror(errno));
+        return -1;
+    }
+
+    char merged[PATH_MAX_BUILD];
+    if (snprintf(merged, sizeof(merged), "%s/%s", tmp, srcrel)
+        >= (int)sizeof(merged)) {
+        seterr(err, errsz, "COPY --from src path too long: '%s'", srcrel);
+        rm_rf(tmp);
+        return -1;
+    }
+
+    /* bottom -> top: diffs is top-first, so walk it backwards */
+    for (int l = nd - 1; l >= 0; l--) {
+        char src[PATH_MAX_BUILD];
+        if (snprintf(src, sizeof(src), "%s/%s", diffs[l], srcrel)
+            >= (int)sizeof(src)) {
+            seterr(err, errsz, "COPY --from path too long: '%s'", diffs[l]);
+            rm_rf(tmp);
+            return -1;
+        }
+        if (merge_subtree(src, merged, err, errsz) < 0) {
+            rm_rf(tmp);
+            return -1;
+        }
+    }
+
+    struct stat st;
+    if (lstat(merged, &st) < 0) {
+        seterr(err, errsz, "COPY --from src not found in the source "
+               "image: /%s", srcrel);
+        rm_rf(tmp);
+        return -1;
+    }
+
+    int rc = build_copy_path(merged, layer_root, target, err, errsz);
+    rm_rf(tmp);
+    return rc;
 }
 
 /* ─────────────────────────── ENV ─────────────────────────── */
