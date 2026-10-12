@@ -67,7 +67,9 @@ Dockerfile that drops privileges via chown hits this. Worked around in
 the dogfood (`chown ... || true`; files stay root-owned but
 world-readable, `USER mermaid` still works). The real fix is a
 guest-side overlay upper (tmpfs) so ownership changes are guest-local --
-an ADR-sized piece of work, deliberately not started here.
+an ADR-sized piece of work, deliberately not started here. (It was
+written the same day: see ADR-028 and
+`2026-10-12_uid-mapping-exploration.md`.)
 
 ### Bonus flags
 
