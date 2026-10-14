@@ -154,6 +154,10 @@ if [ -e /dev/kvm ]; then
     run_test "E2E build (Dockerfile)" "sh tests/e2e_build.sh"
     # Detached lifecycle: -d + logs + stop.
     run_test "E2E detach (-d/stop/logs)" "sh tests/e2e_detach.sh"
+    # Zero-flag smoke: the canonical `run --rm IMG CMD` with NO -r. Guards
+    # the default-initramfs resolution path every other e2e skips by passing
+    # -r explicitly (the path that hid two compat bugs).
+    run_test "E2E zero-flag (run --rm, no -r)" "timeout 150 sh tests/e2e_zeroflag.sh"
     # images/rmi e2e: deletes the cached alpine image on purpose and must
     # stay the LAST e2e -- earlier e2es depend on that image existing.
     run_test "E2E images/rmi (cache)" "sh tests/e2e_images.sh"
