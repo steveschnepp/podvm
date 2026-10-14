@@ -2,7 +2,33 @@
 
 **Date:** 2026-10-12
 
-**Status:** Proposed
+**Status:** Superseded in part -- see "Decision Reversal" below. The
+original decision (guest-side overlay, path C) was NOT implemented. The
+project chose UID translation via a subuid range (path B), which this ADR
+originally rejected. Path B is implemented (2026-10-14); path C remains
+an unimplemented alternative.
+
+## Decision Reversal (2026-10-14): B over C
+
+This ADR's title rejected "UID Translation" in favor of a guest-side
+overlay. That decision was reversed. The project's defining constraint is
+that "the guest asks, the host executes" (ADR-002's 9p model) -- the host
+does the real filesystem work, the guest is a thin client. A guest-side
+overlay (C) inverts that: writes move into the guest (tmpfs upper), and
+ownership crosses back as tar metadata. A subuid range (B) *preserves* it:
+the guest still asks over 9p, the host still executes, and the kernel's
+userns translation maps guest uids onto a subuid range so chown lands on
+real (unprivileged, subuid-owned) host files.
+
+B was chosen because it is ~10x cheaper than C (no guest overlay module,
+no tar write-back protocol, no thicker PID 1) and keeps the ask/executes
+boundary intact. The reason this ADR originally rejected B -- "the host
+filesystem represents container uids (subuid-owned files)" -- was judged
+an acceptable cost against losing the ask/executes model. B is proven
+end-to-end (tests/e2e_ownership.sh: guest chown 1000 -> host uid 166535).
+
+The exploration record below (9p mapped-xattr, falsified) and the C
+sketch remain useful context; the C *decision* does not stand.
 
 ## Context
 
