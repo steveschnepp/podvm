@@ -27,11 +27,21 @@ endif
 
 # musl-gcc deliberately drops /usr/include (glibc headers would
 # contaminate a musl static build), but the kernel UAPI headers
-# (linux/, asm/) are self-contained. -idirafter appends /usr/include
-# AFTER all standard dirs, so musl's own headers still win and only
-# what musl lacks (the UAPI headers) comes from there. glibc gcc needs
-# no such hint.
-MUSL_UAPI = $(if $(filter musl-gcc,$(CC)),-idirafter /usr/include)
+# (linux/, asm/) are self-contained. -idirafter appends these dirs AFTER
+# all standard dirs, so musl's own headers still win and only what musl
+# lacks (the UAPI headers) comes from there.
+#
+# /usr/include alone is NOT enough: on Debian/Ubuntu the arch-specific
+# UAPI headers (asm/types.h, pulled in by linux/vm_sockets.h) live in the
+# multiarch dir /usr/include/<triplet>, which plain gcc searches
+# automatically but musl-gcc does not. Hosts without the
+# /usr/include/asm -> multiarch symlink (a libc6-dev artifact) would
+# otherwise fail to build with "asm/types.h: No such file". Add the
+# multiarch dir too, detected so it is portable across architectures.
+# glibc gcc needs no such hint.
+MULTIARCH := $(shell gcc -print-multiarch 2>/dev/null)
+MUSL_UAPI = $(if $(filter musl-gcc,$(CC)),-idirafter /usr/include \
+              $(if $(MULTIARCH),-idirafter /usr/include/$(MULTIARCH)))
 CFLAGS = -static -Os -Wall -Wextra -fno-stack-protector \
          -fno-asynchronous-unwind-tables \
          -ffunction-sections -fdata-sections
