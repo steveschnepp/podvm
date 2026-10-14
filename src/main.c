@@ -40,6 +40,7 @@
 #include "build.h"
 #include "vsockalloc.h"
 #include "cli.h"
+#include "subuid.h"
 
 #include <limits.h>    /* PATH_MAX */
 
@@ -561,38 +562,37 @@ static void apply_image_config(const ImageConfig *ic) {
  *
  * uid_map: map our uid to 0 inside the ns so the overlay mount is
  * permitted; 9p then serves the files as the invoking user outside.
+ *
+ * PATH B (ADR-028): the map is now written by the PARENT, not here. A
+ * single-uid map an unprivileged child could write itself, but a RANGE
+ * (subuid) map needs CAP_SETUID in the parent namespace -- which only the
+ * setuid newuidmap helper has, and only the parent can invoke. So this
+ * function unshares, then hands the parent a handshake: signal "I've
+ * unshared", block until the parent replies "map written", then continue.
+ * The parent writes either the range map (guest uids -> subuids) or the
+ * single-uid map (no allocation / helper failed) -- same behavior as
+ * before when no subuid exists.
  */
-static int setup_userns_overlay(void) {
-    uid_t uid = getuid();
-    gid_t gid = getgid();
-    char buf[64];
-
+static int setup_userns_overlay(int ready_fd, int go_fd) {
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) {
         fprintf(stderr, "podvm: unshare user+mnt failed: %s\n", strerror(errno));
         return -1;
     }
 
-    /* Deny setgroups, then map uid/gid. Must be done in this order. */
-    int fd = open("/proc/self/setgroups", O_WRONLY);
-    if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
-
-    snprintf(buf, sizeof(buf), "0 %u 1", uid);
-    fd = open("/proc/self/uid_map", O_WRONLY);
-    if (fd < 0 || write(fd, buf, strlen(buf)) < 0) {
-        fprintf(stderr, "podvm: uid_map failed: %s\n", strerror(errno));
-        if (fd >= 0) close(fd);
+    /* Tell the parent we're unshared (it may now write our map), then
+     * block until it signals the map is in place. setgroups-deny and the
+     * map write all happen parent-side. */
+    char x = 'U';
+    if (write(ready_fd, &x, 1) != 1) {
+        fprintf(stderr, "podvm: userns handshake (ready) failed: %s\n",
+                strerror(errno));
         return -1;
     }
-    close(fd);
-
-    snprintf(buf, sizeof(buf), "0 %u 1", gid);
-    fd = open("/proc/self/gid_map", O_WRONLY);
-    if (fd < 0 || write(fd, buf, strlen(buf)) < 0) {
-        fprintf(stderr, "podvm: gid_map failed: %s\n", strerror(errno));
-        if (fd >= 0) close(fd);
+    if (read(go_fd, &x, 1) != 1) {
+        fprintf(stderr, "podvm: userns handshake (map) failed: %s\n",
+                strerror(errno));
         return -1;
     }
-    close(fd);
 
     /* Stop mount propagation so our tmpfs/overlay stay private. */
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
@@ -876,12 +876,32 @@ static int start_qemu(void) {
     qargs[qi++] = "-no-reboot";
     qargs[qi] = NULL;
 
+    /* PATH B handshake pipes (used only when the rootfs is staged via a
+     * userns overlay). Two pipes: child -> parent "I've unshared", and
+     * parent -> child "your map is written". The map must be written by
+     * the parent because a subuid RANGE map needs CAP_SETUID in the
+     * parent namespace, which only setuid newuidmap has. */
+    int ready_pipe[2] = { -1, -1 }, go_pipe[2] = { -1, -1 };
+    if (store_nlayers > 0 && (pipe(ready_pipe) < 0 || pipe(go_pipe) < 0)) {
+        fprintf(stderr, "podvm: userns handshake pipe failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
     qemu_pid = fork();
     if (qemu_pid == 0) {
         /* Child: stage the rootfs (podman layers via userns overlay),
-         * then exec QEMU inside that namespace. */
-        if (store_nlayers > 0 && setup_userns_overlay() < 0)
-            _exit(1);
+         * then exec QEMU inside that namespace. The parent writes our
+         * uid/gid map (single- or subuid-range); we block on the handshake
+         * until it does. */
+        if (store_nlayers > 0) {
+            close(ready_pipe[0]);   /* we write ready */
+            close(go_pipe[1]);      /* we read go */
+            if (setup_userns_overlay(ready_pipe[1], go_pipe[0]) < 0)
+                _exit(1);
+            close(ready_pipe[1]);
+            close(go_pipe[0]);
+        }
         execvp("qemu-system-x86_64", (char *const *)qargs);
         fprintf(stderr, "podvm: exec qemu failed: %s\n", strerror(errno));
         _exit(1);
@@ -889,6 +909,50 @@ static int start_qemu(void) {
     if (qemu_pid < 0) {
         fprintf(stderr, "podvm: fork qemu failed: %s\n", strerror(errno));
         return -1;
+    }
+
+    if (store_nlayers > 0) {
+        /* Parent: wait for the child to unshare, then write its uid/gid
+         * map -- a subuid range when the user has one (so guest chown
+         * lands on real subuid-owned host files), else the single-uid map
+         * exactly as before. Then release the child to mount + exec. */
+        close(ready_pipe[1]);
+        close(go_pipe[0]);
+        char x;
+        if (read(ready_pipe[0], &x, 1) != 1) {
+            fprintf(stderr, "podvm: userns handshake (child unshared) failed: %s\n",
+                    strerror(errno));
+            kill(qemu_pid, SIGKILL);
+            waitpid(qemu_pid, NULL, 0);
+            return -1;
+        }
+        SubUidAlloc alloc;
+        int mapped = 0, fatal = 0;
+        if (subuid_read_alloc(&alloc)) {
+            int rc = subuid_map_child(qemu_pid, &alloc);
+            mapped = (rc == 0);
+            /* rc == -2: uid_map written but gid failed. The single-uid
+             * fallback cannot run (uid_map is write-once), so this is
+             * fatal -- do not silently launch half-mapped. */
+            fatal = (rc == -2);
+        }
+        if (!mapped && !fatal && subuid_map_child_single(qemu_pid) < 0)
+            fatal = 1;
+        if (!mapped && fatal) {
+            kill(qemu_pid, SIGKILL);
+            waitpid(qemu_pid, NULL, 0);
+            return -1;
+        }
+        close(ready_pipe[0]);
+        x = 'M';
+        if (write(go_pipe[1], &x, 1) != 1) {
+            fprintf(stderr, "podvm: userns handshake (release) failed: %s\n",
+                    strerror(errno));
+            kill(qemu_pid, SIGKILL);
+            waitpid(qemu_pid, NULL, 0);
+            return -1;
+        }
+        close(go_pipe[1]);
     }
 
     return 0;

@@ -146,6 +146,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E interactive (-i)" "timeout 150 python3 tests/e2e_interactive.py"
     # Write-back e2e: named container's writes persist across runs.
     run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
+    # Ownership e2e: guest chown lands on a subuid-owned host file (ADR-028 B).
+    run_test "E2E ownership (chown->subuid)" "sh tests/e2e_ownership.sh"
     # rm/--rm e2e: state removal on demand and on exit.
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
     # Concurrency e2e: overlapping runs get distinct vsock CID + exit port.
