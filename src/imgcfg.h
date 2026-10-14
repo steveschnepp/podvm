@@ -12,9 +12,14 @@
 
 #include "image.h"
 
-/* Generous bounds; the wire escaping happens later and may grow these. */
-#define IMGCFG_ARGS_MAX (PATH_MAX * 4)
-#define IMGCFG_ENV_MAX  (PATH_MAX * 4)
+/* The wire limit. These must match config.args/config.env in cli.h and
+ * MAX_CMDLINE in main.c -- the folded args/env are copied back into
+ * config.args/env verbatim, then escaped onto the kernel cmdline/vsock
+ * payload (both MAX_CMDLINE). A larger RunSpec would just be truncated
+ * at the copy-back, so folding here operates at the real limit and drops
+ * a whole trailing field (with a warning) rather than corrupting one. */
+#define IMGCFG_ARGS_MAX 4096
+#define IMGCFG_ENV_MAX  4096
 
 /*
  * A resolved (or partially-resolved) run: what to exec, the environment,

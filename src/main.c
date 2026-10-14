@@ -13,6 +13,7 @@
 #define _GNU_SOURCE   /* unshare, CLONE_NEWUSER */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -67,8 +68,10 @@ static int resolve_initramfs(void) {
         exe[n] = '\0';
         slash = strrchr(exe, '/');
         if (slash) *slash = '\0';
-        snprintf(cand, sizeof(cand), "%s/initramfs.cpio", exe);
-        if (stat(cand, &st) == 0) {
+        int cn = snprintf(cand, sizeof(cand), "%s/initramfs.cpio", exe);
+        /* A too-long candidate is an invalid path -- skip it (fall
+         * through to the installed copy) rather than stat a truncated one. */
+        if (cn >= 0 && (size_t)cn < sizeof(cand) && stat(cand, &st) == 0) {
             snprintf(config.initramfs, sizeof(config.initramfs), "%s", cand);
             return 1;
         }
@@ -93,6 +96,16 @@ static int mkdir_p(const char *path, mode_t mode) {
     }
     if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
     return 0;
+}
+
+/* Append a fixed suffix (e.g. "/u") to a path. Returns -1 if it would not
+ * fit -- a truncated overlay upper/workdir path is a broken mount, so
+ * callers must treat overflow as fatal rather than continue with a
+ * silently-shortened path. */
+static int path_append(char *dst, size_t dstsz, const char *base,
+                       const char *suffix) {
+    int n = snprintf(dst, dstsz, "%s%s", base, suffix);
+    return (n < 0 || (size_t)n >= dstsz) ? -1 : 0;
 }
 
 /* Get host kernel path */
@@ -382,13 +395,37 @@ static void csv_encode(char *dst, size_t dstsz, const char *raw) {
 
 
 /*
+ * Append printf-formatted text to the config token buffer at *used,
+ * advancing *used. Sets *trunc and stops writing if the value would not
+ * fit: a truncated config token string is MISPARSED by the guest (it
+ * reads podvm.args=... as podvm.env=...), so once anything is dropped the
+ * whole config is invalid -- callers fail hard rather than launch with a
+ * silently-corrupt cmdline.
+ */
+static void tok_append(char *buf, size_t len, size_t *used, int *trunc,
+                       const char *fmt, ...) {
+    if (*trunc) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *used, len - *used, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= len - *used) { *trunc = 1; return; }
+    *used += (size_t)w;
+}
+
+/*
  * Build the podvm.*= token string, escaping every value so spaces and
  * commas survive the channel. Shared by the kernel cmdline and the vsock
  * payload so the two can never diverge on encoding.
+ *
+ * Returns 0, or -1 if the assembled config would exceed len (a truncated
+ * config is unusable -- the guest must never see a partial token string).
  */
-static void build_config_tokens(char *buf, size_t len) {
-    char entry[PATH_MAX * 2], args[MAX_CMDLINE], env[MAX_CMDLINE];
+static int build_config_tokens(char *buf, size_t len) {
+    char entry[PATH_MAX * 2], args[MAX_CMDLINE];
     char cwd[PATH_MAX * 2], user[sizeof(config.user) * 2];
+    size_t used = 0;
+    int trunc = 0;
 
     escape_value(entry, sizeof(entry), config.entrypoint);
     {
@@ -399,8 +436,11 @@ static void build_config_tokens(char *buf, size_t len) {
 
     /* HOME is ensured for images by imgcfg_fold(); do the same here so
      * the bare-rootfs path (and -e with no image) also always has one,
-     * as docker guarantees. */
-    char envraw[MAX_CMDLINE];
+     * as docker guarantees. envraw/env must be able to hold config.env
+     * PLUS the ",HOME=/root" suffix -- sizing them to config.env alone
+     * silently truncates the tail. Any real wire overflow is still
+     * caught by tok_append below. */
+    char envraw[sizeof(config.env) + 16], env[sizeof(config.env) + 16];
     if (config.env[0])
         snprintf(envraw, sizeof(envraw), "%s%s", config.env,
                  strstr(config.env, "HOME=") ? "" : ",HOME=/root");
@@ -410,7 +450,7 @@ static void build_config_tokens(char *buf, size_t len) {
     escape_value(cwd, sizeof(cwd), config.cwd[0] ? config.cwd : "/");
     escape_value(user, sizeof(user), config.user[0] ? config.user : "-");
 
-    snprintf(buf, len,
+    tok_append(buf, len, &used, &trunc,
         "podvm.root=/rootfs "
         "podvm.entrypoint=%s "
         "podvm.args=%s "
@@ -421,10 +461,8 @@ static void build_config_tokens(char *buf, size_t len) {
 
     /* Only sent when non-default, so ordinary cmdlines (and the e2e
      * assertions on them) are unchanged. */
-    if (config.net_none) {
-        size_t used = strlen(buf);
-        snprintf(buf + used, len - used, " podvm.net=none");
-    }
+    if (config.net_none)
+        tok_append(buf, len, &used, &trunc, " podvm.net=none");
     if (nvolumes) {
         /* tag:target:ro|- per element; escape_csv escapes each element
          * so targets may contain spaces (but not commas/colons --
@@ -443,8 +481,7 @@ static void build_config_tokens(char *buf, size_t len) {
             voff += (size_t)w;
         }
         csv_encode(volesc, sizeof(volesc), volraw);
-        size_t used = strlen(buf);
-        snprintf(buf + used, len - used, " podvm.vol=%s", volesc);
+        tok_append(buf, len, &used, &trunc, " podvm.vol=%s", volesc);
     }
     if (ntmpfs) {
         char traw[MAX_CMDLINE], tesc[MAX_CMDLINE];
@@ -459,29 +496,28 @@ static void build_config_tokens(char *buf, size_t len) {
             toff += (size_t)w;
         }
         csv_encode(tesc, sizeof(tesc), traw);
-        size_t used = strlen(buf);
-        snprintf(buf + used, len - used, " podvm.tmpfs=%s", tesc);
+        tok_append(buf, len, &used, &trunc, " podvm.tmpfs=%s", tesc);
     }
     if (config.hostname[0]) {
         char hostesc[600];
         escape_value(hostesc, sizeof(hostesc), config.hostname);
-        size_t used = strlen(buf);
-        snprintf(buf + used, len - used, " podvm.hostname=%s", hostesc);
+        tok_append(buf, len, &used, &trunc, " podvm.hostname=%s", hostesc);
     }
     /* The exit-report port this run's helper listens on. Sent only when
      * one was allocated (not --detach), so the guest dials the port the
      * host actually bound instead of the old hardcoded 5001. */
-    if (vsock_exit_port > 0) {
-        size_t used = strlen(buf);
-        snprintf(buf + used, len - used, " podvm.exitport=%d", vsock_exit_port);
-    }
+    if (vsock_exit_port > 0)
+        tok_append(buf, len, &used, &trunc, " podvm.exitport=%d", vsock_exit_port);
+
+    return trunc ? -1 : 0;
 }
 
-/* Build kernel cmdline */
-static void build_cmdline(char *buf, size_t len) {
+/* Build kernel cmdline. Returns 0, or -1 if the config does not fit. */
+static int build_cmdline(char *buf, size_t len) {
     char tokens[MAX_CMDLINE];
-    build_config_tokens(tokens, sizeof(tokens));
-    snprintf(buf, len, "console=ttyS0 panic=-1 %s", tokens);
+    if (build_config_tokens(tokens, sizeof(tokens)) < 0) return -1;
+    int w = snprintf(buf, len, "console=ttyS0 panic=-1 %s", tokens);
+    return (w < 0 || (size_t)w >= len) ? -1 : 0;
 }
 
 /*
@@ -586,8 +622,11 @@ static int setup_userns_overlay(void) {
         state[0] = '\0';
 
     if (state[0] && !config.read_only) {
-        snprintf(updir, sizeof(updir), "%s/u", state);
-        snprintf(wkdir, sizeof(wkdir), "%s/w", state);
+        if (path_append(updir, sizeof(updir), state, "/u") < 0 ||
+            path_append(wkdir, sizeof(wkdir), state, "/w") < 0) {
+            fprintf(stderr, "podvm: container state path too long: %s\n", state);
+            return -1;
+        }
         if (mkdir_p(state, 0755) < 0 ||
             (mkdir(updir, 0755) < 0 && errno != EEXIST) ||
             (mkdir(wkdir, 0755) < 0 && errno != EEXIST)) {
@@ -601,8 +640,11 @@ static int setup_userns_overlay(void) {
                 config.name, state);
     } else {
         snprintf(basedir, sizeof(basedir), "/tmp/podvm-ovl.%d", getpid());
-        snprintf(updir, sizeof(updir), "%s/u", basedir);
-        snprintf(wkdir, sizeof(wkdir), "%s/w", basedir);
+        if (path_append(updir, sizeof(updir), basedir, "/u") < 0 ||
+            path_append(wkdir, sizeof(wkdir), basedir, "/w") < 0) {
+            fprintf(stderr, "podvm: overlay base path too long: %s\n", basedir);
+            return -1;
+        }
 
         if (mkdir(basedir, 0755) < 0 && errno != EEXIST) {
             fprintf(stderr, "podvm: mkdir %s failed: %s\n", basedir, strerror(errno));
@@ -635,9 +677,15 @@ static int setup_userns_overlay(void) {
     }
 
     char opts[STORE_PATH_MAX * 9];
-    snprintf(opts, sizeof(opts),
-             "lowerdir=%s,upperdir=%s,workdir=%s,userxattr",
-             lowers, updir, wkdir);
+    int ow = snprintf(opts, sizeof(opts),
+                      "lowerdir=%s,upperdir=%s,workdir=%s,userxattr",
+                      lowers, updir, wkdir);
+    /* lowers+updir+wkdir can exceed opts; a truncated mount-option string
+     * is a broken mount, so fail rather than mount with a cut path. */
+    if (ow < 0 || (size_t)ow >= sizeof(opts)) {
+        fprintf(stderr, "podvm: overlay options too long\n");
+        return -1;
+    }
 
     if (mount("overlay", config.rootfs_dir, "overlay",
               config.read_only ? MS_RDONLY : 0, opts) < 0) {
@@ -689,7 +737,11 @@ static int start_qemu(void) {
     char vol_dev[MAX_VOLUMES][64];
     char vol_tag[MAX_VOLUMES][16];
 
-    build_cmdline(cmdline, sizeof(cmdline));
+    if (build_cmdline(cmdline, sizeof(cmdline)) < 0) {
+        fprintf(stderr, "podvm: config too large for the kernel cmdline "
+                        "(> %d bytes); reduce args/env\n", MAX_CMDLINE);
+        return -1;
+    }
     snprintf(memory_str, sizeof(memory_str), "%dM", config.memory);
     snprintf(cpu_str, sizeof(cpu_str), "%d", config.cpus);
     snprintf(fsdev_str, sizeof(fsdev_str),
@@ -729,12 +781,20 @@ static int start_qemu(void) {
      * guest mounts them at the requested targets after chroot. */
     for (int i = 0; i < nvolumes; i++) {
         snprintf(vol_tag[i], sizeof(vol_tag[i]), "vol%d", i);
-        snprintf(vol_fsdev[i], sizeof(vol_fsdev[i]),
-                 "local,id=%s,path=%s,security_model=none%s",
-                 vol_tag[i], volumes[i].host,
-                 volumes[i].ro ? ",readonly=on" : "");
-        snprintf(vol_dev[i], sizeof(vol_dev[i]),
-                 "virtio-9p-pci,fsdev=%s,mount_tag=%s", vol_tag[i], vol_tag[i]);
+        int fw = snprintf(vol_fsdev[i], sizeof(vol_fsdev[i]),
+                          "local,id=%s,path=%s,security_model=none%s",
+                          vol_tag[i], volumes[i].host,
+                          volumes[i].ro ? ",readonly=on" : "");
+        int dw = snprintf(vol_dev[i], sizeof(vol_dev[i]),
+                          "virtio-9p-pci,fsdev=%s,mount_tag=%s",
+                          vol_tag[i], vol_tag[i]);
+        /* A truncated -fsdev path would mount the wrong host directory;
+         * fail rather than start QEMU with a silently-cut volume. */
+        if (fw < 0 || (size_t)fw >= sizeof(vol_fsdev[i]) ||
+            dw < 0 || (size_t)dw >= sizeof(vol_dev[i])) {
+            fprintf(stderr, "podvm: volume %d path too long for QEMU\n", i);
+            return -1;
+        }
         qargs[qi++] = "-fsdev";  qargs[qi++] = vol_fsdev[i];
         qargs[qi++] = "-device"; qargs[qi++] = vol_dev[i];
     }
@@ -1270,7 +1330,7 @@ static int resolve_image_chain(const char *ref,
             return -1;
         }
         for (int l = 0; l < c && l < MAX_CHAIN; l++)
-            snprintf(diffs[l], PATH_MAX, "%s", lay[l].diff);
+            memcpy(diffs[l], lay[l].diff, sizeof(lay[l].diff));
         if (digs_bottom) {
             /* Commit each base layer into the native store (bottom-first
              * for the manifest). Copy-to-native, simple; optimize later. */
@@ -1304,8 +1364,7 @@ static int resolve_image_chain(const char *ref,
     /* Reuse the base's existing digests (bottom-first). */
     if (digs_bottom) {
         for (int l = 0; l < c && l < MAX_CHAIN; l++)
-            snprintf(digs_bottom[c - 1 - l], sizeof(digs_bottom[0]), "%s",
-                     nl[l].digest);
+            memcpy(digs_bottom[c - 1 - l], nl[l].digest, sizeof(nl[l].digest));
     }
     if (ic) native_config(ref, ic);
     return c;
@@ -1515,12 +1574,17 @@ static int cmd_build(int argc, char **argv) {
                      s2++)
                     snprintf(st->base_dig_bottom[st->nbase_dig++],
                              NATIVE_DIGEST_MAX, "%s", src->step_dig[s2]);
-                snprintf(st->envlist, sizeof(st->envlist), "%s", src->envlist);
-                snprintf(st->cwd, sizeof(st->cwd), "%s", src->cwd);
-                snprintf(st->user, sizeof(st->user), "%s", src->user);
-                snprintf(st->cmdcsv, sizeof(st->cmdcsv), "%s", src->cmdcsv);
-                snprintf(st->entrycsv, sizeof(st->entrycsv), "%s",
-                         src->entrycsv);
+                /* st is stages[nstages], src is stages[src_stage<nstages]:
+                 * distinct elements, but both index the same stages array so
+                 * gcc cannot prove it and warns -Wrestrict on snprintf(dst,
+                 * ..., src). These are identical fixed-size fields, so a full
+                 * memcpy is the exact copy (no truncation possible) and is
+                 * aliasing-safe by construction. */
+                memcpy(st->envlist, src->envlist, sizeof(st->envlist));
+                memcpy(st->cwd, src->cwd, sizeof(st->cwd));
+                memcpy(st->user, src->user, sizeof(st->user));
+                memcpy(st->cmdcsv, src->cmdcsv, sizeof(st->cmdcsv));
+                memcpy(st->entrycsv, src->entrycsv, sizeof(st->entrycsv));
             } else {
                 ImageConfig ic;
                 image_config_init(&ic);
@@ -1625,11 +1689,20 @@ static int cmd_build(int argc, char **argv) {
             int nchain = 0;
 
             /* docker: a relative COPY dst is relative to WORKDIR */
-            if (op->b[0] == '/')
-                snprintf(dstabs, sizeof(dstabs), "%s", op->b);
-            else
-                snprintf(dstabs, sizeof(dstabs), "%s/%s",
-                         cur->cwd[0] ? cur->cwd : "/", op->b);
+            {
+                int dw = op->b[0] == '/'
+                    ? snprintf(dstabs, sizeof(dstabs), "%s", op->b)
+                    : snprintf(dstabs, sizeof(dstabs), "%s/%s",
+                               cur->cwd[0] ? cur->cwd : "/", op->b);
+                /* A truncated COPY destination is the wrong path -- fail
+                 * rather than copy into a mangled directory. */
+                if (dw < 0 || (size_t)dw >= sizeof(dstabs)) {
+                    fprintf(stderr, "podvm build: line %d: COPY destination "
+                                    "path too long\n", op->line);
+                    rc = 1;
+                    goto out;
+                }
+            }
 
             if (op->from[0]) {
                 /* --from=<stage|image>: src is a path INSIDE that
@@ -1691,7 +1764,15 @@ static int cmd_build(int argc, char **argv) {
                     }
                 }
             }
-            snprintf(ldir, sizeof(ldir), "%s/c%03d", layersdir, i);
+            {
+                int lw = snprintf(ldir, sizeof(ldir), "%s/c%03d", layersdir, i);
+                /* A truncated layer dir is the wrong dir -- fail. */
+                if (lw < 0 || (size_t)lw >= sizeof(ldir)) {
+                    fprintf(stderr, "podvm build: layer dir path too long\n");
+                    rc = 1;
+                    goto out;
+                }
+            }
             if (mkdir_p(ldir, 0755) < 0) {
                 fprintf(stderr, "podvm build: cannot create %s: %s\n",
                         ldir, strerror(errno));
@@ -1780,7 +1861,15 @@ static int cmd_build(int argc, char **argv) {
                 rc = 1;
                 goto out;
             }
-            snprintf(spath, sizeof(spath), "%s/.podvm-step.sh", upath);
+            {
+                int sw = snprintf(spath, sizeof(spath), "%s/.podvm-step.sh", upath);
+                /* A truncated step-script path writes to the wrong file. */
+                if (sw < 0 || (size_t)sw >= sizeof(spath)) {
+                    fprintf(stderr, "podvm build: step script path too long\n");
+                    rc = 1;
+                    goto out;
+                }
+            }
             FILE *sf = fopen(spath, "w");
             if (!sf) {
                 fprintf(stderr, "podvm build: cannot write %s: %s\n",
@@ -1803,10 +1892,13 @@ static int cmd_build(int argc, char **argv) {
             }
             if (vsock_available) {
                 char vcfg[MAX_CMDLINE];
-                build_config_tokens(vcfg, sizeof(vcfg));
-                if (send_config_vsock(vcfg) < 0)
+                if (build_config_tokens(vcfg, sizeof(vcfg)) < 0) {
+                    fprintf(stderr, "podvm: config too large for the vsock "
+                                    "channel; step uses the cmdline\n");
+                } else if (send_config_vsock(vcfg) < 0) {
                     fprintf(stderr, "podvm: vsock config failed; "
                                     "step uses the cmdline\n");
+                }
             }
             int st = wait_qemu();
             int gc = reap_exit_helper();
@@ -2282,7 +2374,13 @@ int main(int argc, char **argv) {
     if (config.detach) {
         char cmdline[MAX_CMDLINE];
         char sdir[CONTAINER_PATH_MAX], pidpath[CONTAINER_PATH_MAX + 16];
-        build_cmdline(cmdline, sizeof(cmdline));
+        if (build_cmdline(cmdline, sizeof(cmdline)) < 0) {
+            fprintf(stderr, "podvm: config too large for the kernel cmdline "
+                            "(> %d bytes); detached runs have no vsock "
+                            "fallback\n", MAX_CMDLINE);
+            kill(qemu_pid, SIGTERM);
+            return 1;
+        }
         if (strlen(cmdline) > 2000)
             fprintf(stderr, "podvm: warning: config is %zu bytes; detached "
                             "runs cannot use the vsock channel and the "
@@ -2314,11 +2412,14 @@ int main(int argc, char **argv) {
      * authoritative fallback and is always passed via -append above). */
     if (vsock_available) {
         char vsock_config[MAX_CMDLINE];
-        build_config_tokens(vsock_config, sizeof(vsock_config));
-
-        printf("podvm: sending config to guest over vsock\n");
-        if (send_config_vsock(vsock_config) < 0) {
-            fprintf(stderr, "podvm: vsock config failed; guest will use cmdline\n");
+        if (build_config_tokens(vsock_config, sizeof(vsock_config)) < 0) {
+            fprintf(stderr, "podvm: config too large for the vsock channel; "
+                            "guest will use the cmdline\n");
+        } else {
+            printf("podvm: sending config to guest over vsock\n");
+            if (send_config_vsock(vsock_config) < 0) {
+                fprintf(stderr, "podvm: vsock config failed; guest will use cmdline\n");
+            }
         }
     }
 

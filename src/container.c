@@ -110,7 +110,11 @@ static int lock_path(const char *name, char *out, size_t n) {
         return -1;
     }
     if (state_base(base, sizeof(base)) < 0) return -1;
-    snprintf(out, n, "%s/locks/%s", base, name);
+    int w = snprintf(out, n, "%s/locks/%s", base, name);
+    if (w < 0 || (size_t)w >= n) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     return 0;
 }
 
@@ -120,7 +124,11 @@ int container_lock(const char *name) {
 
     if (lock_path(name, path, sizeof(path)) < 0) return -1;
     if (state_base(base, sizeof(base)) < 0) return -1;
-    snprintf(dir, sizeof(dir), "%s/locks", base);
+    int dw = snprintf(dir, sizeof(dir), "%s/locks", base);
+    if (dw < 0 || (size_t)dw >= sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     if (mkdir_p(dir, 0755) < 0) return -1;
 
     /* Deliberately NOT O_CLOEXEC: the QEMU child inherits the fd, so

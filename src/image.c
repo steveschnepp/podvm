@@ -185,8 +185,11 @@ static int reg_parse(const char *name, const char *tag, RegRef *r) {
     /* Official image on Docker Hub -> library/ prefix */
     if (!strcmp(r->registry, "docker.io") && !strchr(r->repo, '/')) {
         char tmp[256];
-        snprintf(tmp, sizeof(tmp), "library/%s", r->repo);
-        snprintf(r->repo, sizeof(r->repo), "%s", tmp);
+        int n = snprintf(tmp, sizeof(tmp), "library/%s", r->repo);
+        /* An over-long repo name cannot take the prefix -- reject rather
+         * than silently truncate the ref. */
+        if (n < 0 || (size_t)n >= sizeof(tmp)) return -1;
+        memcpy(r->repo, tmp, (size_t)n + 1);
     }
 
     snprintf(r->tag, sizeof(r->tag), "%s", (tag && tag[0]) ? tag : "latest");

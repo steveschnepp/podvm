@@ -555,7 +555,7 @@ int cli_parse_run(int argc, char **argv) {
             if (j > optind) *p++ = ',';
             char esc[4096];
             if (kv_escape(esc, sizeof(esc), argv[j]) == (size_t)-1)
-                snprintf(esc, sizeof(esc), "");
+                esc[0] = '\0';
             int n = snprintf(p, (size_t)(end - p), "%s", esc);
             if (n < 0 || p + n >= end) {
                 fprintf(stderr, "podvm: command too long for the config channel\n");

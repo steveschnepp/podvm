@@ -14,12 +14,25 @@
 /* Escaping a field can double its size. */
 #define IMGCFG_ESC_MAX (PATH_MAX * 2 + 16)
 
-/* Append a (possibly already-escaped) field to the csv args. */
+/* Append a (possibly already-escaped) field to the csv args. Bounds are
+ * checked BEFORE the write (via the caller's `args_full` flag) so an
+ * over-long command is dropped whole instead of being emitted as a
+ * truncated, comma-corrupt field. */
 #define PUSH_TO_ARG(field) do { \
-    size_t _have = strlen(argbuf); \
-    int _w = snprintf(argbuf + _have, sizeof(argbuf) - _have, \
-                      "%s%s", _have ? "," : "", (field)); \
-    (void)_w; \
+    if (!args_full) { \
+        const char *_f = (field); \
+        size_t _have = strlen(argbuf); \
+        size_t _fl = strlen(_f); \
+        size_t _need = (_have ? 1 : 0) + _fl; \
+        if (_need >= sizeof(argbuf) - _have) { \
+            args_full = 1; \
+        } else { \
+            char *_p = argbuf + _have; \
+            if (_have) *_p++ = ','; \
+            memcpy(_p, _f, _fl); \
+            _p[_fl] = '\0'; \
+        } \
+    } \
 } while (0)
 
 /*
@@ -57,6 +70,7 @@ void imgcfg_fold(const ImageConfig *ic, const RunSpec *base, RunSpec *out) {
     char entry[PATH_MAX];
     char argbuf[IMGCFG_ARGS_MAX];
     int have_entry = 0;
+    int args_full = 0;
 
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -107,6 +121,9 @@ void imgcfg_fold(const ImageConfig *ic, const RunSpec *base, RunSpec *out) {
         snprintf(out->entrypoint, sizeof(out->entrypoint), "%s", entry);
         snprintf(out->args, sizeof(out->args), "%s", argbuf);
     }
+    if (args_full)
+        fprintf(stderr, "podvm: image command too long for config channel; "
+                        "trailing arguments dropped\n");
 
     /* Env: the image's vars first, then the base (the user's CLI -e),
      * so a CLI key overrides the image's value for the same key (docker

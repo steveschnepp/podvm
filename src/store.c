@@ -176,8 +176,12 @@ int store_chain(const char *top_layer, StoreLayer *layers, int max) {
             const char *id = json_str(json_get(l, "id"));
             if (!id || strcmp(id, want)) continue;
 
-            snprintf(layers[count].diff, sizeof(layers[count].diff),
-                     "%s/overlay/%s/diff", root, id);
+            int dw = snprintf(layers[count].diff, sizeof(layers[count].diff),
+                              "%s/overlay/%s/diff", root, id);
+            if (dw < 0 || (size_t)dw >= sizeof(layers[count].diff)) {
+                json_free(j);
+                return -1;               /* truncated path is a wrong path */
+            }
             count++;
             found = 1;
 

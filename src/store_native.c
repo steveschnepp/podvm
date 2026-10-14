@@ -21,6 +21,16 @@
 
 #define LOAD_MAX 128   /* max layers a podvm load will ingest */
 
+/* Join a directory and an entry name into dst. Returns 0 on success,
+ * -1 if the result would not fit. Callers skip the entry on overflow: a
+ * truncated path is a WRONG path, and touching it (unlink/rm_rf/stat)
+ * would operate on some other file. */
+static int join_entry(char *dst, size_t dstsz, const char *dir,
+                      const char *name) {
+    int w = snprintf(dst, dstsz, "%s/%s", dir, name);
+    return (w < 0 || (size_t)w >= dstsz) ? -1 : 0;
+}
+
 static int mkdir_p(const char *path, int mode) {
     char tmp[NATIVE_PATH_MAX];
     char *p;
@@ -196,7 +206,9 @@ int native_commit_diff(const char *diff_dir, char *out_digest, size_t n) {
     char tmpdir[NATIVE_PATH_MAX], tmptar[NATIVE_PATH_MAX];
     snprintf(tmpdir, sizeof(tmpdir), "%s/tmp", native_store_dir());
     if (mkdir_p(tmpdir, 0755) < 0) return -1;
-    snprintf(tmptar, sizeof(tmptar), "%s/commit-%d.tar", tmpdir, (int)getpid());
+    int tw = snprintf(tmptar, sizeof(tmptar), "%s/commit-%d.tar", tmpdir,
+                      (int)getpid());
+    if (tw < 0 || (size_t)tw >= sizeof(tmptar)) return -1;
     if (tar_pack_dir(diff_dir, tmptar) < 0) return -1;
 
     char *data = NULL;
@@ -323,7 +335,8 @@ int native_list(NativeImage *ents, int max) {
     while ((nd = readdir(d)) != NULL && count < max) {
         if (nd->d_name[0] == '.') continue;
         char namedir[NATIVE_PATH_MAX];
-        snprintf(namedir, sizeof(namedir), "%s/%s", mroot, nd->d_name);
+        if (join_entry(namedir, sizeof(namedir), mroot, nd->d_name) < 0)
+            continue;
         struct stat dst;
         if (stat(namedir, &dst) != 0 || !S_ISDIR(dst.st_mode)) continue;
         DIR *d2 = opendir(namedir);
@@ -332,7 +345,8 @@ int native_list(NativeImage *ents, int max) {
         while ((te = readdir(d2)) != NULL && count < max) {
             if (te->d_name[0] == '.') continue;
             char mpath[NATIVE_PATH_MAX];
-            snprintf(mpath, sizeof(mpath), "%s/%s", namedir, te->d_name);
+            if (join_entry(mpath, sizeof(mpath), namedir, te->d_name) < 0)
+                continue;
             char *text = NULL;
             if (read_file(mpath, &text, NULL) < 0) continue;
             JNode *m = json_parse(text);
@@ -588,7 +602,8 @@ int native_gc(int *freed) {
         while ((nd = readdir(d))) {
             if (nd->d_name[0] == '.') continue;
             char namedir[NATIVE_PATH_MAX];
-            snprintf(namedir, sizeof(namedir), "%s/%s", mroot, nd->d_name);
+            if (join_entry(namedir, sizeof(namedir), mroot, nd->d_name) < 0)
+                continue;
             struct stat st;
             if (stat(namedir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
             DIR *d2 = opendir(namedir);
@@ -597,7 +612,8 @@ int native_gc(int *freed) {
             while ((te = readdir(d2))) {
                 if (te->d_name[0] == '.') continue;
                 char mp[NATIVE_PATH_MAX];
-                snprintf(mp, sizeof(mp), "%s/%s", namedir, te->d_name);
+                if (join_entry(mp, sizeof(mp), namedir, te->d_name) < 0)
+                    continue;
                 char *text = NULL;
                 if (read_file(mp, &text, NULL) < 0) continue;
                 JNode *m = json_parse(text);
@@ -635,7 +651,9 @@ int native_gc(int *freed) {
                 if (!strcmp(refs[i], be->d_name)) { ref = 1; break; }
             if (!ref) {
                 char bp[NATIVE_PATH_MAX];
-                snprintf(bp, sizeof(bp), "%s/%s", broot, be->d_name);
+                /* Skip (do not unlink a truncated/wrong path). */
+                if (join_entry(bp, sizeof(bp), broot, be->d_name) < 0)
+                    continue;
                 if (unlink(bp) == 0) nfreed++;
             }
         }
@@ -654,7 +672,9 @@ int native_gc(int *freed) {
                 if (!strcmp(refs[i], le->d_name)) { ref = 1; break; }
             if (!ref) {
                 char lp[NATIVE_PATH_MAX];
-                snprintf(lp, sizeof(lp), "%s/%s", lroot, le->d_name);
+                /* Skip (do not rm_rf a truncated/wrong path). */
+                if (join_entry(lp, sizeof(lp), lroot, le->d_name) < 0)
+                    continue;
                 rm_rf(lp);
                 nfreed++;
             }

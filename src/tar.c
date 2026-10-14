@@ -146,10 +146,17 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
 
         /* Build full name from prefix + name */
         char full[PATH_SIZE];
-        if (prefix[0])
-            snprintf(full, sizeof(full), "%s/%s", prefix, name);
-        else
-            snprintf(full, sizeof(full), "%s", name);
+        {
+            int fw = prefix[0]
+                ? snprintf(full, sizeof(full), "%s/%s", prefix, name)
+                : snprintf(full, sizeof(full), "%s", name);
+            /* A truncated entry path is a wrong path -- never extract to
+             * it. Skip the entry, matching the safe_path failure below. */
+            if (fw < 0 || (size_t)fw >= sizeof(full)) {
+                off += data_blocks;
+                continue;
+            }
+        }
 
         char base[PATH_SIZE];
         { const char *sl = strrchr(full, '/'); snprintf(base, sizeof(base), "%s", sl ? sl + 1 : full); }
@@ -364,7 +371,12 @@ static int pack_walk(int fd, const char *root, const char *rel) {
         else
             snprintf(childrel, sizeof(childrel), "%s", de->d_name);
         char childpath[PATH_SIZE];
-        snprintf(childpath, sizeof(childpath), "%s/%s", root, childrel);
+        {
+            int cw = snprintf(childpath, sizeof(childpath), "%s/%s", root, childrel);
+            /* A truncated child path is a wrong path -- skip the entry
+             * rather than lstat/open something else. */
+            if (cw < 0 || (size_t)cw >= sizeof(childpath)) continue;
+        }
 
         struct stat st;
         if (lstat(childpath, &st) < 0) continue;
