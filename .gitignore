@@ -10,9 +10,11 @@ kernel/*.cpio
 kernel/*.cpio.gz
 kernel/bzImage
 
-# Test binaries (all tests/test_* except the .c sources)
+# Test binaries (all tests/test_* except the .c sources; rf is the
+# e2e-trap helper built from tests/rf.c)
 tests/test_*
 !tests/test_*.c
+tests/rf
 
 # Debug/build logs (output capture)
 out/

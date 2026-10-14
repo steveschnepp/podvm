@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR/.."
 
 TIMEOUT_SECS="${PODVM_E2E_NATIVE_TIMEOUT:-180}"
 WORK=$(mktemp -d /tmp/podvm-e2e-native.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+trap '"$SCRIPT_DIR/rf" "$WORK" 2>/dev/null || rm -rf "$WORK"' EXIT
 
 # Isolate podvm's layered store (ADR-027) so the pull lands in a fresh,
 # empty store -- forcing a real pull and keeping the test off the user's

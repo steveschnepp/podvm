@@ -15,6 +15,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pwd.h>
+#include <sched.h>      /* unshare */
+#include <signal.h>     /* kill */
+#include <ftw.h>        /* nftw */
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 
 /*
@@ -207,4 +212,90 @@ void subuid_container_to_host(unsigned cuid, unsigned cgid,
     else if (have && cgid >= 1 && cgid <= a.gid_count)
         *out_gid = a.gid_base + (cgid - 1);
     else                           *out_gid = cgid;
+}
+
+/* ── subuid-aware recursive delete ───────────────────────────────────
+ *
+ * The ownership round-trip (ADR-028 ingest) leaves store/state trees
+ * owned by subuids. An unprivileged `rm -rf` cannot delete those: unlink
+ * needs write on the PARENT, and a subuid-owned 0755 directory grants the
+ * invoking user none. That broke rmi/prune/--rm and the e2e traps once
+ * ownership started surviving.
+ *
+ * The fix (what rootless podman does): run the delete INSIDE a
+ * subuid-mapped userns, where the process is ns-root over the range and
+ * so owns every subuid-owned file. The chmod pre-pass matters too --
+ * overlayfs leaves its work dir at mode 000, and chmod needs ownership.
+ */
+static int rm_one_cb(const char *path, const struct stat *st, int type,
+                     struct FTW *ftwbuf) {
+    (void)st; (void)ftwbuf;
+    int isdir = (type == FTW_D || type == FTW_DNR || type == FTW_DP);
+    int rc = isdir ? rmdir(path) : unlink(path);
+    return (rc < 0 && errno != ENOENT) ? -1 : 0;
+}
+
+/* Pre-pass: open every dir so the delete can descend (overlay work dirs
+ * are mode 000). Symlinks untouched (FTW_PHYS + the type test). */
+static int chmod_one_cb(const char *path, const struct stat *st, int type,
+                        struct FTW *ftwbuf) {
+    (void)path; (void)st; (void)ftwbuf;
+    if ((type == FTW_D || type == FTW_DNR) &&
+        chmod(path, 0700) < 0 && errno != ENOENT) return -1;
+    return 0;
+}
+
+int subuid_rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) < 0) return -1;       /* errno = ENOENT if absent */
+
+    /* Fast path: most trees podvm deletes are user-owned (save/load
+     * staging, build temp, an empty state dir). A plain delete handles
+     * those with no fork. It aborts on the first EPERM -- a subuid-owned
+     * dir the chmod pre-pass cannot open -- which is exactly when we must
+     * escalate to the userns below. */
+    if (nftw(path, chmod_one_cb, 16, FTW_PHYS) == 0 &&
+        nftw(path, rm_one_cb, 16, FTW_DEPTH | FTW_PHYS) == 0)
+        return 0;
+
+    /* Slow path: the tree holds subuid-owned files. Re-run the delete in
+     * a subuid-mapped userns (ns-root over the range), the only context
+     * where chmod+unlink succeed on them. The prior partial attempt is
+     * harmless: rm_one_cb tolerates ENOENT, so the retry finishes it. */
+    int ready[2], go[2];
+    if (pipe(ready) < 0 || pipe(go) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        close(ready[0]); close(go[1]);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) _exit(1);
+        char x = 'U';
+        if (write(ready[1], &x, 1) != 1) _exit(1);   /* unshared */
+        if (read(go[0], &x, 1) != 1) _exit(1);       /* map written */
+        close(ready[1]); close(go[0]);
+        /* ns-root over the subuid range: chmod + unlink now succeed on
+         * every subuid-owned file podvm created. */
+        int rc = nftw(path, chmod_one_cb, 16, FTW_PHYS);
+        if (rc == 0) rc = nftw(path, rm_one_cb, 16, FTW_DEPTH | FTW_PHYS);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    close(ready[1]); close(go[0]);
+    char x;
+    if (read(ready[0], &x, 1) != 1) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    SubUidAlloc alloc;
+    int mapped = 0, fatal = 0;
+    if (subuid_read_alloc(&alloc)) {
+        int rc = subuid_map_child(pid, &alloc);
+        mapped = (rc == 0);
+        fatal = (rc == -2);       /* uid map committed, gid failed: no fallback */
+    }
+    if (!mapped && !fatal && subuid_map_child_single(pid) < 0) fatal = 1;
+    close(ready[0]);
+    if (fatal) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    x = 'M';
+    if (write(go[1], &x, 1) != 1) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    close(go[1]);
+    int wst = 0;
+    waitpid(pid, &wst, 0);
+    return (WIFEXITED(wst) && WEXITSTATUS(wst) == 0) ? 0 : -1;
 }

@@ -84,4 +84,17 @@ void subuid_host_to_container(unsigned host_uid, unsigned host_gid,
 void subuid_container_to_host(unsigned cuid, unsigned cgid,
                               unsigned *out_uid, unsigned *out_gid);
 
+/*
+ * Recursively delete a tree that may contain subuid-owned files (store
+ * layer diffs, container state dirs). An unprivileged `rm -rf` cannot
+ * remove those -- unlink needs write on the parent, and a subuid-owned
+ * directory grants the invoking user none. Runs the delete inside a
+ * subuid-mapped userns (ns-root over the range) so it succeeds. Returns
+ * 0 on success, -1 on failure (errno from lstat if the path is absent).
+ *
+ * Use this INSTEAD of rm()/nftw() for any tree podvm wrote through a
+ * subuid-mapped userns: layer diffs, container uppers, build staging.
+ */
+int subuid_rm_rf(const char *path);
+
 #endif /* PODVM_SUBUID_H */

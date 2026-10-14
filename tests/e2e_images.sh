@@ -22,7 +22,7 @@ cd "$SCRIPT_DIR/.."
 
 TIMEOUT_SECS="${PODVM_E2E_TIMEOUT:-60}"
 WORK=$(mktemp -d /tmp/podvm-e2e-images.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+trap '"$SCRIPT_DIR/rf" "$WORK" 2>/dev/null || rm -rf "$WORK"' EXIT
 
 export XDG_STATE_HOME="$WORK/state"
 PODVM=build/podvm

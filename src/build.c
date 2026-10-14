@@ -20,6 +20,7 @@
 #include <sys/sysmacros.h>      /* major()/minor() for whiteout checks */
 
 #include "build.h"
+#include "subuid.h"   /* subuid_rm_rf: build staging is subuid-written */
 
 #define PATH_MAX_BUILD 2048
 
@@ -503,22 +504,13 @@ int build_copy_path(const char *src, const char *layer_root,
 /* ─────────────────── COPY --from (layer chain) ─────────────────── */
 
 static int rm_rf(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
-    if (S_ISDIR(st.st_mode)) {
-        DIR *d = opendir(path);
-        if (!d) return -1;
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            char sub[PATH_MAX_BUILD];
-            if (snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name)
-                >= (int)sizeof(sub)) { closedir(d); return -1; }
-            rm_rf(sub);
-        }
-        closedir(d);
-    }
-    return remove(path);
+    /* Build staging is written via the userns overlay, so it can hold
+     * subuid-owned files the invoking user cannot unlink. subuid_rm_rf
+     * handles both: a plain fast path for user-owned trees, escalating to
+     * a subuid-mapped userns for the rest. Keep the ENOENT->0 convention
+     * (it lstats first and leaves errno=ENOENT when absent). */
+    if (subuid_rm_rf(path) < 0) return errno == ENOENT ? 0 : -1;
+    return 0;
 }
 
 /* overlayfs whiteout: char device 0:0 with the deleted path's name. */

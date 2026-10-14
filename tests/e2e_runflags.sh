@@ -18,7 +18,7 @@ cd "$SCRIPT_DIR/.."
 
 TIMEOUT_SECS="${PODVM_E2E_TIMEOUT:-60}"
 WORK=$(mktemp -d /tmp/podvm-e2e-runflags.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+trap '"$SCRIPT_DIR/rf" "$WORK" 2>/dev/null || rm -rf "$WORK"' EXIT
 
 PODVM=build/podvm
 # Keep any container state this test creates out of the real ~/.local.

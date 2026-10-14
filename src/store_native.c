@@ -423,26 +423,15 @@ static int link_or_copy(const char *src, const char *dst) {
     return 0;
 }
 
-/* Recursive delete (for save/load staging dirs under <store>/tmp). */
+/* Recursive delete. Used for BOTH the user-owned save/load staging dirs
+ * under <store>/tmp AND -- in the GC path -- unreferenced layer diff
+ * dirs, which hold subuid-owned files after ingest (ADR-028). An
+ * unprivileged recursive delete cannot remove those (unlink needs write
+ * on the subuid-owned parent), so delegate to subuid_rm_rf: a plain fast
+ * path for the user-owned trees, escalating to a subuid-mapped userns for
+ * the layer diffs. Void signature kept for the existing call sites. */
 static void rm_rf(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) < 0) return;
-    if (S_ISDIR(st.st_mode)) {
-        DIR *d = opendir(path);
-        if (d) {
-            struct dirent *de;
-            while ((de = readdir(d))) {
-                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-                char p[NATIVE_PATH_MAX];
-                snprintf(p, sizeof(p), "%s/%s", path, de->d_name);
-                rm_rf(p);
-            }
-            closedir(d);
-        }
-        rmdir(path);
-    } else {
-        unlink(path);
-    }
+    (void)subuid_rm_rf(path);
 }
 
 int native_save(const char *image_str, const char *out_path, int format) {

@@ -18,6 +18,7 @@
 #include <ftw.h>
 
 #include "container.h"
+#include "subuid.h"   /* subuid_rm_rf: state uppers are subuid-owned */
 
 /* mkdir -p (container.c keeps its own: main.c's is static, and these
  * are three lines of loop). */
@@ -67,39 +68,20 @@ int container_state_dir(const char *name, char *out, size_t n) {
     return 0;
 }
 
-/* nftw callback: delete depth-first (children before their parent, so
- * directories are empty by the time we rmdir them). A directory can
- * still arrive as FTW_D/FTW_DNR (pre-order) when nftw could not descend
- * into it; rmdir then too -- it needs write on the *parent*, not on the
- * dir. Non-ENOENT errors abort the walk. */
-static int rm_one(const char *path, const struct stat *st, int type,
-                  struct FTW *ftwbuf) {
-    (void)st; (void)ftwbuf;
-    int isdir = (type == FTW_D || type == FTW_DNR || type == FTW_DP);
-    int rc = isdir ? rmdir(path) : unlink(path);
-    return (rc < 0 && errno != ENOENT) ? -1 : 0;
-}
-
-/* nftw pre-pass: open up every directory so the delete pass can descend.
- * overlayfs leaves its work dir at mode 000, which nftw cannot opendir --
- * glibc reports that as FTW_DNR, and without this pass the delete pass
- * would try unlink() on the dir and abort with EISDIR. The tree is ours
- * (podvm created it as the invoking user), so chmod cannot fail on
- * anything we could otherwise delete. Symlinks are left alone (FTW_PHYS
- * + the FTW_D/FTW_DNR test), so this cannot chmod out of the tree. */
-static int chmod_one(const char *path, const struct stat *st, int type,
-                     struct FTW *ftwbuf) {
-    (void)path; (void)st; (void)ftwbuf;
-    if ((type == FTW_D || type == FTW_DNR) &&
-        chmod(path, 0700) < 0 && errno != ENOENT) return -1;
-    return 0;
-}
+/* The recursive-delete logic (chmod pre-pass + depth-first unlink) now
+ * lives in subuid.c as subuid_rm_rf, because container state uppers hold
+ * subuid-owned files that only a subuid-mapped userns can delete. The
+ * two nftw callbacks that used to live here moved with it. */
 
 int container_rm_rf(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) < 0) return -1;       /* errno = ENOENT if absent */
-    if (nftw(path, chmod_one, 16, FTW_PHYS) < 0) return -1;
-    return nftw(path, rm_one, 16, FTW_DEPTH | FTW_PHYS);
+    /* Container state dirs hold the writable upper, whose files are
+     * subuid-owned once a guest chowns them (ADR-028). An unprivileged
+     * nftw cannot unlink those -- it needs write on the parent, which is
+     * itself subuid-owned. subuid_rm_rf handles both: a plain fast path
+     * for user-owned trees, escalating to a subuid-mapped userns for the
+     * rest. It also keeps the chmod pre-pass (overlay work dirs are mode
+     * 000). */
+    return subuid_rm_rf(path);
 }
 
 /* Build <base>/locks/<name>; no existence checks. */

@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_cli test_build test_json test_store test_vsockalloc test_tarwrite test_store_native test_subuid
+TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_cli test_build test_json test_store test_vsockalloc test_tarwrite test_store_native test_subuid rf
 
 .PHONY: all test clean
 
@@ -41,16 +41,16 @@ test_userdb: test_userdb.c ../src/userdb.c ../src/userdb.h
 	$(CC) $(CFLAGS) -o $@ test_userdb.c ../src/userdb.c -I../src
 
 # Container state tests (name validation, state dir, rm -rf; no deps)
-test_container: test_container.c ../src/container.c ../src/container.h
-	$(CC) $(CFLAGS) -o $@ test_container.c ../src/container.c -I../src
+test_container: test_container.c ../src/container.c ../src/container.h ../src/subuid.c ../src/subuid.h
+	$(CC) $(CFLAGS) -o $@ test_container.c ../src/container.c ../src/subuid.c -I../src
 
 # Run-CLI parser tests (links the real src/cli.c; docker grammar)
-test_cli: test_cli.c ../src/cli.c ../src/cli.h ../src/container.c ../src/strparse.c
-	$(CC) $(CFLAGS) -o $@ test_cli.c ../src/cli.c ../src/container.c ../src/strparse.c -I../src
+test_cli: test_cli.c ../src/cli.c ../src/cli.h ../src/container.c ../src/strparse.c ../src/subuid.c ../src/subuid.h
+	$(CC) $(CFLAGS) -o $@ test_cli.c ../src/cli.c ../src/container.c ../src/strparse.c ../src/subuid.c -I../src
 
 # Build parser tests (pure logic, no deps)
-test_build: test_build.c ../src/build.c ../src/build.h
-	$(CC) $(CFLAGS) -o $@ test_build.c ../src/build.c -I../src
+test_build: test_build.c ../src/build.c ../src/build.h ../src/subuid.c ../src/subuid.h
+	$(CC) $(CFLAGS) -o $@ test_build.c ../src/build.c ../src/subuid.c -I../src
 
 # JSON parser tests (no deps)
 test_json: test_json.c ../src/json.c ../src/json.h
@@ -76,6 +76,12 @@ test_store_native: test_store_native.c ../src/store_native.c ../src/store_native
 # Container<->host ownership translation (pure arithmetic; no VM/newuidmap)
 test_subuid: test_subuid.c ../src/subuid.c ../src/subuid.h
 	$(CC) $(CFLAGS) -o $@ test_subuid.c ../src/subuid.c -I../src
+
+# e2e-trap helper: rm -rf a tree that may hold subuid-owned files.
+# Reuses the product's subuid_rm_rf; the traps call it because the shell's
+# rm cannot unlink through subuid-owned directories.
+rf: rf.c ../src/subuid.c ../src/subuid.h
+	$(CC) $(CFLAGS) -o $@ rf.c ../src/subuid.c -I../src
 
 # Run all tests
 test: $(TESTS)
