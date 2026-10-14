@@ -62,4 +62,26 @@ int subuid_map_child(pid_t child, const SubUidAlloc *alloc);
  */
 int subuid_map_child_single(pid_t child);
 
+/*
+ * Translate a HOST uid/gid (as stored on disk by a subuid-mapped userns)
+ * back to the CONTAINER uid/gid the image format speaks. The map is:
+ *     host invoking-uid      <-> container 0  (root)
+ *     host subuid_base + k   <-> container k+1
+ * Anything outside those two ranges is NOT a container id podvm created --
+ * pass it through unchanged (it may be a legitimate host-owned file).
+ * Used when packing a committed layer / saving, so the tar carries
+ * container-ids (what the image spec and podman expect), never raw subuids.
+ */
+void subuid_host_to_container(unsigned host_uid, unsigned host_gid,
+                              unsigned *out_uid, unsigned *out_gid);
+
+/*
+ * The inverse: container uid/gid -> host uid/gid, using the invoking uid
+ * and subuid allocation. (The kernel does this translation for free when
+ * chown happens INSIDE a mapped ns -- this explicit form is for code that
+ * must reason about the on-disk owner without a syscall, e.g. tests.)
+ */
+void subuid_container_to_host(unsigned cuid, unsigned cgid,
+                              unsigned *out_uid, unsigned *out_gid);
+
 #endif /* PODVM_SUBUID_H */

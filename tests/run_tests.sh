@@ -71,6 +71,7 @@ run_test "Podman store" "./tests/test_store"
 run_test "Vsock alloc" "./tests/test_vsockalloc"
 run_test "Tar write" "./tests/test_tarwrite"
 run_test "Native store" "./tests/test_store_native"
+run_test "Ownership translate" "./tests/test_subuid"
 
 echo ""
 echo "Running integration tests..."
@@ -148,6 +149,8 @@ if [ -e /dev/kvm ]; then
     run_test "E2E write-back (--name)" "sh tests/e2e_writeback.sh"
     # Ownership e2e: guest chown lands on a subuid-owned host file (ADR-028 B).
     run_test "E2E ownership (chown->subuid)" "sh tests/e2e_ownership.sh"
+    # Ownership save e2e: a build-step chown survives commit+save as container-uid.
+    run_test "E2E ownership save (commit)" "timeout 300 sh tests/e2e_ownership_save.sh"
     # rm/--rm e2e: state removal on demand and on exit.
     run_test "E2E rm (rm + --rm)" "sh tests/e2e_rm.sh"
     # Concurrency e2e: overlapping runs get distinct vsock CID + exit port.

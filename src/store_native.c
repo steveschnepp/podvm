@@ -7,6 +7,7 @@
 #include "tar.h"
 #include "sha256.h"
 #include "json.h"
+#include "subuid.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -161,27 +162,44 @@ int native_blob_put(const char *data, size_t len, char *out_digest, size_t n) {
 
 /* Unpack a layer tar into root inside a short-lived user+mount ns, where
  * we are uid 0 so mknod(char 0:0) whiteouts succeed -- the same trick
- * rootless podman uses. The tar data pointer is inherited across fork. */
+ * rootless podman uses. The tar data pointer is inherited across fork.
+ *
+ * OWNERSHIP (ADR-028 ingest): the ns is mapped with the subuid RANGE (via
+ * the parent, same handshake as the QEMU child), so the tar's container
+ * uids lchown onto real host subuids. mknod whiteouts still work (ns-root
+ * keeps CAP_MKNOD) -- verified. The stored diff then carries the image's
+ * ownership, which the run-time userns maps back to container ids.
+ */
 static int unpack_layer_in_userns(const char *data, size_t len, const char *root) {
-    uid_t uid = getuid();
-    gid_t gid = getgid();
+    int ready[2], go[2];
+    if (pipe(ready) < 0 || pipe(go) < 0) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        close(ready[0]); close(go[1]);
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) _exit(1);
-        int fd = open("/proc/self/setgroups", O_WRONLY);
-        if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "0 %u 1", (unsigned)uid);
-        fd = open("/proc/self/uid_map", O_WRONLY);
-        if (fd < 0 || write(fd, buf, (size_t)n) != n) _exit(1);
-        close(fd);
-        n = snprintf(buf, sizeof(buf), "0 %u 1", (unsigned)gid);
-        fd = open("/proc/self/gid_map", O_WRONLY);
-        if (fd < 0 || write(fd, buf, (size_t)n) != n) _exit(1);
-        close(fd);
+        char x = 'U';
+        if (write(ready[1], &x, 1) != 1) _exit(1);   /* unshared */
+        if (read(go[0], &x, 1) != 1) _exit(1);       /* map written */
+        close(ready[1]); close(go[0]);
         _exit(tar_extract_layer(data, len, root) == 0 ? 0 : 1);
     }
+    close(ready[1]); close(go[0]);
+    char x;
+    if (read(ready[0], &x, 1) != 1) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    SubUidAlloc alloc;
+    int mapped = 0, fatal = 0;
+    if (subuid_read_alloc(&alloc)) {
+        int rc = subuid_map_child(pid, &alloc);
+        mapped = (rc == 0);
+        fatal = (rc == -2);       /* uid map committed, gid failed: no fallback */
+    }
+    if (!mapped && !fatal && subuid_map_child_single(pid) < 0) fatal = 1;
+    close(ready[0]);
+    if (fatal) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    x = 'M';
+    if (write(go[1], &x, 1) != 1) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+    close(go[1]);
     int st = 0;
     waitpid(pid, &st, 0);
     return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;

@@ -159,3 +159,52 @@ int subuid_map_child_single(pid_t child) {
     }
     return 0;
 }
+
+/*
+ * The container<->host ownership translation for the store's disk edges.
+ *
+ * A subuid-mapped userns writes files whose on-disk (host) owner encodes
+ * the container id: container 0 is the invoking user, container k is
+ * subuid_base + (k-1). The tar format must carry CONTAINER ids (the image
+ * spec, and what podman expects on save/load) -- so pack translates
+ * host->container, and anything outside the two known ranges is passed
+ * through (a real host-owned file podvm did not create).
+ *
+ * These read the allocation fresh each call (one /etc/subuid parse; cheap,
+ * and keeps them usable without threading an alloc through every caller).
+ */
+void subuid_host_to_container(unsigned host_uid, unsigned host_gid,
+                              unsigned *out_uid, unsigned *out_gid) {
+    unsigned inv_uid = (unsigned)getuid(), inv_gid = (unsigned)getgid();
+    SubUidAlloc a;
+    int have = subuid_read_alloc(&a);
+
+    if (host_uid == inv_uid)      *out_uid = 0;
+    else if (have && host_uid >= a.uid_base &&
+             host_uid < a.uid_base + a.uid_count)
+        *out_uid = (host_uid - a.uid_base) + 1;
+    else                          *out_uid = host_uid;   /* pass through */
+
+    if (host_gid == inv_gid)      *out_gid = 0;
+    else if (have && host_gid >= a.gid_base &&
+             host_gid < a.gid_base + a.gid_count)
+        *out_gid = (host_gid - a.gid_base) + 1;
+    else                          *out_gid = host_gid;
+}
+
+void subuid_container_to_host(unsigned cuid, unsigned cgid,
+                              unsigned *out_uid, unsigned *out_gid) {
+    unsigned inv_uid = (unsigned)getuid(), inv_gid = (unsigned)getgid();
+    SubUidAlloc a;
+    int have = subuid_read_alloc(&a);
+
+    if (cuid == 0)                 *out_uid = inv_uid;
+    else if (have && cuid >= 1 && cuid <= a.uid_count)
+        *out_uid = a.uid_base + (cuid - 1);
+    else                           *out_uid = cuid;       /* pass through */
+
+    if (cgid == 0)                 *out_gid = inv_gid;
+    else if (have && cgid >= 1 && cgid <= a.gid_count)
+        *out_gid = a.gid_base + (cgid - 1);
+    else                           *out_gid = cgid;
+}

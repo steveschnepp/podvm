@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include "subuid.h"   /* host<->container ownership translation */
 
 #define PATH_SIZE 2048
 
@@ -115,6 +116,13 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
         char typeflag = h[156];
         memcpy(prefix, h + 345, 155);
         prefix[155] = '\0';
+        /* Ownership from the header (container ids). Applied only on the
+         * layer path (preserve), which runs inside a subuid-mapped userns
+         * where the chown lands on the right host subuid. The plain path
+         * (load staging) runs outside any ns and has no business chowning
+         * to ids we do not own. */
+        unsigned hdr_uid = (unsigned)tar_octal(h + 108, 8);
+        unsigned hdr_gid = (unsigned)tar_octal(h + 116, 8);
 
         off += 512;
 
@@ -196,8 +204,21 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
             continue;
         }
 
+        /* Apply the header's ownership after the entry is created. On the
+         * layer path this runs in the subuid-mapped userns, so a container
+         * uid lands on the matching host subuid (and stat maps it back).
+         * lchown so symlinks get their recorded owner too (a real chown
+         * would follow the link). Best-effort: an id we cannot set (e.g. a
+         * whiteout char dev, or a uid outside the map) must not abort the
+         * whole layer -- the file still extracts, just owned by the default. */
+#define APPLY_OWNER(p) do { \
+            if (preserve) \
+                (void)lchown((p), (uid_t)hdr_uid, (gid_t)hdr_gid); \
+        } while (0)
+
         if (typeflag == '5') { /* directory */
             mkdir_p(path, 0755);
+            APPLY_OWNER(path);
         } else if (typeflag == '2') { /* symlink */
             char target[PATH_SIZE];
             memcpy(target, h + 157, 100);
@@ -209,6 +230,7 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
             mkdir_p(parent, 0755);
             remove(path);
             symlink(target, path);
+            APPLY_OWNER(path);
         } else if (typeflag == '1') { /* hardlink: treat as symlink-ish copy target */
             char target[PATH_SIZE];
             memcpy(target, h + 157, 100);
@@ -237,7 +259,9 @@ static int extract(const char *tar, size_t tarlen, const char *root, int preserv
                 if (size) { ssize_t w = write(fd, data, (size_t)size); (void)w; }
                 close(fd);
             }
+            APPLY_OWNER(path);
         }
+#undef APPLY_OWNER
 
         off += data_blocks;
     }
@@ -261,7 +285,8 @@ static void hdr_octal(char *field, size_t n, unsigned long long v) {
  * fallback handled by the caller). */
 static void hdr_build(char h[512], const char *name, const char *linkname,
                       unsigned long long size, unsigned mode, char typeflag,
-                      time_t mtime, const char *prefix) {
+                      time_t mtime, const char *prefix,
+                      unsigned uid, unsigned gid) {
     memset(h, 0, 512);
     const char *nm = name;
     if (prefix && prefix[0]) {
@@ -272,8 +297,8 @@ static void hdr_build(char h[512], const char *name, const char *linkname,
     }
     strncpy(h + 0, nm, 100);
     hdr_octal(h + 100, 8, mode & 07777);
-    hdr_octal(h + 108, 8, 0);            /* uid: root in the layer */
-    hdr_octal(h + 116, 8, 0);            /* gid */
+    hdr_octal(h + 108, 8, uid);         /* container uid */
+    hdr_octal(h + 116, 8, gid);         /* container gid */
     hdr_octal(h + 124, 12, size);
     hdr_octal(h + 136, 12, (unsigned long long)mtime);
     memset(h + 148, ' ', 8);             /* chksum placeholder */
@@ -323,25 +348,28 @@ static int write_all(int fd, const void *buf, size_t n) {
 
 static int emit_entry(int fd, const char *rel, const char *linkname,
                       unsigned long long size, unsigned mode, char typeflag,
-                      const char *content) {
+                      const char *content, unsigned uid, unsigned gid) {
     char prefix[160], base[104];
     char h[512];
     if (name_split(rel, prefix, sizeof(prefix), base, sizeof(base)) >= 0) {
-        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), prefix);
+        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), prefix,
+                  uid, gid);
         if (write_all(fd, h, 512) < 0) return -1;
     } else {
         /* GNU longname: an 'L' entry carrying the full name, then the
          * header with a truncated name field (the reader uses the 'L'). */
         char lh[512];
         unsigned long long nlen = (unsigned long long)strlen(rel);
-        hdr_build(lh, "././@LongLink", NULL, nlen + 1, 0, 'L', time(NULL), NULL);
+        hdr_build(lh, "././@LongLink", NULL, nlen + 1, 0, 'L', time(NULL),
+                  NULL, 0, 0);
         lh[156] = 'L';
         if (write_all(fd, lh, 512) < 0) return -1;
         if (write_all(fd, rel, (size_t)nlen) < 0) return -1;
         size_t pad = (size_t)((nlen + 1 + 511) / 512) * 512 - (size_t)nlen;
         char z[512]; memset(z, 0, sizeof(z));
         if (write_all(fd, z, pad) < 0) return -1;
-        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), NULL);
+        hdr_build(h, rel, linkname, size, mode, typeflag, time(NULL), NULL,
+                  uid, gid);
         if (write_all(fd, h, 512) < 0) return -1;
     }
     if (typeflag == '0' && size && content) {
@@ -381,9 +409,17 @@ static int pack_walk(int fd, const char *root, const char *rel) {
         struct stat st;
         if (lstat(childpath, &st) < 0) continue;
 
+        /* The on-disk owner is a HOST id (invoking user or a subuid).
+         * Translate to the CONTAINER id the tar format carries, so the
+         * blob/`save` output is interop-correct and round-trips through
+         * ingest. Directories/files/symlinks all carry real ownership. */
+        unsigned puid, pgid;
+        subuid_host_to_container((unsigned)st.st_uid, (unsigned)st.st_gid,
+                                 &puid, &pgid);
+
         if (S_ISDIR(st.st_mode)) {
             if (emit_entry(fd, childrel, NULL, 0, (unsigned)st.st_mode & 07777,
-                           '5', NULL) < 0) { closedir(d); return -1; }
+                           '5', NULL, puid, pgid) < 0) { closedir(d); return -1; }
             if (pack_walk(fd, root, childrel) < 0) { closedir(d); return -1; }
         } else if (S_ISREG(st.st_mode)) {
             int f = open(childpath, O_RDONLY);
@@ -400,7 +436,8 @@ static int pack_walk(int fd, const char *root, const char *rel) {
             }
             close(f);
             int rc = emit_entry(fd, childrel, NULL, (unsigned long long)st.st_size,
-                                (unsigned)st.st_mode & 07777, '0', content);
+                                (unsigned)st.st_mode & 07777, '0', content,
+                                puid, pgid);
             free(content);
             if (rc < 0) { closedir(d); return -1; }
         } else if (S_ISLNK(st.st_mode)) {
@@ -408,12 +445,15 @@ static int pack_walk(int fd, const char *root, const char *rel) {
             ssize_t n = readlink(childpath, target, sizeof(target) - 1);
             if (n < 0) { closedir(d); return -1; }
             target[n] = '\0';
-            if (emit_entry(fd, childrel, target, 0, 0777, '2', NULL) < 0) {
+            if (emit_entry(fd, childrel, target, 0, 0777, '2', NULL,
+                           puid, pgid) < 0) {
                 closedir(d); return -1;
             }
         } else if (S_ISCHR(st.st_mode) &&
                    major(st.st_mode) == 0 && minor(st.st_mode) == 0) {
-            /* Overlay whiteout: emit a portable .wh.<name> entry. */
+            /* Overlay whiteout: emit a portable .wh.<name> entry. A
+             * whiteout is a deletion marker, not a file with an owner --
+             * container-root (0) regardless of the on-disk device's uid. */
             char whrel[PATH_SIZE];
             const char *slash = strrchr(childrel, '/');
             if (slash)
@@ -421,7 +461,7 @@ static int pack_walk(int fd, const char *root, const char *rel) {
                          (int)(slash - childrel), childrel, slash + 1);
             else
                 snprintf(whrel, sizeof(whrel), ".wh.%s", childrel);
-            if (emit_entry(fd, whrel, NULL, 0, 0644, '0', NULL) < 0) {
+            if (emit_entry(fd, whrel, NULL, 0, 0644, '0', NULL, 0, 0) < 0) {
                 closedir(d);
                 return -1;
             }
