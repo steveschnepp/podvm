@@ -81,7 +81,9 @@ run_test "Host build" "mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 # CLI matrix: drives the real binary's getopt surface (no VM). Needs
 # build/podvm, so it runs right after the host build.
 run_test "CLI matrix (real binary)" "sh tests/cli_matrix.sh"
-run_test "Guest build" "cd guest && make -s 2>&1"
+# Guest init must build under BOTH musl and glibc (static); the guard
+# builds each in turn and leaves the smaller musl binary for the initramfs.
+run_test "Guest build (musl + glibc)" "sh tests/guest_libc.sh"
 run_test "Initramfs build" "cd guest && chmod +x build-initramfs.sh && ./build-initramfs.sh 2>&1"
 
 echo ""
