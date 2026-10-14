@@ -28,6 +28,7 @@
 #include <curl/curl.h>
 #include <zlib.h>
 #include <zstd.h>
+#include <zstd_errors.h> /* ZSTD_getErrorCode, ZSTD_error_* -- not all zstd.h versions pull this in */
 
 #include "image.h"
 #include "json.h"
