@@ -2247,6 +2247,7 @@ static int cmd_logs(int argc, char **argv) {
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
+    fprintf(stderr, "       %s run [options] <image|rootfs-dir> [command] [args...]\n", prog);
     fprintf(stderr, "       %s rm <name> [<name>...]\n", prog);
     fprintf(stderr, "       %s images\n", prog);
     fprintf(stderr, "       %s rmi <image> [<image>...]\n", prog);
@@ -2323,6 +2324,16 @@ int main(int argc, char **argv) {
         return cmd_stop(argc, argv);
     if (argc > 1 && strcmp(argv[1], "logs") == 0)
         return cmd_logs(argc, argv);
+
+    /* Drop-in compat: docker/podman take an explicit `run` keyword.
+     * Consume it (keyword wins, as in docker) so `podvm run --rm img`
+     * parses identically to `podvm --rm img`. getopt's '+' would
+     * otherwise stop at the non-option `run` and treat it as the image. */
+    if (argc > 1 && strcmp(argv[1], "run") == 0) {
+        for (int i = 1; i < argc; i++) argv[i] = argv[i + 1];
+        argc--;
+    }
+
     const char *image_ref = NULL;   /* user's original ref, kept for config */
     
     static struct option long_options[] = {

@@ -242,5 +242,17 @@ run_podvm h1.log --hostname build-host "$IMG" /bin/sh -c 'hostname' \
 cp "$WORK/h1.log" "$WORK/last.log"
 grep -q "build-host" "$WORK/h1.log" || fail "--hostname did not reach the guest"
 
+# ---- explicit `run` keyword (drop-in docker/podman compat) ----
+
+# docker/podman spell it `run --rm IMG CMD`; podvm's default form has no
+# keyword, and getopt's '+' stops at the first non-option -- so without
+# consuming `run`, it was treated as the IMAGE. Keyword wins (docker
+# semantics); flags and the entrypoint command parse identically.
+timeout "$TIMEOUT_SECS" "$PODVM" run -r "$WORK/initramfs.cpio" \
+    -e PODVM_E2E_KW=yes "$IMG" /bin/sh -c 'echo "KW=$PODVM_E2E_KW"' \
+    > "$WORK/kw1.log" 2>&1 || fail "run-keyword invocation failed"
+cp "$WORK/kw1.log" "$WORK/last.log"
+grep -q "KW=yes" "$WORK/kw1.log" || fail "run-keyword form did not parse flags like the default form"
+
 echo "E2E-RUNFLAGS PASS: -e/-u/-w/-p/--network/--read-only/-v/--tmpfs/--hostname behave"
 exit 0
