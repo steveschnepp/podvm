@@ -60,7 +60,9 @@ fi
 
 expect_fail "no args"          "Usage:"      # no positional at all
 expect_fail "unknown -x"       "invalid option"      -x "$BOGUS"
-expect_fail "-it (phantom)"    "invalid option"      -it "$BOGUS"
+# -it used to be a "phantom" (mock-parser fossil); -t is now real
+# (docker compat: the serial console is a tty) -- pinned below instead.
+expect_fail "-y unknown"       "invalid option"      -y "$BOGUS"
 expect_fail "-m missing value" "requires an argument" -m
 
 # ---- the optstring matrix: THE regression guard ----
@@ -68,7 +70,7 @@ expect_fail "-m missing value" "requires an argument" -m
 # cleanly and fails only at resolution. If any letter is dropped from
 # the optstring, getopt reports "invalid option" and this fails.
 printf 'CLIMTX_A=1\n' > "$WORK/envfile"
-"$PODVM" -i -m 256 -c 2 -k "$WORK/kernel" -r "$WORK/initramfs" \
+"$PODVM" -i -t -m 256 -c 2 -k "$WORK/kernel" -r "$WORK/initramfs" \
     -n climtx -e K=V -e 'MSG=a b,c' --env-file "$WORK/envfile" \
     -u root -w / -p 127.0.0.1:9999:80 --network slirp \
     -v "$WORK:/mnt:ro" --tmpfs /clitmpfs --hostname climtx --read-only \

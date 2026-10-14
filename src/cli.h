@@ -44,6 +44,10 @@ typedef struct {
     int  memory;       /* MB */
     int  cpus;
     int  interactive;  /* -i flag */
+    int  tty;          /* -t/--tty: no-op today -- the serial console IS
+                        * a real guest tty (see cli.c); kept so `-it`
+                        * parses like docker. A vsock PTY channel would
+                        * make it meaningful (resize, clean stream). */
     int  autoremove;   /* --rm: drop the named state dir when the run ends */
 } PodvmConfig;
 

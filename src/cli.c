@@ -230,6 +230,8 @@ static void cli_usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
     fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
+    fprintf(stderr, "  -t, --tty           Allocate a TTY (the serial console already\n");
+    fprintf(stderr, "                      is one; accepted for docker compat)\n");
     fprintf(stderr, "  -d, --detach        Run in the background (requires --name;\n");
     fprintf(stderr, "                      serial goes to <state>/log)\n");
     fprintf(stderr, "  -e, --env <K=V>     Set an environment variable (repeatable;\n");
@@ -310,6 +312,7 @@ static int bool_long_with_value(const char *tok) {
 
     static const struct { const char *name; int *field; } bools[] = {
         {"interactive", &config.interactive},
+        {"tty",         &config.tty},
         {"detach",      &config.detach},
         {"rm",          &config.autoremove},
         {"read-only",   &config.read_only},
@@ -355,6 +358,7 @@ int cli_parse_run(int argc, char **argv) {
 
     static struct option long_options[] = {
         {"interactive", no_argument,       0, 'i'},
+        {"tty",         no_argument,       0, 't'},
         {"memory",      required_argument, 0, 'm'},
         {"cpus",        required_argument, 0, 'c'},
         {"kernel",      required_argument, 0, 'k'},
@@ -379,10 +383,19 @@ int cli_parse_run(int argc, char **argv) {
     /* '+' stops getopt at the first non-option (the image/rootfs), so
      * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
      * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:die:u:w:p:v:m:c:k:r:n:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+:die:u:w:p:v:m:c:k:r:n:th", long_options, &option_index)) != -1) {
         switch (opt) {
         case 'i':
             config.interactive = 1;
+            break;
+        case 't':
+            /* docker `-t`: allocate a tty for the container. podvm
+             * needs no allocation -- the entrypoint's stdio is the
+             * serial console, a real guest tty (isatty, echo, Ctrl-C
+             * all work). Accepted so `-it` muscle memory parses;
+             * recorded so a future vsock-PTY channel can give it
+             * full meaning (window size, stream separation). */
+            config.tty = 1;
             break;
         case 'd':
             config.detach = 1;

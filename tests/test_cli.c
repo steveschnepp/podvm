@@ -101,6 +101,17 @@ static void test_flag_forms(void) {
           config.read_only == 1 && config.net_none == 1,
           "long-only flags: host=%s ro=%d net_none=%d",
           config.hostname, config.read_only, config.net_none);
+
+    /* -t/--tty: docker compat; the serial console is already a tty,
+     * so this is parse-level acceptance, not an allocation. */
+    rc = PARSE("podvm", "-it", "img");
+    CHECK(rc == CLI_PARSE_OK && config.interactive == 1 && config.tty == 1,
+          "-it: inter=%d tty=%d", config.interactive, config.tty);
+    rc = PARSE("podvm", "--tty=true", "img");
+    CHECK(rc == CLI_PARSE_OK && config.tty == 1, "--tty=true");
+    rc = PARSE("podvm", "-t", "img");
+    CHECK(rc == CLI_PARSE_OK && config.tty == 1 && config.interactive == 0,
+          "-t alone (docker: tty without exclusive stdin)");
 }
 
 /* ---- pflag bool `=VALUE` form (docker accepts it) ---- */
@@ -123,8 +134,8 @@ static void test_bool_eq_value(void) {
     rc = PARSE("podvm", "--rm=banana", "img");
     CHECK(rc == CLI_PARSE_ERROR, "--rm=banana accepted");
 
-    rc = PARSE("podvm", "--tty=true", "img");
-    CHECK(rc == CLI_PARSE_ERROR, "--tty=true (unknown flag) accepted");
+    rc = PARSE("podvm", "--tty=banana", "img");
+    CHECK(rc == CLI_PARSE_ERROR, "--tty=banana accepted");
 }
 
 /* ---- flags stop at the image (docker: args after image = command) ---- */

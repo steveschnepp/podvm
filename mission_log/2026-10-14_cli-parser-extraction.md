@@ -180,3 +180,49 @@ run -im 512    /nonexistent-x  ->  directory not found   (grouped shorts OK)
 - `podvm build`'s hand-rolled flag loop (`cmd_build`) is the same
   pattern the extraction just fixed -- worth the same treatment when
   build flags grow (--build-arg, --target, --no-cache).
+
+---
+
+## Session 2: -t/--tty via serial, vsock PTY deferred (2026-10-14)
+
+### The Question
+
+Fake-over-serial or hijack vsock for docker's `-t`?
+
+### The Decisive Evidence (from the tree, not opinion)
+
+1. **The serial console is already a real tty.** The entrypoint's
+   fds 0/1/2 are the kernel console (ttyS0) -- a genuine guest line
+   discipline: isatty() is true, echo works, Ctrl-C becomes SIGINT.
+   "Fake" is only half-right: a real tty on a UART instead of a PTY.
+2. **A guest PTY is feasible whenever wanted:** init.c already mounts
+   devpts (mount_pseudofs_at), and both host and synthetic kernels
+   have UNIX98_PTYS.
+
+### Decision
+
+- **Accept -t/--tty now, as parse-level honesty** (a tty genuinely
+  exists; recorded in config.tty for a future channel to act on).
+  docker `-it` muscle memory parses.
+- **vsock-backed PTY is the end-state, built on demand** -- when
+  window-size forwarding (SIGWINCH -> TIOCSWINSZ), stream separation
+  (dmesg out of the user's terminal), or `docker attach` need it.
+  It must be a THIRD allocated port (vsockalloc), never a hijack of
+  the config (5000) or exit-report channels.
+- Not speculative: ~250 lines (guest relay + host relay + port
+  alloc) is cheap but not free; the UART tty covers isatty/echo/
+  signals today.
+
+### Fossil flipped
+
+`cli_matrix.sh` pinned `-it` as an expected "phantom" failure -- a
+relic of the old drifted mock parser. Now a positive assertion (optstring
+matrix includes -t; `--tty=banana` rejected; -t alone != -i).
+
+### Test Results
+
+```
+test_cli: all checks passed   (-it, -t, --tty=true, --tty=banana)
+CLI matrix                    PASS (phantom replaced with -y)
+PASS: 37   FAIL: 0
+```
