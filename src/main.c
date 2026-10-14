@@ -1421,43 +1421,18 @@ static void copy_target(const char *dstabs, const char *src, int multi,
 }
 
 static int cmd_build(int argc, char **argv) {
-    const char *df_arg = NULL, *tag = NULL, *context = NULL;
+    /* Flag grammar lives in cli.c (unit-tested; docker build: flags before
+     * or after the single context, -t required). This keeps only the
+     * build-specific path/Dockerfile work. Exit-code contract preserved:
+     * help -> 0, parse error -> 2. */
+    PodvmBuildArgs b;
+    switch (cli_parse_build(argc, argv, &b)) {
+    case CLI_PARSE_HELP:  return 0;
+    case CLI_PARSE_ERROR: return 2;
+    default: break;
+    }
+    const char *df_arg = b.dockerfile, *tag = b.tag, *context = b.context;
 
-    for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "-f") && i + 1 < argc) df_arg = argv[++i];
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) tag = argv[++i];
-        else if (!strcmp(argv[i], "-r") && i + 1 < argc)
-            snprintf(config.initramfs, sizeof(config.initramfs), "%s", argv[++i]);
-        else if (!strcmp(argv[i], "-k") && i + 1 < argc)
-            snprintf(config.kernel, sizeof(config.kernel), "%s", argv[++i]);
-        else if (!strcmp(argv[i], "-m") && i + 1 < argc)
-            config.memory = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc)
-            config.cpus = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            fprintf(stderr, "Usage: podvm build [-f Dockerfile] -t <name:tag> "
-                            "[-r initramfs] [-k kernel] [-m MB] [-c CPUS] [context]\n");
-            fprintf(stderr, "Build a Dockerfile into a podvm image. Supported: FROM\n");
-            fprintf(stderr, "(multi-stage: 'FROM x AS name'), RUN (shell form), COPY\n");
-            fprintf(stderr, "(context-relative, or '--from=<stage|image>'), WORKDIR,\n");
-            fprintf(stderr, "ENV, USER, CMD, ENTRYPOINT; EXPOSE/LABEL are accepted\n");
-            fprintf(stderr, "and ignored. -m/-c size the RUN-step VMs.\n");
-            return 0;
-        } else if (argv[i][0] == '-') {
-            fprintf(stderr, "podvm build: unknown option '%s'\n", argv[i]);
-            return 2;
-        } else if (!context) {
-            context = argv[i];
-        } else {
-            fprintf(stderr, "podvm build: unexpected argument '%s'\n", argv[i]);
-            return 2;
-        }
-    }
-    if (!tag) {
-        fprintf(stderr, "podvm build: -t <name:tag> is required\n");
-        return 2;
-    }
-    if (!context) context = ".";
     if (image_is_path(tag)) {
         fprintf(stderr, "podvm build: tag must not be a path: '%s'\n", tag);
         return 2;

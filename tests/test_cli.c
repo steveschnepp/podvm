@@ -218,6 +218,74 @@ static void test_state_reset(void) {
     CHECK(config.memory == 128 && config.cpus == 1, "defaults not restored");
 }
 
+/* ---- build grammar (cli_parse_build) ----
+ *
+ * Pins the docker-build flag surface now that it lives in cli.c. Covers
+ * the fixes: an honest "requires an argument" (was "unknown option '-t'")
+ * and positive-integer validation for -m/-c (was a silent atoi->0). */
+static int parse_build(char **argv, PodvmBuildArgs *out) {
+    int argc = 0;
+    while (argv[argc]) argc++;
+    return cli_parse_build(argc, argv, out);
+}
+
+#define PBUILD(...) parse_build((char *[]){ __VA_ARGS__, NULL }, &b)
+
+static void test_build_flags(void) {
+    PodvmBuildArgs b;
+    int rc;
+
+    /* required -t, default context "." */
+    rc = PBUILD("podvm", "build", "-t", "name:tag");
+    CHECK(rc == CLI_PARSE_OK, "build -t: rc=%d", rc);
+    CHECK(!strcmp(b.tag, "name:tag"), "build tag: %s", b.tag);
+    CHECK(!strcmp(b.context, "."), "build default context: %s", b.context);
+    CHECK(b.dockerfile == NULL, "build -f default: %s", b.dockerfile);
+
+    /* -f + explicit context */
+    rc = PBUILD("podvm", "build", "-f", "DF", "-t", "n:t", "ctx");
+    CHECK(rc == CLI_PARSE_OK && !strcmp(b.dockerfile, "DF") &&
+          !strcmp(b.context, "ctx"), "build -f ctx: df=%s ctx=%s",
+          b.dockerfile ? b.dockerfile : "(null)", b.context);
+
+    /* flags AFTER the context still parse (docker grammar; not getopt '+') */
+    rc = PBUILD("podvm", "build", "ctx", "-t", "n:t");
+    CHECK(rc == CLI_PARSE_OK && !strcmp(b.context, "ctx") &&
+          !strcmp(b.tag, "n:t"), "build flags-after-context: ctx=%s tag=%s",
+          b.context, b.tag);
+
+    /* -m/-c reach config as positive ints */
+    rc = PBUILD("podvm", "build", "-t", "n:t", "-m", "512", "-c", "2");
+    CHECK(rc == CLI_PARSE_OK && config.memory == 512 && config.cpus == 2,
+          "build -m/-c: mem=%d cpus=%d", config.memory, config.cpus);
+
+    /* missing -t is an error */
+    rc = PBUILD("podvm", "build", "ctx");
+    CHECK(rc == CLI_PARSE_ERROR, "build without -t: rc=%d", rc);
+
+    /* MISSING ARGUMENT is honest (was: "unknown option '-t'") */
+    rc = PBUILD("podvm", "build", "-t");
+    CHECK(rc == CLI_PARSE_ERROR, "build -t at end: rc=%d", rc);
+    rc = PBUILD("podvm", "build", "-f");
+    CHECK(rc == CLI_PARSE_ERROR, "build -f at end: rc=%d", rc);
+
+    /* garbage / non-positive -m and -c are rejected, not atoi'd to 0 */
+    rc = PBUILD("podvm", "build", "-t", "n:t", "-m", "banana");
+    CHECK(rc == CLI_PARSE_ERROR, "build -m banana: rc=%d", rc);
+    rc = PBUILD("podvm", "build", "-t", "n:t", "-c", "0");
+    CHECK(rc == CLI_PARSE_ERROR, "build -c 0: rc=%d", rc);
+
+    /* unknown option and a second positional are errors */
+    rc = PBUILD("podvm", "build", "--frobnicate", "-t", "n:t");
+    CHECK(rc == CLI_PARSE_ERROR, "build unknown opt: rc=%d", rc);
+    rc = PBUILD("podvm", "build", "-t", "n:t", "ctx", "extra");
+    CHECK(rc == CLI_PARSE_ERROR, "build 2nd positional: rc=%d", rc);
+
+    /* -h is HELP, not an error */
+    rc = PBUILD("podvm", "build", "-h");
+    CHECK(rc == CLI_PARSE_HELP, "build -h: rc=%d", rc);
+}
+
 int main(void) {
     int saved_stderr = dup(2);
     int devnull = open("/dev/null", O_WRONLY);
@@ -229,6 +297,7 @@ int main(void) {
     test_post_image_passthrough();
     test_validations();
     test_state_reset();
+    test_build_flags();
 
     if (saved_stderr >= 0) dup2(saved_stderr, 2);
 

@@ -92,4 +92,22 @@ int cli_parse_run(int argc, char **argv);
 /* The image/rootfs ref as typed (valid until the next cli_parse_run). */
 const char *cli_image_ref(void);
 
+/*
+ * Parse `podvm build [FLAGS] [context]` (docker build grammar) into
+ * `config` (which -r/-k/-m/-c share with run) plus the out-params.
+ *
+ * Flags may appear before OR after the single positional context (the
+ * hand-rolled loop podvm has always used -- not getopt's stop-at-first-
+ * non-option), so `podvm build ctx -t tag` parses like docker's. Exactly
+ * one context; -t is required. Returns CLI_PARSE_OK (out-params filled),
+ * CLI_PARSE_HELP (usage printed), or CLI_PARSE_ERROR (message printed).
+ */
+typedef struct {
+    const char *dockerfile;   /* -f, or NULL -> "<context>/Dockerfile" */
+    const char *tag;          /* -t, required */
+    const char *context;      /* positional, or NULL -> "." */
+} PodvmBuildArgs;
+
+int cli_parse_build(int argc, char **argv, PodvmBuildArgs *out);
+
 #endif /* PODVM_CLI_H */

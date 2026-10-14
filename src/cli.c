@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <errno.h>
 #include <getopt.h>
 #include <sys/stat.h>
@@ -569,5 +570,98 @@ int cli_parse_run(int argc, char **argv) {
         config.entrypoint[0] = '\0';
     }
 
+    return CLI_PARSE_OK;
+}
+
+/* docker-build usage (printed on -h/--help and on parse errors that
+ * benefit from it). */
+static void cli_build_usage(const char *prog) {
+    fprintf(stderr, "Usage: %s build [-f Dockerfile] -t <name:tag> "
+                    "[-r initramfs] [-k kernel] [-m MB] [-c CPUS] [context]\n",
+            prog);
+    fprintf(stderr, "Build a Dockerfile into a podvm image. Supported: FROM\n");
+    fprintf(stderr, "(multi-stage: 'FROM x AS name'), RUN (shell form), COPY\n");
+    fprintf(stderr, "(context-relative, or '--from=<stage|image>'), WORKDIR,\n");
+    fprintf(stderr, "ENV, USER, CMD, ENTRYPOINT; EXPOSE/LABEL are accepted\n");
+    fprintf(stderr, "and ignored. -m/-c size the RUN-step VMs.\n");
+}
+
+/* Parse a strictly-positive integer (memory MB, cpus). Returns 1 and
+ * stores *out on success; 0 on garbage or a non-positive value. atoi
+ * would silently map "banana" to 0, which only fails later at QEMU
+ * launch with a confusing message. */
+static int pos_int(const char *s, int *out) {
+    char *end;
+    long v;
+    if (!s || !*s) return 0;
+    v = strtol(s, &end, 10);
+    if (*end != '\0' || v <= 0 || v > INT_MAX) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+int cli_parse_build(int argc, char **argv, PodvmBuildArgs *out) {
+    const char *df_arg = NULL, *tag = NULL, *context = NULL;
+
+    /* argv[0] is the program, argv[1] the "build" keyword -- start at 2,
+     * exactly as the hand-rolled loop in cmd_build always has. Flags are
+     * scanned linearly and may appear before OR after the single
+     * positional context (docker's grammar), which getopt's stop-at-first-
+     * non-option ('+') would break -- so keep the explicit loop. */
+    for (int i = 2; i < argc; i++) {
+        const char *a = argv[i];
+
+        /* Value-taking flags: report a MISSING argument honestly (the old
+         * loop fell through to "unknown option '-t'" when -t was last). */
+        if (!strcmp(a, "-f") || !strcmp(a, "-t") || !strcmp(a, "-r") ||
+            !strcmp(a, "-k") || !strcmp(a, "-m") || !strcmp(a, "-c")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "podvm build: option '%s' requires an argument\n", a);
+                cli_build_usage(argv[0]);
+                return CLI_PARSE_ERROR;
+            }
+            const char *v = argv[++i];
+            if      (!strcmp(a, "-f")) df_arg = v;
+            else if (!strcmp(a, "-t")) tag = v;
+            else if (!strcmp(a, "-r"))
+                snprintf(config.initramfs, sizeof(config.initramfs), "%s", v);
+            else if (!strcmp(a, "-k"))
+                snprintf(config.kernel, sizeof(config.kernel), "%s", v);
+            else if (!strcmp(a, "-m")) {
+                if (!pos_int(v, &config.memory)) {
+                    fprintf(stderr, "podvm build: -m memory must be a positive "
+                                    "MB value: '%s'\n", v);
+                    return CLI_PARSE_ERROR;
+                }
+            } else if (!strcmp(a, "-c")) {
+                if (!pos_int(v, &config.cpus)) {
+                    fprintf(stderr, "podvm build: -c cpus must be a positive "
+                                    "count: '%s'\n", v);
+                    return CLI_PARSE_ERROR;
+                }
+            }
+        } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            cli_build_usage(argv[0]);
+            return CLI_PARSE_HELP;
+        } else if (a[0] == '-') {
+            fprintf(stderr, "podvm build: unknown option '%s'\n", a);
+            return CLI_PARSE_ERROR;
+        } else if (!context) {
+            context = a;
+        } else {
+            fprintf(stderr, "podvm build: unexpected argument '%s'\n", a);
+            return CLI_PARSE_ERROR;
+        }
+    }
+
+    if (!tag) {
+        fprintf(stderr, "podvm build: -t <name:tag> is required\n");
+        return CLI_PARSE_ERROR;
+    }
+    if (!context) context = ".";
+
+    out->dockerfile = df_arg;
+    out->tag = tag;
+    out->context = context;
     return CLI_PARSE_OK;
 }
