@@ -38,41 +38,14 @@
 #include "container.h"
 #include "build.h"
 #include "vsockalloc.h"
+#include "cli.h"
 
 #include <limits.h>    /* PATH_MAX */
 
 #define MAX_CMDLINE 4096
 
-/* Published ports: -p [hostip:]hostport:containerport (tcp). The
- * destination is always the guest's slirp address (10.0.2.15). */
-#define MAX_PUBLISH 16
-
-/* Configuration */
-static struct {
-    char kernel[PATH_MAX];
-    char initramfs[PATH_MAX];
-    char rootfs_dir[PATH_MAX];
-    char entrypoint[PATH_MAX];
-    char args[4096];       /* csv of escaped argv elements (guest tok[] matches) */
-    char env[4096];         /* escaped csv of K=V (guest tok[] matches) */
-    char cwd[PATH_MAX];       /* from image WorkingDir, or user override */
-    char user[128];           /* from image User ("uid:gid") */
-    char name[256];           /* container name; enables persistent state */
-    char hostname[256];       /* --hostname; sent as podvm.hostname= */
-    int  net_none;      /* --network=none: no netdev, guest skips eth0 */
-    int  read_only;     /* --read-only: serve the lower ro, no upper */
-    int  detach;        /* -d: background the VM; serial to <state>/log */
-    int  memory;       /* MB */
-    int  cpus;
-    int  interactive;  /* -i flag */
-    int  autoremove;   /* --rm: drop the named state dir when the run ends */
-} config = {
-    .kernel = "",  /* Empty = use host kernel */
-    .initramfs = "",   /* Empty = auto-resolve (see resolve_initramfs) */
-    .memory = 128,
-    .cpus = 1,
-    .interactive = 0,
-};
+/* Run-CLI parse state (config, publishes, volumes, tmpfs) lives in
+ * cli.c; main.c consumes it below. */
 
 /* Resolve the initramfs when -r is omitted. Order:
  *   1. next to the running binary (dev tree: build/initramfs.cpio) --
@@ -281,146 +254,6 @@ static int fill_native_chain(const char *img) {
     return store_nlayers;
 }
 
-/* -p/--publish entries (tcp only; validated in publish_add). */
-static struct {
-    char hostip[64];
-    int  hostport;
-    int  containerport;
-} publishes[MAX_PUBLISH];
-static int npublishes = 0;
-
-/* -v/--volume bind mounts, each served to the guest over its own 9p
- * tag (vol0, vol1, ...) because the rootfs tag is taken. */
-#define MAX_VOLUMES 8
-static struct {
-    char host[CONTAINER_PATH_MAX];     /* host dir (exists at parse time) */
-    char target[CONTAINER_PATH_MAX];   /* absolute path inside the container */
-    int  ro;
-} volumes[MAX_VOLUMES];
-static int nvolumes = 0;
-
-/* --tmpfs scratch mounts (absolute container paths). */
-#define MAX_TMPFS 8
-static char tmpfs_targets[MAX_TMPFS][CONTAINER_PATH_MAX];
-static int ntmpfs = 0;
-
-/*
- * Parse and store one -p spec: [hostip:]hostport:containerport.
- * Numeric ports 1..65535; hostip defaults to 127.0.0.1 (docker's
- * default bind). IPv6 hostips are rejected -- the colon-splitting is
- * unambiguous only without them.
- */
-static int publish_add(const char *spec) {
-    char buf[128];
-    char *cport, *hport;
-    const char *ip = "127.0.0.1";
-
-    if (npublishes >= MAX_PUBLISH) {
-        fprintf(stderr, "podvm: too many -p entries (max %d)\n", MAX_PUBLISH);
-        return -1;
-    }
-    snprintf(buf, sizeof(buf), "%s", spec);
-
-    cport = strrchr(buf, ':');
-    if (!cport) goto bad;
-    *cport++ = '\0';
-    hport = strrchr(buf, ':');
-    if (hport) {
-        *hport++ = '\0';
-        ip = buf;
-    } else {
-        hport = buf;
-    }
-
-    {
-        char *end;
-        long hp = strtol(hport, &end, 10);
-        if (*end || hp < 1 || hp > 65535) goto bad;
-        long cp = strtol(cport, &end, 10);
-        if (*end || cp < 1 || cp > 65535) goto bad;
-        if (strlen(ip) >= sizeof(publishes[0].hostip)) goto bad;
-
-        snprintf(publishes[npublishes].hostip,
-                 sizeof(publishes[0].hostip), "%s", ip);
-        publishes[npublishes].hostport = (int)hp;
-        publishes[npublishes].containerport = (int)cp;
-        npublishes++;
-    }
-    return 0;
-
-bad:
-    fprintf(stderr, "podvm: invalid -p '%s' "
-                    "(want [hostip:]hostport:containerport, tcp)\n", spec);
-    return -1;
-}
-
-/*
- * Parse and store one -v spec: host-dir:container-dir[:ro]. Both paths
- * absolute; the host path must be an existing directory (QEMU would
- * otherwise fail late with a worse message). Colons and commas are
- * rejected in both paths: commas break QEMU's fsdev option parsing and
- * colons break the guest-side tag:target:ro split. Docker's volume
- * names (non-path first field) are not supported -- bind mounts only.
- */
-static int volume_add(const char *spec) {
-    char buf[CONTAINER_PATH_MAX * 2];
-    int ro = 0;
-
-    if (nvolumes >= MAX_VOLUMES) {
-        fprintf(stderr, "podvm: too many -v entries (max %d)\n", MAX_VOLUMES);
-        return -1;
-    }
-    snprintf(buf, sizeof(buf), "%s", spec);
-
-    {
-        char *last = strrchr(buf, ':');
-        if (last && !strcmp(last, ":ro")) {
-            *last = '\0';
-            ro = 1;
-        }
-        char *target = strrchr(buf, ':');
-        if (!target) goto bad;
-        *target++ = '\0';
-
-        if (buf[0] != '/' || target[0] != '/') goto bad;
-        if (strchr(buf, ':') || strchr(buf, ',') ||
-            strchr(target, ':') || strchr(target, ',')) goto bad;
-        if (strlen(buf) >= sizeof(volumes[0].host) ||
-            strlen(target) >= sizeof(volumes[0].target)) goto bad;
-
-        struct stat st;
-        if (stat(buf, &st) < 0 || !S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "podvm: -v host path is not a directory: %s\n", buf);
-            return -1;
-        }
-
-        snprintf(volumes[nvolumes].host, sizeof(volumes[0].host), "%s", buf);
-        snprintf(volumes[nvolumes].target, sizeof(volumes[0].target), "%s", target);
-        volumes[nvolumes].ro = ro;
-        nvolumes++;
-    }
-    return 0;
-
-bad:
-    fprintf(stderr, "podvm: invalid -v '%s' (want absolute-host-dir:"
-                    "absolute-container-dir[:ro])\n", spec);
-    return -1;
-}
-
-/* --tmpfs <dir>: absolute container path for a guest tmpfs mount. */
-static int tmpfs_add(const char *spec) {
-    if (ntmpfs >= MAX_TMPFS) {
-        fprintf(stderr, "podvm: too many --tmpfs entries (max %d)\n", MAX_TMPFS);
-        return -1;
-    }
-    if (spec[0] != '/') {
-        fprintf(stderr, "podvm: --tmpfs path must be absolute: '%s'\n", spec);
-        return -1;
-    }
-    snprintf(tmpfs_targets[ntmpfs], sizeof(tmpfs_targets[0]), "%s", spec);
-    ntmpfs++;
-    return 0;
-}
 
 /* Detect host vsock support via /dev/vhost-vsock, and claim a unique
  * guest CID for this VM. Without a free CID the vhost-vsock device
@@ -547,62 +380,6 @@ static void csv_encode(char *dst, size_t dstsz, const char *raw) {
     dst[off] = '\0';
 }
 
-/*
- * Append one KEY=VALUE to the CLI env list. config.env is the raw
- * comma-joined list; build_config_tokens() escapes each element on the
- * way out, so values may contain commas, spaces, and '='.
- * Returns -1 (with a message) on malformed input or overflow.
- */
-static int env_add(const char *kv) {
-    const char *eq = strchr(kv, '=');
-    if (!eq) {
-        fprintf(stderr, "podvm: env entry must be KEY=VALUE: '%s'\n", kv);
-        return -1;
-    }
-    /* Escape the VALUE now: this is the last place that knows which
-     * commas in the entry are data (csv_encode will not re-escape). */
-    char esc[2048];
-    if (kv_escape(esc, sizeof(esc), eq + 1) == (size_t)-1) {
-        fprintf(stderr, "podvm: env value too long: '%s'\n", kv);
-        return -1;
-    }
-    size_t klen = (size_t)(eq - kv);        /* key, without '=' */
-    size_t have = strlen(config.env);
-    int w = snprintf(config.env + have, sizeof(config.env) - have,
-                     "%s%.*s=%s", have ? "," : "", (int)klen, kv, esc);
-    if (w < 0 || (size_t)w >= sizeof(config.env) - have) {
-        fprintf(stderr, "podvm: too many/large -e values (env list is %zu bytes)\n",
-                sizeof(config.env));
-        return -1;
-    }
-    return 0;
-}
-
-/* --env-file: KEY=VALUE per line; blank lines and #-comments skipped.
- * Each line is one env element, so a value may contain anything but a
- * newline (the encoder escapes the rest). */
-static int env_add_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "podvm: cannot open env file %s: %s\n",
-                path, strerror(errno));
-        return -1;
-    }
-    char line[1024];
-    int lineno = 0;
-    while (fgets(line, sizeof(line), f)) {
-        lineno++;
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0] || line[0] == '#') continue;
-        if (env_add(line) < 0) {
-            fprintf(stderr, "podvm: %s:%d: bad env entry\n", path, lineno);
-            fclose(f);
-            return -1;
-        }
-    }
-    fclose(f);
-    return 0;
-}
 
 /*
  * Build the podvm.*= token string, escaping every value so spaces and
@@ -1162,10 +939,6 @@ static int cmd_rm(int argc, char **argv) {
     return rc;
 }
 
-/* Long-only options: --rm has no short form (-r is taken by --initramfs;
- * docker's -h hostname clashes with help, so --hostname is long-only). */
-enum { OPT_RM = 1000, OPT_ENVFILE = 1001, OPT_NETWORK = 1002,
-       OPT_READONLY = 1003, OPT_TMPFS = 1004, OPT_HOSTNAME = 1005 };
 
 /*
  * `podvm images` -- list the podvm store (pulls and build output).
@@ -2284,66 +2057,8 @@ static int cmd_logs(int argc, char **argv) {
     return 0;
 }
 
-/* Print usage */
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [options] <image|rootfs-dir> [command] [args...]\n", prog);
-    fprintf(stderr, "       %s run [options] <image|rootfs-dir> [command] [args...]\n", prog);
-    fprintf(stderr, "       %s rm <name> [<name>...]\n", prog);
-    fprintf(stderr, "       %s images\n", prog);
-    fprintf(stderr, "       %s rmi <image> [<image>...]\n", prog);
-    fprintf(stderr, "       %s build [-f Dockerfile] -t <name:tag> [context]\n", prog);
-    fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -i, --interactive   Give the guest stdin exclusively\n");
-    fprintf(stderr, "                      (default: QEMU monitor shares it; Ctrl-A C)\n");
-    fprintf(stderr, "  -d, --detach        Run in the background (requires --name;\n");
-    fprintf(stderr, "                      serial goes to <state>/log)\n");
-    fprintf(stderr, "  -e, --env <K=V>     Set an environment variable (repeatable;\n");
-    fprintf(stderr, "                      overrides the image's value for the key)\n");
-    fprintf(stderr, "      --env-file <f>  Read KEY=VALUE lines from a file\n");
-    fprintf(stderr, "  -u, --user <spec>   Run as <name|uid>[:<group|gid>] (resolved\n");
-    fprintf(stderr, "                      against the container's /etc/passwd)\n");
-    fprintf(stderr, "  -w, --workdir <dir> Working directory inside the container\n");
-    fprintf(stderr, "                      (absolute; created if missing)\n");
-    fprintf(stderr, "  -p, --publish <spec> Publish a container port to the host:\n");
-    fprintf(stderr, "                      [hostip:]hostport:containerport (tcp)\n");
-    fprintf(stderr, "      --network <mode>  slirp (default) or none (no network)\n");
-    fprintf(stderr, "      --read-only     Mount the container rootfs read-only\n");
-    fprintf(stderr, "  -v, --volume <h:t[:ro]>  Bind-mount a host directory into\n");
-    fprintf(stderr, "                      the container (both paths absolute)\n");
-    fprintf(stderr, "      --tmpfs <dir>   Mount a tmpfs at <dir> in the container\n");
-    fprintf(stderr, "      --hostname <name>  Set the container hostname\n");
-    fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
-    fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
-    fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
-    fprintf(stderr, "  -r, --initramfs <path> Initramfs path (default: next to\n");
-    fprintf(stderr, "                      the podvm binary, then /var/lib/podvm)\n");
-    fprintf(stderr, "  -n, --name <name>   Container name; persists the writable layer\n");
-    fprintf(stderr, "                      across runs (write-back). Without it, writes\n");
-    fprintf(stderr, "                      are discarded when the VM exits.\n");
-    fprintf(stderr, "      --rm            Remove the named container's state when the\n");
-    fprintf(stderr, "                      run exits (no-op without --name)\n");
-    fprintf(stderr, "  -h, --help          Show this help\n");
-    fprintf(stderr, "\nSubcommands:\n");
-    fprintf(stderr, "  rm <name>...        Delete named containers' persistent state\n");
-    fprintf(stderr, "  stop <name>...      Stop detached containers\n");
-    fprintf(stderr, "  logs <name>         Print a detached container's serial log\n");
-    fprintf(stderr, "  images              List cached images\n");
-    fprintf(stderr, "  rmi <image>...      Remove cached images (refused while in use)\n");
-    fprintf(stderr, "  build               Build a Dockerfile into a cached image\n");
-    fprintf(stderr, "  save [-o F] IMAGE   Save an image as a docker-archive tar\n");
-    fprintf(stderr, "  load [-i F]         Load a docker-archive tar\n");
-    fprintf(stderr, "  system prune        Remove unreferenced blobs/layers from the store\n");
-    fprintf(stderr, "\nExamples:\n");
-    fprintf(stderr, "  %s -i debian /bin/sh\n", prog);
-    fprintf(stderr, "  %s -i debian echo hello\n", prog);
-    fprintf(stderr, "  %s -i /path/to/rootfs /bin/sh\n", prog);
-    fprintf(stderr, "  %s -n build -i alpine /bin/sh   (writes survive the run)\n", prog);
-    fprintf(stderr, "  %s rm build                     (discard them)\n", prog);
-}
 
 int main(int argc, char **argv) {
-    int opt;
-    int option_index = 0;
 
     /* Subcommands are dispatched before getopt, so a subcommand name is
      * never consumed as the image positional argument. */
@@ -2366,212 +2081,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "logs") == 0)
         return cmd_logs(argc, argv);
 
-    /* Drop-in compat: docker/podman take an explicit `run` keyword.
-     * Consume it (keyword wins, as in docker) so `podvm run --rm img`
-     * parses identically to `podvm --rm img`. getopt's '+' would
-     * otherwise stop at the non-option `run` and treat it as the image. */
-    if (argc > 1 && strcmp(argv[1], "run") == 0) {
-        for (int i = 1; i < argc; i++) argv[i] = argv[i + 1];
-        argc--;
-    }
-
-    const char *image_ref = NULL;   /* user's original ref, kept for config */
-    
-    static struct option long_options[] = {
-        {"interactive", no_argument,       0, 'i'},
-        {"memory",      required_argument, 0, 'm'},
-        {"cpus",        required_argument, 0, 'c'},
-        {"kernel",      required_argument, 0, 'k'},
-        {"initramfs",   required_argument, 0, 'r'},
-        {"name",        required_argument, 0, 'n'},
-        {"env",         required_argument, 0, 'e'},
-        {"env-file",    required_argument, 0, OPT_ENVFILE},
-        {"user",        required_argument, 0, 'u'},
-        {"workdir",     required_argument, 0, 'w'},
-        {"publish",     required_argument, 0, 'p'},
-        {"network",     required_argument, 0, OPT_NETWORK},
-        {"read-only",   no_argument,       0, OPT_READONLY},
-        {"tmpfs",       required_argument, 0, OPT_TMPFS},
-        {"hostname",     required_argument, 0, OPT_HOSTNAME},
-        {"volume",      required_argument, 0, 'v'},
-        {"rm",          no_argument,       0, OPT_RM},
-        {"detach",      no_argument,       0, 'd'},
-        {"help",        no_argument,       0, 'h'},
-        {0, 0, 0, 0}
-    };
-    
-    /* '+' stops getopt at the first non-option (the image/rootfs), so
-     * flags meant for the entrypoint (e.g. `podvm img /bin/sh -c ...`)
-     * are not stolen as podvm options. */
-    while ((opt = getopt_long(argc, argv, "+:die:u:w:p:v:m:c:k:r:n:h", long_options, &option_index)) != -1) {
-        switch (opt) {
-        case 'i':
-            config.interactive = 1;
-            break;
-        case 'd':
-            config.detach = 1;
-            break;
-        case 'e':
-            if (env_add(optarg) < 0) return 1;
-            break;
-        case OPT_ENVFILE:
-            if (env_add_file(optarg) < 0) return 1;
-            break;
-        case 'u':
-            if (!optarg[0]) {
-                fprintf(stderr, "podvm: --user must not be empty\n");
-                return 1;
-            }
-            snprintf(config.user, sizeof(config.user), "%s", optarg);
-            break;
-        case 'w':
-            if (optarg[0] != '/') {
-                fprintf(stderr, "podvm: --workdir must be an absolute path: '%s'\n",
-                        optarg);
-                return 1;
-            }
-            snprintf(config.cwd, sizeof(config.cwd), "%s", optarg);
-            break;
-        case 'p':
-            if (publish_add(optarg) < 0) return 1;
-            break;
-        case OPT_NETWORK:
-            if (!strcmp(optarg, "none")) {
-                config.net_none = 1;
-            } else if (!strcmp(optarg, "slirp")) {
-                config.net_none = 0;
-            } else {
-                fprintf(stderr, "podvm: --network must be slirp or none "
-                                "(host/bridge need tap; ADR-009/perf phase)\n");
-                return 1;
-            }
-            break;
-        case OPT_READONLY:
-            config.read_only = 1;
-            break;
-        case 'v':
-            if (volume_add(optarg) < 0) return 1;
-            break;
-        case OPT_TMPFS:
-            if (tmpfs_add(optarg) < 0) return 1;
-            break;
-        case OPT_HOSTNAME:
-            if (!optarg[0]) {
-                fprintf(stderr, "podvm: --hostname must not be empty\n");
-                return 1;
-            }
-            snprintf(config.hostname, sizeof(config.hostname), "%s", optarg);
-            break;
-        case 'm':
-            config.memory = atoi(optarg);
-            break;
-        case 'c':
-            config.cpus = atoi(optarg);
-            break;
-        case 'k':
-            strncpy(config.kernel, optarg, PATH_MAX - 1);
-            break;
-        case 'r':
-            strncpy(config.initramfs, optarg, PATH_MAX - 1);
-            break;
-        case 'n':
-            if (!container_name_valid(optarg)) {
-                fprintf(stderr, "podvm: invalid container name '%s' "
-                                "(no '/', not '.' or '..', no leading '-')\n",
-                        optarg);
-                return 1;
-            }
-            snprintf(config.name, sizeof(config.name), "%s", optarg);
-            break;
-        case OPT_RM:
-            config.autoremove = 1;
-            break;
-        case 'h':
-            usage(argv[0]);
-            return 0;
-        case ':':
-            fprintf(stderr, "podvm: option '-%c' requires an argument\n", optopt);
-            usage(argv[0]);
-            return 1;
-        case '?':
-        default:
-            fprintf(stderr, "podvm: invalid option -- '%c'\n", optopt);
-            usage(argv[0]);
-            return 1;
-        }
-    }
-
-    /* Need at least image/rootfs and command */
-    if (optind >= argc) {
-        usage(argv[0]);
+    /* Run-argv parsing lives in cli.c (unit-tested; docker grammar:
+     * `run` keyword consumed, flags stop at the image). */
+    switch (cli_parse_run(argc, argv)) {
+    case CLI_PARSE_HELP:
+        return 0;
+    case CLI_PARSE_ERROR:
         return 1;
     }
-
-    if (config.net_none && npublishes > 0) {
-        fprintf(stderr, "podvm: -p/--publish requires networking "
-                        "(--network=none disables it)\n");
-        return 1;
-    }
-
-    /* Detached runs are named and have no supervisor to clean up after
-     * them. */
-    if (config.detach) {
-        if (!config.name[0]) {
-            fprintf(stderr, "podvm: --detach requires --name\n");
-            return 1;
-        }
-        if (config.autoremove) {
-            fprintf(stderr, "podvm: --detach cannot be combined with --rm "
-                            "(nothing would clean the state up)\n");
-            return 1;
-        }
-        if (config.interactive) {
-            fprintf(stderr, "podvm: --detach cannot be combined with "
-                            "--interactive\n");
-            return 1;
-        }
-    }
-
-    /* Get image or rootfs directory */
-    strncpy(config.rootfs_dir, argv[optind], PATH_MAX - 1);
-    config.rootfs_dir[PATH_MAX - 1] = '\0';
-    {
-        /* Keep the user's original ref for image-config lookup (the
-         * rootfs_dir field is overwritten with the resolved path below). */
-        static char image_ref_buf[PATH_MAX];
-        snprintf(image_ref_buf, sizeof(image_ref_buf), "%s", config.rootfs_dir);
-        image_ref = image_ref_buf;
-    }
-    optind++;
-
-    /* Get entrypoint (if provided) */
-    if (optind < argc) {
-        strncpy(config.entrypoint, argv[optind], PATH_MAX - 1);
-        optind++;
-
-        /* Build args string. Each argv element is escaped HERE -- the
-         * last place that knows which commas are separators -- so an
-         * argument containing a comma reaches the guest intact
-         * (csv_encode will not re-escape). */
-        char *p = config.args;
-        char *end = config.args + sizeof(config.args) - 1;
-        for (int j = optind; j < argc && p < end; j++) {
-            if (j > optind) *p++ = ',';
-            char esc[4096];
-            if (kv_escape(esc, sizeof(esc), argv[j]) == (size_t)-1)
-                snprintf(esc, sizeof(esc), "");
-            int n = snprintf(p, (size_t)(end - p), "%s", esc);
-            if (n < 0 || p + n >= end) {
-                fprintf(stderr, "podvm: command too long for the config channel\n");
-                return 1;
-            }
-            p += n;
-        }
-        *p = '\0';
-    } else {
-        /* No command specified, use image entrypoint or default */
-        config.entrypoint[0] = '\0';
-    }
+    const char *image_ref = cli_image_ref();   /* user's original ref */
 
     /* Resolve kernel path */
     if (config.kernel[0] == '\0') {

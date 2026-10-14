@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LDFLAGS = -lzstd
 
 # Test binaries
-TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_build test_json test_store test_vsockalloc test_tarwrite test_store_native
+TESTS = test_config test_vsock test_kernel_config test_image test_sha256 test_imgcfg test_userdb test_container test_cli test_build test_json test_store test_vsockalloc test_tarwrite test_store_native
 
 .PHONY: all test clean
 
@@ -43,6 +43,10 @@ test_userdb: test_userdb.c ../src/userdb.c ../src/userdb.h
 # Container state tests (name validation, state dir, rm -rf; no deps)
 test_container: test_container.c ../src/container.c ../src/container.h
 	$(CC) $(CFLAGS) -o $@ test_container.c ../src/container.c -I../src
+
+# Run-CLI parser tests (links the real src/cli.c; docker grammar)
+test_cli: test_cli.c ../src/cli.c ../src/cli.h ../src/container.c ../src/strparse.c
+	$(CC) $(CFLAGS) -o $@ test_cli.c ../src/cli.c ../src/container.c ../src/strparse.c -I../src
 
 # Build parser tests (pure logic, no deps)
 test_build: test_build.c ../src/build.c ../src/build.h
@@ -93,6 +97,9 @@ test: $(TESTS)
 	@echo ""
 	@echo "=== Container State Tests ==="
 	./test_container || true
+	@echo ""
+	@echo "=== CLI Parser Tests ==="
+	./test_cli || true
 	@echo ""
 	@echo "=== Build Parser Tests ==="
 	./test_build || true
