@@ -13,8 +13,8 @@
 #include "image.h"
 
 /* Generous bounds; the wire escaping happens later and may grow these. */
-#define IMGCFG_ARGS_MAX (MAX_PATH * 4)
-#define IMGCFG_ENV_MAX  (MAX_PATH * 4)
+#define IMGCFG_ARGS_MAX (PATH_MAX * 4)
+#define IMGCFG_ENV_MAX  (PATH_MAX * 4)
 
 /*
  * A resolved (or partially-resolved) run: what to exec, the environment,
@@ -22,10 +22,10 @@
  * later by build_config_tokens(), not here.
  */
 typedef struct {
-    char entrypoint[MAX_PATH];   /* program to exec */
+    char entrypoint[PATH_MAX];   /* program to exec */
     char args[IMGCFG_ARGS_MAX];  /* comma-joined args for the program */
     char env[IMGCFG_ENV_MAX];    /* comma-joined K=V pairs */
-    char cwd[MAX_PATH];          /* working directory ("" if unset) */
+    char cwd[PATH_MAX];          /* working directory ("" if unset) */
     char user[128];              /* "uid:gid" ("" if unset) */
 } RunSpec;
 

@@ -41,9 +41,12 @@ install: $(BUILD_DIR)/podvm
 guest:
 	cd guest && make
 
-# Build initramfs
+# Build initramfs (dev artifact lands in build/ next to the podvm
+# binary; podvm auto-resolves it there without -r)
 initramfs: guest
 	cd guest && ./build-initramfs.sh
+	@mkdir -p $(BUILD_DIR)
+	cp guest/initramfs.cpio $(BUILD_DIR)/initramfs.cpio
 
 # Build kernel (requires kernel source)
 kernel:

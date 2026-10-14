@@ -39,7 +39,8 @@
 #include "build.h"
 #include "vsockalloc.h"
 
-#define MAX_PATH    1024
+#include <limits.h>    /* PATH_MAX */
+
 #define MAX_CMDLINE 4096
 
 /* Published ports: -p [hostip:]hostport:containerport (tcp). The
@@ -48,13 +49,13 @@
 
 /* Configuration */
 static struct {
-    char kernel[MAX_PATH];
-    char initramfs[MAX_PATH];
-    char rootfs_dir[MAX_PATH];
-    char entrypoint[MAX_PATH];
+    char kernel[PATH_MAX];
+    char initramfs[PATH_MAX];
+    char rootfs_dir[PATH_MAX];
+    char entrypoint[PATH_MAX];
     char args[4096];       /* csv of escaped argv elements (guest tok[] matches) */
     char env[4096];         /* escaped csv of K=V (guest tok[] matches) */
-    char cwd[MAX_PATH];       /* from image WorkingDir, or user override */
+    char cwd[PATH_MAX];       /* from image WorkingDir, or user override */
     char user[128];           /* from image User ("uid:gid") */
     char name[256];           /* container name; enables persistent state */
     char hostname[256];       /* --hostname; sent as podvm.hostname= */
@@ -67,15 +68,48 @@ static struct {
     int  autoremove;   /* --rm: drop the named state dir when the run ends */
 } config = {
     .kernel = "",  /* Empty = use host kernel */
-    .initramfs = "/var/lib/podvm/kernel/initramfs.cpio",
+    .initramfs = "",   /* Empty = auto-resolve (see resolve_initramfs) */
     .memory = 128,
     .cpus = 1,
     .interactive = 0,
 };
 
+/* Resolve the initramfs when -r is omitted. Order:
+ *   1. next to the running binary (dev tree: build/initramfs.cpio) --
+ *      the binary you run owns the initramfs you get;
+ *   2. the installed copy (/var/lib/podvm/kernel/initramfs.cpio),
+ *      which is software payload of a system-wide install.
+ * Returns 1 if config.initramfs was filled, 0 if nothing was found. */
+static int resolve_initramfs(void) {
+    static const char *installed = "/var/lib/podvm/kernel/initramfs.cpio";
+    char exe[PATH_MAX], cand[PATH_MAX];
+    struct stat st;
+    ssize_t n;
+    char *slash;
+
+    if (config.initramfs[0]) return 1;      /* -r given */
+
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        slash = strrchr(exe, '/');
+        if (slash) *slash = '\0';
+        snprintf(cand, sizeof(cand), "%s/initramfs.cpio", exe);
+        if (stat(cand, &st) == 0) {
+            snprintf(config.initramfs, sizeof(config.initramfs), "%s", cand);
+            return 1;
+        }
+    }
+    if (stat(installed, &st) == 0) {
+        snprintf(config.initramfs, sizeof(config.initramfs), "%s", installed);
+        return 1;
+    }
+    return 0;
+}
+
 /* Create a directory and all missing parents (like mkdir -p). */
 static int mkdir_p(const char *path, mode_t mode) {
-    char tmp[MAX_PATH];
+    char tmp[PATH_MAX];
     if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return -1;
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
@@ -576,8 +610,8 @@ static int env_add_file(const char *path) {
  * payload so the two can never diverge on encoding.
  */
 static void build_config_tokens(char *buf, size_t len) {
-    char entry[MAX_PATH * 2], args[MAX_CMDLINE], env[MAX_CMDLINE];
-    char cwd[MAX_PATH * 2], user[sizeof(config.user) * 2];
+    char entry[PATH_MAX * 2], args[MAX_CMDLINE], env[MAX_CMDLINE];
+    char cwd[PATH_MAX * 2], user[sizeof(config.user) * 2];
 
     escape_value(entry, sizeof(entry), config.entrypoint);
     {
@@ -841,7 +875,7 @@ static int start_qemu(void) {
     char cmdline[MAX_CMDLINE];
     char memory_str[32];
     char cpu_str[32];
-    char fsdev_str[MAX_PATH + 64];
+    char fsdev_str[PATH_MAX + 64];
     char vsock_cid_str[32];
     char vsock_dev[64];
     char netdev_str[512];
@@ -856,6 +890,12 @@ static int start_qemu(void) {
                     config.kernel);
             return -1;
         }
+        if (!resolve_initramfs()) {
+            fprintf(stderr, "podvm: initramfs not found: build it "
+                            "('make initramfs' -> build/initramfs.cpio), "
+                            "install it ('make install'), or pass -r\n");
+            return -1;
+        }
         if (stat(config.initramfs, &st) < 0) {
             fprintf(stderr, "podvm: initramfs not found: %s "
                             "(use -r, or 'make initramfs')\n",
@@ -868,7 +908,7 @@ static int start_qemu(void) {
      * one fsdev+device pair per -v volume. */
     const char *qargs[128];
     int qi = 0;
-    char vol_fsdev[MAX_VOLUMES][MAX_PATH + 64];
+    char vol_fsdev[MAX_VOLUMES][PATH_MAX + 64];
     char vol_dev[MAX_VOLUMES][64];
     char vol_tag[MAX_VOLUMES][16];
 
@@ -1403,11 +1443,11 @@ static void json_csv_array(FILE *f, const char *label, const char *csv) {
 }
 
 /* Insert a committed layer at the front of the chain (top-first). */
-static void chain_insert_front(char chain[MAX_CHAIN][MAX_PATH], int *n,
+static void chain_insert_front(char chain[MAX_CHAIN][PATH_MAX], int *n,
                                const char *path) {
     if (*n >= MAX_CHAIN - 1) return;      /* bounded; count reported */
     memmove(&chain[1], &chain[0], (size_t)(*n) * sizeof(chain[0]));
-    snprintf(chain[0], MAX_PATH, "%s", path);
+    snprintf(chain[0], PATH_MAX, "%s", path);
     (*n)++;
 }
 
@@ -1421,16 +1461,16 @@ static void chain_insert_front(char chain[MAX_CHAIN][MAX_PATH], int *n,
  */
 typedef struct {
     char name[128];                          /* "AS name", may be empty */
-    char base_diffs[MAX_CHAIN][MAX_PATH];    /* base chain, top-first */
+    char base_diffs[MAX_CHAIN][PATH_MAX];    /* base chain, top-first */
     int  nbase;
     char base_dig_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* bottom-first */
     int  nbase_dig;
-    char layer_chain[MAX_CHAIN][MAX_PATH];   /* committed step layers, top-first */
+    char layer_chain[MAX_CHAIN][PATH_MAX];   /* committed step layers, top-first */
     int  nlayers;
     char step_dig[MAX_CHAIN][NATIVE_DIGEST_MAX]; /* step digests, build order */
     int  nstepdig;
     char envlist[4096];
-    char cwd[MAX_PATH];
+    char cwd[PATH_MAX];
     char user[128];
     char cmdcsv[4096];
     char entrycsv[4096];
@@ -1444,7 +1484,7 @@ typedef struct {
  * image config. Returns the layer count, or -1 with a message in err.
  */
 static int resolve_image_chain(const char *ref,
-                               char diffs[MAX_CHAIN][MAX_PATH],
+                               char diffs[MAX_CHAIN][PATH_MAX],
                                char digs_bottom[MAX_CHAIN][NATIVE_DIGEST_MAX],
                                ImageConfig *ic,
                                char *err, size_t errsz) {
@@ -1457,7 +1497,7 @@ static int resolve_image_chain(const char *ref,
             return -1;
         }
         for (int l = 0; l < c && l < MAX_CHAIN; l++)
-            snprintf(diffs[l], MAX_PATH, "%s", lay[l].diff);
+            snprintf(diffs[l], PATH_MAX, "%s", lay[l].diff);
         if (digs_bottom) {
             /* Commit each base layer into the native store (bottom-first
              * for the manifest). Copy-to-native, simple; optimize later. */
@@ -1487,7 +1527,7 @@ static int resolve_image_chain(const char *ref,
         return -1;
     }
     for (int l = 0; l < c && l < MAX_CHAIN; l++)
-        snprintf(diffs[l], MAX_PATH, "%s", nl[l].diff);
+        snprintf(diffs[l], PATH_MAX, "%s", nl[l].diff);
     /* Reuse the base's existing digests (bottom-first). */
     if (digs_bottom) {
         for (int l = 0; l < c && l < MAX_CHAIN; l++)
@@ -1591,7 +1631,7 @@ static int cmd_build(int argc, char **argv) {
         return 2;
     }
 
-    char df_path[MAX_PATH];
+    char df_path[PATH_MAX];
     if (df_arg) snprintf(df_path, sizeof(df_path), "%s", df_arg);
     else snprintf(df_path, sizeof(df_path), "%s/Dockerfile", context);
 
@@ -1624,13 +1664,13 @@ static int cmd_build(int argc, char **argv) {
     if (config.kernel[0] == '\0')
         get_host_kernel(config.kernel, sizeof(config.kernel));
 
-    char workdir[MAX_PATH], layersdir[MAX_PATH];
+    char workdir[PATH_MAX], layersdir[PATH_MAX];
     if (container_build_dir(workdir, sizeof(workdir)) < 0) {
         fprintf(stderr, "podvm build: cannot create the build dir: %s\n",
                 strerror(errno));
         return 1;
     }
-    char wsuffix[MAX_PATH];
+    char wsuffix[PATH_MAX];
     snprintf(wsuffix, sizeof(wsuffix), "/b%d", (int)getpid());
     strncat(workdir, wsuffix, sizeof(workdir) - strlen(workdir) - 1);
     snprintf(layersdir, sizeof(layersdir), "%s/layers", workdir);
@@ -1689,10 +1729,10 @@ static int cmd_build(int argc, char **argv) {
                  * our base, and its final config is inherited. */
                 BuildStage *src = &stages[src_stage];
                 for (int l = 0; l < src->nlayers && st->nbase < MAX_CHAIN; l++)
-                    snprintf(st->base_diffs[st->nbase++], MAX_PATH, "%s",
+                    snprintf(st->base_diffs[st->nbase++], PATH_MAX, "%s",
                              src->layer_chain[l]);
                 for (int b = 0; b < src->nbase && st->nbase < MAX_CHAIN; b++)
-                    snprintf(st->base_diffs[st->nbase++], MAX_PATH, "%s",
+                    snprintf(st->base_diffs[st->nbase++], PATH_MAX, "%s",
                              src->base_diffs[b]);
                 for (int b = 0; b < src->nbase_dig && st->nbase_dig < MAX_CHAIN;
                      b++)
@@ -1806,8 +1846,8 @@ static int cmd_build(int argc, char **argv) {
             }
             break;
         case BCOPY: {
-            char ldir[MAX_PATH], srcabs[MAX_PATH], dstabs[MAX_PATH], cerr[512];
-            char fromdiffs[MAX_CHAIN][MAX_PATH];
+            char ldir[PATH_MAX], srcabs[PATH_MAX], dstabs[PATH_MAX], cerr[512];
+            char fromdiffs[MAX_CHAIN][PATH_MAX];
             const char *chain[MAX_CHAIN];
             int nchain = 0;
 
@@ -1887,7 +1927,7 @@ static int cmd_build(int argc, char **argv) {
             }
             if (op->from[0]) {
                 for (int s = 0; s < nsrc; s++) {
-                    char target[MAX_PATH];
+                    char target[PATH_MAX];
                     copy_target(dstabs, srcs[s], nsrc > 1, target, sizeof(target));
                     if (build_copy_from_chain((const char *const *)chain, nchain,
                                               srcs[s], ldir, target,
@@ -1901,7 +1941,7 @@ static int cmd_build(int argc, char **argv) {
                        i, op->from, op->a, op->b);
             } else {
                 for (int s = 0; s < nsrc; s++) {
-                    char target[MAX_PATH];
+                    char target[PATH_MAX];
                     copy_target(dstabs, srcs[s], nsrc > 1, target, sizeof(target));
                     snprintf(srcabs, sizeof(srcabs), "%s/%s", context, srcs[s]);
                     if (build_copy_path(srcabs, ldir, target, cerr, sizeof(cerr)) < 0) {
@@ -1913,7 +1953,7 @@ static int cmd_build(int argc, char **argv) {
                 printf("podvm: step %d: COPY %s %s\n", i, op->a, op->b);
             }
             {
-                char dig[NATIVE_DIGEST_MAX], ndir[MAX_PATH];
+                char dig[NATIVE_DIGEST_MAX], ndir[PATH_MAX];
                 if (native_commit_diff(ldir, dig, sizeof(dig)) < 0) {
                     fprintf(stderr, "podvm build: cannot commit COPY layer\n");
                     rc = 1;
@@ -1929,7 +1969,7 @@ static int cmd_build(int argc, char **argv) {
         }
         case BRUN: {
             char stepname[64], sdir[CONTAINER_PATH_MAX];
-            char upath[MAX_PATH], spath[MAX_PATH];
+            char upath[PATH_MAX], spath[PATH_MAX];
             snprintf(stepname, sizeof(stepname), "pb%dp%d-s%d",
                      (int)getpid(), (int)getppid(), i);
 
@@ -2015,7 +2055,7 @@ static int cmd_build(int argc, char **argv) {
             /* Commit: the step upper becomes a native layer (whiteouts
              * preserved as char 0:0 by the userns unpack). */
             {
-                char dig[NATIVE_DIGEST_MAX], ndir[MAX_PATH];
+                char dig[NATIVE_DIGEST_MAX], ndir[PATH_MAX];
                 if (native_commit_diff(upath, dig, sizeof(dig)) < 0) {
                     fprintf(stderr, "podvm build: cannot commit the step layer\n");
                     container_rm_rf(sdir);
@@ -2275,7 +2315,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -m, --memory <MB>   Memory in MB (default: 128)\n");
     fprintf(stderr, "  -c, --cpus <cpus>   CPUs (default: 1)\n");
     fprintf(stderr, "  -k, --kernel <path> Kernel path\n");
-    fprintf(stderr, "  -r, --initramfs <path> Initramfs path\n");
+    fprintf(stderr, "  -r, --initramfs <path> Initramfs path (default: next to\n");
+    fprintf(stderr, "                      the podvm binary, then /var/lib/podvm)\n");
     fprintf(stderr, "  -n, --name <name>   Container name; persists the writable layer\n");
     fprintf(stderr, "                      across runs (write-back). Without it, writes\n");
     fprintf(stderr, "                      are discarded when the VM exits.\n");
@@ -2428,10 +2469,10 @@ int main(int argc, char **argv) {
             config.cpus = atoi(optarg);
             break;
         case 'k':
-            strncpy(config.kernel, optarg, MAX_PATH - 1);
+            strncpy(config.kernel, optarg, PATH_MAX - 1);
             break;
         case 'r':
-            strncpy(config.initramfs, optarg, MAX_PATH - 1);
+            strncpy(config.initramfs, optarg, PATH_MAX - 1);
             break;
         case 'n':
             if (!container_name_valid(optarg)) {
@@ -2492,12 +2533,12 @@ int main(int argc, char **argv) {
     }
 
     /* Get image or rootfs directory */
-    strncpy(config.rootfs_dir, argv[optind], MAX_PATH - 1);
-    config.rootfs_dir[MAX_PATH - 1] = '\0';
+    strncpy(config.rootfs_dir, argv[optind], PATH_MAX - 1);
+    config.rootfs_dir[PATH_MAX - 1] = '\0';
     {
         /* Keep the user's original ref for image-config lookup (the
          * rootfs_dir field is overwritten with the resolved path below). */
-        static char image_ref_buf[MAX_PATH];
+        static char image_ref_buf[PATH_MAX];
         snprintf(image_ref_buf, sizeof(image_ref_buf), "%s", config.rootfs_dir);
         image_ref = image_ref_buf;
     }
@@ -2505,7 +2546,7 @@ int main(int argc, char **argv) {
 
     /* Get entrypoint (if provided) */
     if (optind < argc) {
-        strncpy(config.entrypoint, argv[optind], MAX_PATH - 1);
+        strncpy(config.entrypoint, argv[optind], PATH_MAX - 1);
         optind++;
 
         /* Build args string. Each argv element is escaped HERE -- the
@@ -2539,7 +2580,7 @@ int main(int argc, char **argv) {
     }
     
     /* Resolve rootfs/image */
-    char resolved_rootfs[MAX_PATH];
+    char resolved_rootfs[PATH_MAX];
     int used_podman = 0;
     int used_native = 0;
 
@@ -2633,8 +2674,8 @@ int main(int argc, char **argv) {
     }
     
     /* Copy resolved path back */
-    strncpy(config.rootfs_dir, resolved_rootfs, MAX_PATH - 1);
-    config.rootfs_dir[MAX_PATH - 1] = '\0';
+    strncpy(config.rootfs_dir, resolved_rootfs, PATH_MAX - 1);
+    config.rootfs_dir[PATH_MAX - 1] = '\0';
 
     /*
      * Fold the image's own config (Env/Entrypoint/Cmd/WorkingDir/User)

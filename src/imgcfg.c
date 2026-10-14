@@ -12,7 +12,7 @@
 #include "strparse.h"
 
 /* Escaping a field can double its size. */
-#define IMGCFG_ESC_MAX (MAX_PATH * 2 + 16)
+#define IMGCFG_ESC_MAX (PATH_MAX * 2 + 16)
 
 /* Append a (possibly already-escaped) field to the csv args. */
 #define PUSH_TO_ARG(field) do { \
@@ -54,7 +54,7 @@
 } while (0)
 
 void imgcfg_fold(const ImageConfig *ic, const RunSpec *base, RunSpec *out) {
-    char entry[MAX_PATH];
+    char entry[PATH_MAX];
     char argbuf[IMGCFG_ARGS_MAX];
     int have_entry = 0;
 

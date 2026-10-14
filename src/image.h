@@ -8,16 +8,16 @@
 #define IMAGE_H
 
 #include <stddef.h>
+#include <limits.h>    /* PATH_MAX */
 
 #define MAX_IMAGE_NAME 256
-#define MAX_PATH 1024
 
 /* Image reference */
 typedef struct {
     char name[MAX_IMAGE_NAME];      /* e.g., "debian" or "registry/repo:tag" */
     char tag[MAX_IMAGE_NAME];       /* e.g., "latest", "12" */
     char digest[128];               /* e.g., "sha256:abc..." */
-    char rootfs[MAX_PATH];          /* Path to assembled rootfs */
+    char rootfs[PATH_MAX];          /* Path to assembled rootfs */
 } ImageRef;
 
 /* Limits on an image config's command/env arrays. */
@@ -39,7 +39,7 @@ typedef struct {
     int   nentry;
     char *cmd[MAX_CMD_PARTS];
     int   ncmd;
-    char  cwd[MAX_PATH];            /* WorkingDir ("" if unset) */
+    char  cwd[PATH_MAX];            /* WorkingDir ("" if unset) */
     char  user[128];                /* User, e.g. "1000:1000" ("" if unset) */
 } ImageConfig;
 
